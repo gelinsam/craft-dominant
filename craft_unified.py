@@ -1,21 +1,3 @@
-Use this file as your Railway upload. Folder: `/Users/samgelin/Documents/New project`
-
-Here’s the raw `craft_unified.py` you can copy/paste:
-
-```python
-"""
-CRAFT DOMINANT - UNIFIED SYSTEM
-================================
-
-Everything integrated:
-- Historical pacing intelligence (from actual past events)
-- Customer CRM with lifetime value (from all past orders)
-- Real-time decision engine
-- Unified dashboard API
-
-This is the ONE file you deploy. It does everything.
-"""
-
 import os
 import sys
 import json
