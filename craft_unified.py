@@ -1401,12 +1401,12 @@ def create_app(db: Database) -> Flask:
         return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
   
     @app.route('/api/sync')
-    def sync_endpoint():
+def sync_endpoint():
     """Trigger Eventbrite sync via URL."""
     api_key = os.environ.get('EVENTBRITE_API_KEY')
     if not api_key:
         return jsonify({'error': 'EVENTBRITE_API_KEY not set'}), 500
-    
+
     try:
         eb = EventbriteSync(api_key, db)
         result = eb.sync_all(years_back=2)
@@ -1420,6 +1420,7 @@ def create_app(db: Database) -> Flask:
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
             
     # === Dashboard ===
     
