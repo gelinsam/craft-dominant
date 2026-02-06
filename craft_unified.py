@@ -1753,5 +1753,8 @@ Then:
         print(f"Unknown command: {cmd}")
 
 
+db = Database()
+app = create_app(db)
+
 if __name__ == '__main__':
-    main()
+    app.run()
