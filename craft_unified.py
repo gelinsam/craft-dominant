@@ -1762,11 +1762,6 @@ restartPolicyMaxRetries = 3
 schedule = "0 10 * * *"
 command = "python craft_unified.py sync $EVENTBRITE_API_KEY"
 
-flask==3.0.0
-flask-cors==4.0.0
-requests==2.31.0
-gunicorn==21.2.0
-
 #!/usr/bin/env python3
 """
 Railway start script.
