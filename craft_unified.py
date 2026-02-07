@@ -702,8 +702,7 @@ class EventbriteSync:
 
                 # Get orders
                 log.info(f"  Syncing: {event['name']}")
-                orders = self._paginate(f"/events/{event['event_id']}/orders/",
-                                       {'status': 'active,attended'})
+                orders = self._paginate(f"/events/{event['event_id']}/orders/", {})
 
                 for order_data in orders:
                     order = self._parse_order(order_data, event['event_id'], event_date)
