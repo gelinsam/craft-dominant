@@ -1751,9 +1751,33 @@ Then:
     else:
         print(f"Unknown command: {cmd}")
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+import os
+from flask import Flask, jsonify, render_template_string
 
 db = Database()
 app = create_app(db)
 
-if __name__ == '__main__':
-    app.run()
+from flask import jsonify, render_template_string
+import os
+
+@app.route("/health")
+@app.route("/health/")
+def health():
+    return "ok", 200
+
+@app.route("/")
+def home():
+    rows = getattr(app, "events_cache", [])
+    html = """
+    <h1>Craft Dashboard</h1>
+    <p>Events loaded: {{ n }}</p>
+    <pre style="white-space: pre-wrap;">{{ data }}</pre>
+    """
+    return render_template_string(
+        html,
+        n=len(rows),
+        data=rows[:50]
+    )
