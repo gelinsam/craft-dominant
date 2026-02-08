@@ -1115,7 +1115,7 @@ class EventbriteSync:
     def _get_pattern(self, name: str) -> str:
         """Extract pattern from event name."""
         name_lower = name.lower()
-        name_lower = re.sub(r'20\\d{2}', '', name_lower)
+        name_lower = re.sub(r'20\d{2}', '', name_lower)
 
         replacements = {
             'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
@@ -1129,9 +1129,10 @@ class EventbriteSync:
         elif 'spring' in name_lower: season = '_spring'
         elif 'fall' in name_lower: season = '_fall'
 
-        name_lower = re.sub(r'[^a-z\\s]', '', name_lower)
+        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
         name_lower = '_'.join(name_lower.split())
         name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+
 
         return name_lower + season
 
@@ -1157,7 +1158,7 @@ class DecisionEngine:
     def _get_pattern(self, name: str) -> str:
         """Same logic as EventbriteSync."""
         name_lower = name.lower()
-        name_lower = re.sub(r'20\\d{2}', '', name_lower)
+        name_lower = re.sub(r'20\d{2}', '', name_lower)
 
         replacements = {
             'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
@@ -1171,9 +1172,10 @@ class DecisionEngine:
         elif 'spring' in name_lower: season = '_spring'
         elif 'fall' in name_lower: season = '_fall'
 
-        name_lower = re.sub(r'[^a-z\\s]', '', name_lower)
+        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
         name_lower = '_'.join(name_lower.split())
         name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+
 
         return name_lower + season
 
@@ -1228,9 +1230,9 @@ class DecisionEngine:
                     pace = ((sell_through - hist_median) / hist_median) * 100
 
                 comparison_events = curve['source_events']
-                comparison_years = [int(re.search(r'20\\d{2}', e).group())
+                comparison_years = [int(re.search(r'20\d{2}', e).group())
                                    for e in curve['source_events']
-                                   if re.search(r'20\\d{2}', e)]
+                                   if re.search(r'20\d{2}', e)]
 
                 # Projection
                 if curve['avg_final_sell_through'] > 0:
@@ -1591,10 +1593,10 @@ class CraftDominant:
             return
 
         app = create_app(self.db)
-        print(f"\\n🚀 Craft Dominant API running on http://{host}:{port}")
+        print(f"\n🚀 Craft Dominant API running on http://{host}:{port}")
         print(f"   Dashboard: http://{host}:{port}/api/dashboard")
         print(f"   Customers: http://{host}:{port}/api/customers")
-        print(f"   Events:    http://{host}:{port}/api/events\\n")
+        print(f"   Events:    http://{host}:{port}/api/events\n")
         app.run(host=host, port=port)
 
     def print_report(self):
@@ -1611,7 +1613,7 @@ class CraftDominant:
         total_revenue = sum(a.revenue for a in analyses)
         total_spend = sum(a.ad_spend for a in analyses)
 
-        print(f"\\n📊 PORTFOLIO")
+        print(f"\n📊 PORTFOLIO")
         print(f"   Events: {len(analyses)}")
         print(f"   Tickets: {total_tickets:,}")
         print(f"   Revenue: ${total_revenue:,.2f}")
@@ -1625,17 +1627,17 @@ class CraftDominant:
             d = a.decision.value
             decisions[d] = decisions.get(d, 0) + 1
 
-        print(f"\\n📋 DECISIONS")
+        print(f"\n📋 DECISIONS")
         for d, count in decisions.items():
             print(f"   {emoji.get(d, '❓')} {d.upper()}: {count}")
 
         # Events
-        print(f"\\n📈 EVENTS")
+        print(f"\n📈 EVENTS")
         print("-" * 70)
 
         for a in analyses:
             e = emoji.get(a.decision.value, '❓')
-            print(f"\\n{e} {a.event_name}")
+            print(f"\n{e} {a.event_name}")
             print(f"   📅 {a.event_date[:10]} ({a.days_until}d) | {a.tickets_sold:,}/{a.capacity:,} ({a.sell_through:.1f}%)")
 
             if a.historical_median_at_point > 0:
@@ -1650,7 +1652,7 @@ class CraftDominant:
         segments = self.db.get_segment_counts()
         total_customers = self.db.get_customer_count()
 
-        print(f"\\n👥 CUSTOMERS")
+        print(f"\n👥 CUSTOMERS")
         print("-" * 70)
         print(f"   Total: {total_customers:,}")
         for seg, count in sorted(segments.items(), key=lambda x: -x[1]):
@@ -1659,9 +1661,9 @@ class CraftDominant:
         at_risk = self.db.get_at_risk_customers()
         if at_risk:
             at_risk_value = sum(c['total_spent'] for c in at_risk)
-            print(f"\\n   ⚠️ AT RISK: {len(at_risk)} customers (${at_risk_value:,.2f} historical)")
+            print(f"\n   ⚠️ AT RISK: {len(at_risk)} customers (${at_risk_value:,.2f} historical)")
 
-        print("\\n" + "=" * 70)
+        print("\n" + "=" * 70)
 
 
 def create_app_with_db():
@@ -1707,16 +1709,16 @@ Then:
             except:
                 pass
 
-        print(f"\\nSyncing {years} years of data from Eventbrite...\\n")
+        print(f"\nSyncing {years} years of data from Eventbrite...\n")
         result = craft.sync(api_key, years)
 
-        print(f"\\n✓ Events: {result.get('events', 0)}")
+        print(f"\n✓ Events: {result.get('events', 0)}")
         print(f"✓ Orders: {result.get('orders', 0)}")
         print(f"✓ Customers: {result.get('customers', 0)}")
         print(f"✓ Pacing curves: {result.get('curves', 0)}")
 
         if result.get('errors'):
-            print(f"\\n⚠️ Errors: {len(result['errors'])}")
+            print(f"\n⚠️ Errors: {len(result['errors'])}")
 
     elif cmd == 'report':
         craft.print_report()
@@ -1736,7 +1738,7 @@ Then:
             print(f"Customer not found: {email}")
             return
 
-        print(f"\\n👤 {customer.email}")
+        print(f"\n👤 {customer.email}")
         print(f"   Orders: {customer.total_orders} | Tickets: {customer.total_tickets}")
         print(f"   Total spent: ${customer.total_spent:,.2f}")
         print(f"   LTV Score: {customer.ltv_score:.1f}/100")
@@ -1752,32 +1754,4 @@ Then:
         print(f"Unknown command: {cmd}")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-import os
-from flask import Flask, jsonify, render_template_string
-
-db = Database()
-app = create_app(db)
-
-from flask import jsonify, render_template_string
-import os
-
-@app.route("/health")
-@app.route("/health/")
-def health():
-    return "ok", 200
-
-@app.route("/")
-def home():
-    rows = getattr(app, "events_cache", [])
-    html = """
-    <h1>Craft Dashboard</h1>
-    <p>Events loaded: {{ n }}</p>
-    <pre style="white-space: pre-wrap;">{{ data }}</pre>
-    """
-    return render_template_string(
-        html,
-        n=len(rows),
-        data=rows[:50]
-    )
+    main()
