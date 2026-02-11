@@ -1133,7 +1133,6 @@ class EventbriteSync:
         name_lower = '_'.join(name_lower.split())
         name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
 
-
         return name_lower + season
 
 
@@ -1175,7 +1174,6 @@ class DecisionEngine:
         name_lower = re.sub(r'[^a-z\s]', '', name_lower)
         name_lower = '_'.join(name_lower.split())
         name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-
 
         return name_lower + season
 
@@ -1309,7 +1307,7 @@ class DecisionEngine:
                 Decision.PIVOT, urgency,
                 f"Sales {abs(pace):.0f}% behind historical pace{context}. {basis}.",
                 [
-                    "🚨 PAUSE underperforming ad campaigns",
+                    "PAUSE underperforming ad campaigns",
                     "Audit and refresh all creative",
                     "Test flash sale / promo offer",
                     "Try completely different audience",
@@ -1384,6 +1382,22 @@ def create_app(db: Database) -> Flask:
 
     engine = DecisionEngine(db)
 
+    def _serialize_pacing(obj):
+        """Convert EventPacing dataclass to JSON-safe dict."""
+        d = asdict(obj)
+        # Convert Decision enum to its string value
+        if 'decision' in d:
+            d['decision'] = obj.decision.value
+        return d
+
+    @app.route('/')
+    def home():
+        return jsonify({
+            'name': 'Craft Dominant API',
+            'endpoints': ['/api/dashboard', '/api/events', '/api/customers', '/api/curves'],
+            'status': 'running'
+        })
+
     @app.route('/api/health')
     def health():
         return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
@@ -1442,7 +1456,7 @@ def create_app(db: Database) -> Flask:
                 'event_count': len(analyses)
             },
             'decisions': decisions,
-            'events': [asdict(a) for a in analyses],
+            'events': [_serialize_pacing(a) for a in analyses],
             'customers': {
                 'total': total_customers,
                 'segments': segments
@@ -1463,7 +1477,7 @@ def create_app(db: Database) -> Flask:
         analysis = engine.analyze_event(event_id)
         if not analysis:
             return jsonify({'error': 'Event not found'}), 404
-        return jsonify(asdict(analysis))
+        return jsonify(_serialize_pacing(analysis))
 
     # === CRM ===
 
@@ -1593,7 +1607,7 @@ class CraftDominant:
             return
 
         app = create_app(self.db)
-        print(f"\n🚀 Craft Dominant API running on http://{host}:{port}")
+        print(f"\nCraft Dominant API running on http://{host}:{port}")
         print(f"   Dashboard: http://{host}:{port}/api/dashboard")
         print(f"   Customers: http://{host}:{port}/api/customers")
         print(f"   Events:    http://{host}:{port}/api/events\n")
@@ -1613,7 +1627,7 @@ class CraftDominant:
         total_revenue = sum(a.revenue for a in analyses)
         total_spend = sum(a.ad_spend for a in analyses)
 
-        print(f"\n📊 PORTFOLIO")
+        print(f"\nPORTFOLIO")
         print(f"   Events: {len(analyses)}")
         print(f"   Tickets: {total_tickets:,}")
         print(f"   Revenue: ${total_revenue:,.2f}")
@@ -1621,38 +1635,36 @@ class CraftDominant:
         print(f"   CAC: ${total_spend/total_tickets:.2f}" if total_tickets > 0 else "")
 
         # Decisions
-        emoji = {'pivot': '🚨', 'push': '🚀', 'maintain': '✅', 'coast': '😎', 'not_started': '⏳'}
         decisions = {}
         for a in analyses:
             d = a.decision.value
             decisions[d] = decisions.get(d, 0) + 1
 
-        print(f"\n📋 DECISIONS")
+        print(f"\nDECISIONS")
         for d, count in decisions.items():
-            print(f"   {emoji.get(d, '❓')} {d.upper()}: {count}")
+            print(f"   {d.upper()}: {count}")
 
         # Events
-        print(f"\n📈 EVENTS")
+        print(f"\nEVENTS")
         print("-" * 70)
 
         for a in analyses:
-            e = emoji.get(a.decision.value, '❓')
-            print(f"\n{e} {a.event_name}")
-            print(f"   📅 {a.event_date[:10]} ({a.days_until}d) | {a.tickets_sold:,}/{a.capacity:,} ({a.sell_through:.1f}%)")
+            print(f"\n[{a.decision.value.upper()}] {a.event_name}")
+            print(f"   {a.event_date[:10]} ({a.days_until}d) | {a.tickets_sold:,}/{a.capacity:,} ({a.sell_through:.1f}%)")
 
             if a.historical_median_at_point > 0:
-                print(f"   📊 Historical: {a.historical_median_at_point:.1f}% | Pace: {a.pace_vs_historical:+.0f}%")
-                print(f"   📈 Projected: {a.projected_final:,} [{a.projected_range[0]:,}-{a.projected_range[1]:,}]")
+                print(f"   Historical: {a.historical_median_at_point:.1f}% | Pace: {a.pace_vs_historical:+.0f}%")
+                print(f"   Projected: {a.projected_final:,} [{a.projected_range[0]:,}-{a.projected_range[1]:,}]")
 
-            print(f"   💰 Spend: ${a.ad_spend:,.2f} | CAC: ${a.cac:.2f}")
-            print(f"   🎯 {a.high_value_targets} high-value targets | {a.reactivation_targets} reactivation")
-            print(f"   ➡️ {a.rationale}")
+            print(f"   Spend: ${a.ad_spend:,.2f} | CAC: ${a.cac:.2f}")
+            print(f"   {a.high_value_targets} high-value targets | {a.reactivation_targets} reactivation")
+            print(f"   -> {a.rationale}")
 
         # Customer summary
         segments = self.db.get_segment_counts()
         total_customers = self.db.get_customer_count()
 
-        print(f"\n👥 CUSTOMERS")
+        print(f"\nCUSTOMERS")
         print("-" * 70)
         print(f"   Total: {total_customers:,}")
         for seg, count in sorted(segments.items(), key=lambda x: -x[1]):
@@ -1661,7 +1673,7 @@ class CraftDominant:
         at_risk = self.db.get_at_risk_customers()
         if at_risk:
             at_risk_value = sum(c['total_spent'] for c in at_risk)
-            print(f"\n   ⚠️ AT RISK: {len(at_risk)} customers (${at_risk_value:,.2f} historical)")
+            print(f"\n   AT RISK: {len(at_risk)} customers (${at_risk_value:,.2f} historical)")
 
         print("\n" + "=" * 70)
 
@@ -1712,13 +1724,13 @@ Then:
         print(f"\nSyncing {years} years of data from Eventbrite...\n")
         result = craft.sync(api_key, years)
 
-        print(f"\n✓ Events: {result.get('events', 0)}")
-        print(f"✓ Orders: {result.get('orders', 0)}")
-        print(f"✓ Customers: {result.get('customers', 0)}")
-        print(f"✓ Pacing curves: {result.get('curves', 0)}")
+        print(f"\nEvents: {result.get('events', 0)}")
+        print(f"Orders: {result.get('orders', 0)}")
+        print(f"Customers: {result.get('customers', 0)}")
+        print(f"Pacing curves: {result.get('curves', 0)}")
 
         if result.get('errors'):
-            print(f"\n⚠️ Errors: {len(result['errors'])}")
+            print(f"\nErrors: {len(result['errors'])}")
 
     elif cmd == 'report':
         craft.print_report()
@@ -1738,7 +1750,7 @@ Then:
             print(f"Customer not found: {email}")
             return
 
-        print(f"\n👤 {customer.email}")
+        print(f"\n{customer.email}")
         print(f"   Orders: {customer.total_orders} | Tickets: {customer.total_tickets}")
         print(f"   Total spent: ${customer.total_spent:,.2f}")
         print(f"   LTV Score: {customer.ltv_score:.1f}/100")
