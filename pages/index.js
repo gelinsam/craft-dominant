@@ -69,7 +69,7 @@ const EventCard = ({ event, selected, onSelect }) => {
 const EventDetail = ({ event }) => {
   if (!event) return <Card className="p-8 text-center text-gray-500">Select an event</Card>;
   const cfg = DECISIONS[event.decision] || DECISIONS.maintain;
-  
+
   return (
     <Card className="p-5">
       <div className="flex justify-between mb-4">
@@ -79,7 +79,7 @@ const EventDetail = ({ event }) => {
         </div>
         <Badge color={cfg.color} bg={cfg.bg}>{cfg.icon} {cfg.label}</Badge>
       </div>
-      
+
       <div className="grid grid-cols-4 gap-4 mb-6">
         {[
           { l: 'Tickets', v: event.tickets_sold?.toLocaleString() },
@@ -93,7 +93,7 @@ const EventDetail = ({ event }) => {
           </div>
         ))}
       </div>
-      
+
       {event.historical_median_at_point > 0 && (
         <div className="mb-6 p-4 bg-gray-50 rounded-lg">
           <h3 className="font-semibold mb-2">Historical Comparison</h3>
@@ -107,13 +107,13 @@ const EventDetail = ({ event }) => {
           )}
         </div>
       )}
-      
+
       <div className="mb-6 p-4 bg-blue-50 rounded-lg">
         <h3 className="font-semibold mb-1">Projection</h3>
         <div className="text-3xl font-bold text-blue-600">{event.projected_final?.toLocaleString()}</div>
         <div className="text-sm text-gray-600">Range: {event.projected_range?.[0]?.toLocaleString()} - {event.projected_range?.[1]?.toLocaleString()}</div>
       </div>
-      
+
       <div className="p-4 rounded-lg" style={{ backgroundColor: cfg.bg }}>
         <h3 className="font-semibold mb-2" style={{ color: cfg.color }}>Actions</h3>
         <p className="text-sm mb-3">{event.rationale}</p>
@@ -126,7 +126,7 @@ const EventDetail = ({ event }) => {
           ))}
         </ul>
       </div>
-      
+
       <div className="mt-4 grid grid-cols-2 gap-4">
         <div className="p-3 bg-green-50 rounded-lg text-center">
           <div className="text-xl font-bold text-green-600">{event.high_value_targets}</div>
@@ -172,7 +172,7 @@ const CustomerTable = ({ customers, onSelect }) => (
 const CustomerModal = ({ customer, orders, onClose }) => {
   if (!customer) return null;
   const seg = SEGMENTS[customer.rfm_segment] || SEGMENTS.other;
-  
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
       <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-auto m-4" onClick={e => e.stopPropagation()}>
@@ -186,7 +186,7 @@ const CustomerModal = ({ customer, orders, onClose }) => {
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
         </div>
-        
+
         <div className="grid grid-cols-4 border-b">
           {[
             { l: 'Orders', v: customer.total_orders },
@@ -200,7 +200,7 @@ const CustomerModal = ({ customer, orders, onClose }) => {
             </div>
           ))}
         </div>
-        
+
         <div className="p-5">
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div className="p-3 bg-gray-50 rounded-lg">
@@ -212,7 +212,7 @@ const CustomerModal = ({ customer, orders, onClose }) => {
               <div className="font-semibold">{customer.favorite_city || 'N/A'}</div>
             </div>
           </div>
-          
+
           <h3 className="font-semibold mb-3">Order History ({orders?.length || 0})</h3>
           <div className="space-y-2 max-h-60 overflow-auto">
             {orders?.map((o, i) => (
@@ -242,7 +242,7 @@ export default function CraftDashboard() {
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [customerOrders, setCustomerOrders] = useState([]);
   const [loading, setLoading] = useState(true);
-  
+
   useEffect(() => {
     fetch(`${API_BASE}/api/dashboard`)
       .then(r => r.json())
@@ -253,7 +253,7 @@ export default function CraftDashboard() {
       })
       .catch(() => setLoading(false));
   }, []);
-  
+
   useEffect(() => {
     if (tab === 'crm') {
       fetch(`${API_BASE}/api/customers?limit=50`)
@@ -261,7 +261,7 @@ export default function CraftDashboard() {
         .then(d => setCustomers(d.customers || []));
     }
   }, [tab]);
-  
+
   const handleSelectCustomer = (email) => {
     fetch(`${API_BASE}/api/customers/${encodeURIComponent(email)}`)
       .then(r => r.json())
@@ -270,11 +270,11 @@ export default function CraftDashboard() {
         setCustomerOrders(d.orders || []);
       });
   };
-  
+
   if (loading) return <div className="min-h-screen bg-gray-50 flex items-center justify-center">Loading...</div>;
-  
+
   const { portfolio, decisions, events, customers: cs } = dashboard || {};
-  
+
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b sticky top-0 z-40">
@@ -305,7 +305,7 @@ export default function CraftDashboard() {
           </div>
         </div>
       </header>
-      
+
       <main className="max-w-7xl mx-auto px-6 py-6">
         <div className="grid grid-cols-5 gap-4 mb-6">
           <Card className="p-4"><Stat label="Tickets" value={portfolio?.total_tickets?.toLocaleString() || 0} /></Card>
@@ -314,7 +314,7 @@ export default function CraftDashboard() {
           <Card className="p-4"><Stat label="CAC" value={`$${portfolio?.portfolio_cac?.toFixed(2) || '0.00'}`} /></Card>
           <Card className="p-4"><Stat label="Customers" value={cs?.total?.toLocaleString() || 0} /></Card>
         </div>
-        
+
         {tab === 'events' && (
           <div className="grid grid-cols-12 gap-6">
             <div className="col-span-4 space-y-4 max-h-[70vh] overflow-auto">
@@ -323,7 +323,7 @@ export default function CraftDashboard() {
             <div className="col-span-8"><EventDetail event={selectedEvent} /></div>
           </div>
         )}
-        
+
         {tab === 'crm' && (
           <div>
             <div className="grid grid-cols-6 gap-4 mb-6">
@@ -341,7 +341,7 @@ export default function CraftDashboard() {
           </div>
         )}
       </main>
-      
+
       {decisions?.pivot > 0 && (
         <div className="fixed bottom-0 left-0 right-0 bg-red-600 text-white py-3 px-6 z-50">
           <div className="max-w-7xl mx-auto flex items-center justify-between">
@@ -350,7 +350,7 @@ export default function CraftDashboard() {
           </div>
         </div>
       )}
-      
+
       {selectedCustomer && <CustomerModal customer={selectedCustomer} orders={customerOrders} onClose={() => setSelectedCustomer(null)} />}
     </div>
   );
