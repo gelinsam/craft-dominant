@@ -806,7 +806,29 @@ class EventbriteSync:
         if not email:
             return None
 
-        try:tamp': order_date.isoformat(),
+        try:
+            order_date = datetime.fromisoformat(created.replace('Z', '+00:00')).replace(tzinfo=None)
+            days_before = max(0, (event_date - order_date).days)
+        except:
+            order_date = datetime.now()
+            days_before = 0
+
+        costs = data.get('costs') or {}
+        gross = costs.get('gross') or {}
+        gross_amount = float(gross.get('major_value') or 0)
+
+        attendees = data.get('attendees', [])
+        ticket_count = len(attendees) if attendees else 1
+
+        ticket_type = None
+        if attendees:
+            ticket_type = attendees[0].get('ticket_class_name')
+
+        return {
+            'order_id': order_id,
+            'event_id': event_id,
+            'email': email,
+            'order_timestamp': order_date.isoformat(),
             'ticket_count': ticket_count,
             'gross_amount': gross_amount,
             'ticket_type': ticket_type,
@@ -943,28 +965,6 @@ class EventbriteSync:
             first_dt = datetime.fromisoformat(first_date)
             last_dt = datetime.fromisoformat(last_date)
             days_since = (datetime.now() - last_dt).days
-            order_date = datetime.fromisoformat(created.replace('Z', '+00:00')).replace(tzinfo=None)
-            days_before = max(0, (event_date - order_date).days)
-        except:
-            order_date = datetime.now()
-            days_before = 0
-
-        costs = data.get('costs') or {}
-        gross = costs.get('gross') or {}
-        gross_amount = float(gross.get('major_value') or 0)
-
-        attendees = data.get('attendees', [])
-        ticket_count = len(attendees) if attendees else 1
-
-        ticket_type = None
-        if attendees:
-            ticket_type = attendees[0].get('ticket_class_name')
-
-        return {
-            'order_id': order_id,
-            'event_id': event_id,
-            'email': email,
-            'order_times
             tenure = (datetime.now() - first_dt).days
         except:
             days_since = 0
