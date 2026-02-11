@@ -125,6 +125,9 @@ class EventPacing:
     high_value_targets: int
     reactivation_targets: int
 
+    # Historical year-by-year comparisons
+    historical_comparisons: List[dict] = field(default_factory=list)
+
 
 # =============================================================================
 # DATABASE - UNIFIED SCHEMA
@@ -702,7 +705,7 @@ class EventbriteSync:
 
                 # Get orders
                 log.info(f"  Syncing: {event['name']}")
-                orders = self._paginate(f"/events/{event['event_id']}/orders/", {})
+                orders = self._paginate(f"/events/{event['event_id']}/orders/", {'expand': 'attendees'})
 
                 for order_data in orders:
                     order = self._parse_order(order_data, event['event_id'], event_date)
@@ -1283,6 +1286,41 @@ class DecisionEngine:
         ))
         at_risk = len(self.db.get_at_risk_customers(min_orders=2, min_days_inactive=180))
 
+        # Historical year-by-year comparison
+        historical_comparisons = []
+        all_events = self.db.get_events()
+        for pe in all_events:
+            if pe['event_id'] == event_id:
+                continue
+            if self._get_pattern(pe['name']) != pattern:
+                continue
+            pe_date = datetime.fromisoformat(pe['event_date']).date()
+            pe_tickets = self.db.get_event_tickets(pe['event_id'])
+            pe_revenue = self.db.get_event_revenue(pe['event_id'])
+            pe_capacity = pe.get('capacity', 0)
+            pe_sell_through = (pe_tickets / pe_capacity * 100) if pe_capacity > 0 else 0
+            comp = {
+                'event_name': pe['name'],
+                'event_date': pe['event_date'],
+                'year': pe_date.year,
+                'final_tickets': pe_tickets,
+                'final_revenue': pe_revenue,
+                'capacity': pe_capacity,
+                'final_sell_through': round(pe_sell_through, 1),
+            }
+            snapshot = self.db.get_snapshot_at_days(pe['event_id'], days_until)
+            if snapshot:
+                comp['at_days_out'] = {
+                    'days': snapshot['days_before_event'],
+                    'tickets': snapshot['tickets_cumulative'],
+                    'revenue': snapshot['revenue_cumulative'],
+                    'sell_through': snapshot['sell_through_pct'],
+                }
+            else:
+                comp['at_days_out'] = None
+            historical_comparisons.append(comp)
+        historical_comparisons.sort(key=lambda x: x['year'])
+
         return EventPacing(
             event_id=event_id,
             event_name=event['name'],
@@ -1307,7 +1345,8 @@ class DecisionEngine:
             rationale=rationale,
             actions=actions,
             high_value_targets=high_value,
-            reactivation_targets=at_risk
+            reactivation_targets=at_risk,
+            historical_comparisons=historical_comparisons
         )
 
     def _decide(self, tickets: int, capacity: int, sell_through: float,
