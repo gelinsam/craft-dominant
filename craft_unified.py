@@ -1808,15 +1808,21 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
 
             # Also sync Meta ad spend if credentials are configured
             meta_token = os.environ.get('META_ACCESS_TOKEN')
-            meta_account = os.environ.get('META_AD_ACCOUNT_ID')
-            if meta_token and meta_account:
+            meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
+            meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
+            if meta_token and meta_accounts:
                 try:
-                    log.info("Starting Meta ad spend sync...")
-                    meta = MetaAdsSync(meta_token, meta_account, db)
+                    log.info(f"Starting Meta ad spend sync for {len(meta_accounts)} account(s)...")
                     all_events = db.get_events(upcoming_only=False)
-                    meta_result = meta.sync_all_events(all_events)
-                    log.info(f"Meta sync: {meta_result.get('successful', 0)} events, "
-                             f"${meta_result.get('total_spend', 0):.2f} total spend")
+                    total_meta_spend = 0
+                    for acct_id in meta_accounts:
+                        log.info(f"  Syncing Meta account: {acct_id}")
+                        meta = MetaAdsSync(meta_token, acct_id, db)
+                        meta_result = meta.sync_all_events(all_events)
+                        total_meta_spend += meta_result.get('total_spend', 0)
+                        log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
+                                 f"${meta_result.get('total_spend', 0):.2f} spend")
+                    log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
                 except Exception as me:
                     log.error(f"Meta sync error: {me}")
         except Exception as e:
@@ -1891,8 +1897,9 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     def meta_sync_endpoint():
         """Trigger Meta ad spend sync for all events."""
         meta_token = os.environ.get('META_ACCESS_TOKEN')
-        meta_account = os.environ.get('META_AD_ACCOUNT_ID')
-        if not meta_token or not meta_account:
+        meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
+        meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
+        if not meta_token or not meta_accounts:
             return jsonify({
                 'error': 'META_ACCESS_TOKEN and META_AD_ACCOUNT_ID not configured',
                 'setup': 'Set these environment variables in Railway to enable Meta ad spend tracking'
@@ -1900,15 +1907,17 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
 
         def _do_meta_sync():
             try:
-                meta = MetaAdsSync(meta_token, meta_account, db)
                 all_events = db.get_events(upcoming_only=False)
-                result = meta.sync_all_events(all_events)
-                log.info(f"Manual Meta sync complete: {result}")
+                for acct_id in meta_accounts:
+                    log.info(f"Manual Meta sync for account: {acct_id}")
+                    meta = MetaAdsSync(meta_token, acct_id, db)
+                    result = meta.sync_all_events(all_events)
+                    log.info(f"Manual Meta sync complete for {acct_id}: {result}")
             except Exception as e:
                 log.error(f"Manual Meta sync error: {e}")
 
         threading.Thread(target=_do_meta_sync, daemon=True).start()
-        return jsonify({'status': 'started', 'message': 'Meta ad spend sync started in background'})
+        return jsonify({'status': 'started', 'message': f'Meta ad spend sync started for {len(meta_accounts)} account(s)'})
 
     @app.route('/api/meta-status')
     def meta_status():
