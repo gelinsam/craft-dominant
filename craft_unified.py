@@ -815,7 +815,7 @@ class EventbriteSync:
 
         costs = data.get('costs') or {}
         gross = costs.get('gross') or {}
-        gross_amount = float(gross.get('major_value', 0))
+        gross_amount = float(gross.get('major_value') or 0)
 
         attendees = data.get('attendees', [])
         ticket_count = len(attendees) if attendees else 1
@@ -870,8 +870,8 @@ class EventbriteSync:
             days_before = (event_date - current).days
             day_orders = daily.get(current, [])
 
-            tickets_today = sum(o.get('ticket_count', 1) for o in day_orders)
-            revenue_today = sum(o.get('gross_amount', 0) for o in day_orders)
+            tickets_today = sum((o.get('ticket_count') or 1) for o in day_orders)
+            revenue_today = sum((o.get('gross_amount') or 0) for o in day_orders)
 
             cumulative_tickets += tickets_today
             cumulative_revenue += revenue_today
