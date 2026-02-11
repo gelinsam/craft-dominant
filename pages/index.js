@@ -97,6 +97,7 @@ const EventDetail = ({ event }) => {
       {(event.historical_comparisons?.length > 0 || event.historical_median_at_point > 0) && (
         <div className="mb-6 p-4 bg-gray-50 rounded-lg">
           <h3 className="font-semibold mb-3">Historical Pacing ({event.days_until}d out)</h3>
+          {event.event_name?.includes(' - ') && <p className="text-xs text-gray-400 mt-1">Comparing {event.event_name.split(' - ').pop()}s across years</p>}
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b text-gray-500">
@@ -111,7 +112,7 @@ const EventDetail = ({ event }) => {
                 <tr key={i} className="border-b border-gray-100">
                   <td className="py-2">
                     <div className="font-medium">{h.year}</div>
-                    <div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}</div>
+                    <div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}{h.day_of_week ? ` • ${h.day_of_week.slice(0,3)}` : ''}</div>
                   </td>
                   <td className="text-right py-2 font-medium">
                     {h.at_days_out ? `${h.at_days_out.tickets.toLocaleString()} (${h.at_days_out.sell_through?.toFixed(1)}%)` : '\u2014'}
