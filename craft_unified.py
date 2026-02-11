@@ -603,6 +603,37 @@ class Database:
         ).fetchone()
         return row['total'] if row else 0
 
+    def get_event_spend_at_days_out(self, event_id: str, days_before: int) -> float:
+        """Get cumulative ad spend at a specific days-out point from snapshots."""
+        row = self.conn.execute("""
+            SELECT ad_spend_cumulative FROM daily_snapshots
+            WHERE event_id = ? AND ABS(days_before_event - ?) <= 2
+            ORDER BY ABS(days_before_event - ?) LIMIT 1
+        """, (event_id, days_before, days_before)).fetchone()
+        return float(row['ad_spend_cumulative']) if row and row['ad_spend_cumulative'] else 0.0
+
+    def get_event_daily_spend(self, event_id: str):
+        """Get all daily spend records for an event."""
+        rows = self.conn.execute("""
+            SELECT spend_date, spend, campaign_name, impressions, clicks
+            FROM ad_spend WHERE event_id = ?
+            ORDER BY spend_date ASC
+        """, (event_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_meta_sync_status(self) -> dict:
+        """Get summary of Meta ad spend data in the system."""
+        row = self.conn.execute("""
+            SELECT COUNT(DISTINCT event_id) as events,
+                   COUNT(DISTINCT campaign_id) as campaigns,
+                   COALESCE(SUM(spend), 0) as total_spend,
+                   MIN(spend_date) as earliest,
+                   MAX(spend_date) as latest
+            FROM ad_spend
+        """).fetchone()
+        return dict(row) if row else {}
+
+
 
 # =============================================================================
 # EVENTBRITE SYNC
@@ -1160,6 +1191,163 @@ class EventbriteSync:
         return name_lower + season
 
 
+
+# =============================================================================
+# META ADS SYNC
+# =============================================================================
+
+class MetaAdsSync:
+    """Integrates with Meta Marketing API to pull ad spend data for events."""
+
+    BASE_URL = "https://graph.facebook.com/v24.0"
+
+    def __init__(self, access_token: str, ad_account_id: str, db: Database):
+        self.access_token = access_token
+        self.ad_account_id = ad_account_id.replace('act_', '')
+        self.db = db
+        self.session = requests.Session()
+        self.session.headers['Authorization'] = f'Bearer {access_token}'
+
+    def _api_get(self, url: str, params: dict = None):
+        """Make GET request with retry/backoff for rate limits."""
+        import time
+        params = params or {}
+        params['access_token'] = self.access_token
+        for attempt in range(3):
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get('Retry-After', 60 * (attempt + 1)))
+                    log.warning(f"Meta API rate limited, waiting {wait}s")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                log.error(f"Meta API error (attempt {attempt+1}): {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        return None
+
+    def _generate_keywords(self, event_name: str):
+        """Generate search keywords from event name for campaign matching."""
+        cleaned = re.sub(r'\b20\d{2}\b', '', event_name)
+        for word in ['spring edition', 'fall edition', 'summer edition', 'winter edition',
+                      'edition', 'spring', 'fall', 'summer', 'winter']:
+            cleaned = re.sub(r'\b' + word + r'\b', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'[^\w\s]', '', cleaned)
+        cleaned = ' '.join(cleaned.split()).strip().lower()
+        if not cleaned:
+            return []
+        keywords = [cleaned]
+        words = cleaned.split()
+        if len(words) >= 2:
+            for i in range(len(words) - 1):
+                keywords.append(f"{words[i]} {words[i+1]}")
+        return keywords
+
+    def _find_campaigns(self, event_name: str):
+        """Find Meta campaigns matching an event name."""
+        keywords = self._generate_keywords(event_name)
+        if not keywords:
+            return []
+        url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
+        params = {'fields': 'id,name,status,objective', 'limit': 200}
+        matched = []
+        seen_ids = set()
+        while url:
+            data = self._api_get(url, params)
+            if not data:
+                break
+            for campaign in data.get('data', []):
+                cname = campaign['name'].lower()
+                for kw in keywords:
+                    if kw in cname and campaign['id'] not in seen_ids:
+                        matched.append({'id': campaign['id'], 'name': campaign['name'],
+                                        'status': campaign.get('status')})
+                        seen_ids.add(campaign['id'])
+                        break
+            paging = data.get('paging', {})
+            next_url = paging.get('next')
+            if next_url:
+                url = next_url
+                params = {}
+            else:
+                break
+        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}'")
+        return matched
+
+    def _fetch_daily_insights(self, campaign_id: str, date_start: str, date_stop: str):
+        """Fetch daily spend insights for a campaign."""
+        url = f"{self.BASE_URL}/{campaign_id}/insights"
+        params = {
+            'fields': 'spend,impressions,clicks,date_start,date_stop',
+            'time_increment': '1',
+            'date_start': date_start,
+            'date_stop': date_stop,
+            'limit': 500
+        }
+        insights = []
+        while url:
+            data = self._api_get(url, params)
+            if not data:
+                break
+            insights.extend(data.get('data', []))
+            paging = data.get('paging', {})
+            next_url = paging.get('next')
+            if next_url:
+                url = next_url
+                params = {}
+            else:
+                break
+        return insights
+
+    def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str):
+        """Sync ad spend from Meta for a single event."""
+        try:
+            event_date = datetime.fromisoformat(event_date_str).date()
+            today = date.today()
+            date_start = (event_date - timedelta(days=300)).isoformat()
+            date_stop = min(event_date, today).isoformat()
+            campaigns = self._find_campaigns(event_name)
+            if not campaigns:
+                return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0, 'days_of_data': 0}
+            total_spend = 0.0
+            total_days = 0
+            for campaign in campaigns:
+                insights = self._fetch_daily_insights(campaign['id'], date_start, date_stop)
+                for day_data in insights:
+                    spend = float(day_data.get('spend', 0))
+                    impressions = int(day_data.get('impressions', 0))
+                    clicks = int(day_data.get('clicks', 0))
+                    spend_date = day_data.get('date_start', '')
+                    self.db.save_ad_spend(
+                        event_id=event_id, campaign_id=campaign['id'],
+                        campaign_name=campaign['name'], spend_date=spend_date,
+                        spend=spend, impressions=impressions, clicks=clicks
+                    )
+                    total_spend += spend
+                total_days += len(insights)
+            log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns")
+            return {'event_id': event_id, 'total_spend': round(total_spend, 2),
+                    'campaigns_found': len(campaigns), 'days_of_data': total_days}
+        except Exception as e:
+            log.error(f"Meta sync error for {event_id}: {e}")
+            return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0,
+                    'days_of_data': 0, 'error': str(e)}
+
+    def sync_all_events(self, events_list):
+        """Sync Meta ad spend for all events."""
+        results = {'total_events': len(events_list), 'successful': 0, 'total_spend': 0.0, 'event_results': []}
+        for event in events_list:
+            result = self.sync_event_spend(event['event_id'], event['name'], event['event_date'])
+            results['event_results'].append(result)
+            results['total_spend'] += result.get('total_spend', 0)
+            if not result.get('error'):
+                results['successful'] += 1
+        log.info(f"Meta sync complete: {results['successful']}/{results['total_events']} events, ${results['total_spend']:.2f}")
+        return results
+
 # =============================================================================
 # DECISION ENGINE
 # =============================================================================
@@ -1299,6 +1487,7 @@ class DecisionEngine:
             pe_revenue = self.db.get_event_revenue(pe['event_id'])
             pe_capacity = pe.get('capacity', 0)
             pe_sell_through = (pe_tickets / pe_capacity * 100) if pe_capacity > 0 else 0
+            pe_spend_total = self.db.get_event_spend(pe['event_id'])
             comp = {
                 'event_name': pe['name'],
                 'event_date': pe['event_date'],
@@ -1307,14 +1496,17 @@ class DecisionEngine:
                 'final_revenue': pe_revenue,
                 'capacity': pe_capacity,
                 'final_sell_through': round(pe_sell_through, 1),
+                'ad_spend_total': round(pe_spend_total, 2),
             }
             snapshot = self.db.get_snapshot_at_days(pe['event_id'], days_until)
             if snapshot:
+                spend_at_point = snapshot.get('ad_spend_cumulative', 0) or 0
                 comp['at_days_out'] = {
                     'days': snapshot['days_before_event'],
                     'tickets': snapshot['tickets_cumulative'],
                     'revenue': snapshot['revenue_cumulative'],
                     'sell_through': snapshot['sell_through_pct'],
+                    'ad_spend': round(float(spend_at_point), 2),
                 }
             else:
                 comp['at_days_out'] = None
@@ -1607,6 +1799,20 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                      f"{result.get('orders', 0)} orders, "
                      f"{result.get('customers', 0)} customers, "
                      f"{result.get('curves', 0)} curves")
+
+            # Also sync Meta ad spend if credentials are configured
+            meta_token = os.environ.get('META_ACCESS_TOKEN')
+            meta_account = os.environ.get('META_AD_ACCOUNT_ID')
+            if meta_token and meta_account:
+                try:
+                    log.info("Starting Meta ad spend sync...")
+                    meta = MetaAdsSync(meta_token, meta_account, db)
+                    all_events = db.get_events(upcoming_only=False)
+                    meta_result = meta.sync_all_events(all_events)
+                    log.info(f"Meta sync: {meta_result.get('successful', 0)} events, "
+                             f"${meta_result.get('total_spend', 0):.2f} total spend")
+                except Exception as me:
+                    log.error(f"Meta sync error: {me}")
         except Exception as e:
             _sync_state['error'] = str(e)
             log.error(f"Sync error: {e}")
@@ -1675,7 +1881,40 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         threading.Thread(target=_do_background_sync, daemon=True).start()
         return jsonify({'status': 'started', 'message': 'Sync started in background. Poll /api/sync-status for progress.'})
 
-    # === Dashboard ===
+    @app.route('/api/meta-sync')
+    def meta_sync_endpoint():
+        """Trigger Meta ad spend sync for all events."""
+        meta_token = os.environ.get('META_ACCESS_TOKEN')
+        meta_account = os.environ.get('META_AD_ACCOUNT_ID')
+        if not meta_token or not meta_account:
+            return jsonify({
+                'error': 'META_ACCESS_TOKEN and META_AD_ACCOUNT_ID not configured',
+                'setup': 'Set these environment variables in Railway to enable Meta ad spend tracking'
+            }), 400
+
+        def _do_meta_sync():
+            try:
+                meta = MetaAdsSync(meta_token, meta_account, db)
+                all_events = db.get_events(upcoming_only=False)
+                result = meta.sync_all_events(all_events)
+                log.info(f"Manual Meta sync complete: {result}")
+            except Exception as e:
+                log.error(f"Manual Meta sync error: {e}")
+
+        threading.Thread(target=_do_meta_sync, daemon=True).start()
+        return jsonify({'status': 'started', 'message': 'Meta ad spend sync started in background'})
+
+    @app.route('/api/meta-status')
+    def meta_status():
+        """Check Meta ad spend data status."""
+        status = db.get_meta_sync_status()
+        meta_configured = bool(os.environ.get('META_ACCESS_TOKEN') and os.environ.get('META_AD_ACCOUNT_ID'))
+        return jsonify({
+            'configured': meta_configured,
+            'data': status
+        })
+
+        # === Dashboard ===
 
     @app.route('/api/dashboard')
     def dashboard():
@@ -1841,6 +2080,16 @@ class CraftDominant:
 
         eb = EventbriteSync(api_key, self.db)
         return eb.sync_all(years_back)
+
+    def sync_meta(self, access_token: str, ad_account_id: str) -> dict:
+        """Sync ad spend from Meta Marketing API."""
+        if not requests:
+            return {'error': 'requests library not installed'}
+
+        meta = MetaAdsSync(access_token, ad_account_id, self.db)
+        all_events = self.db.get_events(upcoming_only=False)
+        return meta.sync_all_events(all_events)
+
 
     def analyze(self, event_id: str = None) -> Any:
         """Analyze one event or portfolio."""
