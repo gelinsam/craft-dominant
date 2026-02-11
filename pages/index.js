@@ -94,16 +94,57 @@ const EventDetail = ({ event }) => {
         ))}
       </div>
 
-      {event.historical_median_at_point > 0 && (
+      {(event.historical_comparisons?.length > 0 || event.historical_median_at_point > 0) && (
         <div className="mb-6 p-4 bg-gray-50 rounded-lg">
-          <h3 className="font-semibold mb-2">Historical Comparison</h3>
-          <div className="grid grid-cols-3 gap-4 text-sm">
-            <div><span className="text-gray-500">Current:</span> <strong>{event.sell_through?.toFixed(1)}%</strong></div>
-            <div><span className="text-gray-500">Historical:</span> <strong>{event.historical_median_at_point?.toFixed(1)}%</strong></div>
-            <div><span className="text-gray-500">Pace:</span> <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>{event.pace_vs_historical >= 0 ? '+' : ''}{event.pace_vs_historical?.toFixed(0)}%</strong></div>
-          </div>
-          {event.comparison_events?.length > 0 && (
-            <div className="mt-2 text-xs text-gray-500">Based on: {event.comparison_events.slice(0, 2).join(', ')}</div>
+          <h3 className="font-semibold mb-3">Historical Pacing ({event.days_until}d out)</h3>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b text-gray-500">
+                <th className="text-left py-2">Year</th>
+                <th className="text-right py-2">@ {event.days_until}d out</th>
+                <th className="text-right py-2">Final</th>
+                <th className="text-right py-2">Capacity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {event.historical_comparisons?.map((h, i) => (
+                <tr key={i} className="border-b border-gray-100">
+                  <td className="py-2">
+                    <div className="font-medium">{h.year}</div>
+                    <div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}</div>
+                  </td>
+                  <td className="text-right py-2 font-medium">
+                    {h.at_days_out ? `${h.at_days_out.tickets.toLocaleString()} (${h.at_days_out.sell_through?.toFixed(1)}%)` : '\u2014'}
+                  </td>
+                  <td className="text-right py-2">
+                    {h.final_tickets?.toLocaleString()} ({h.final_sell_through}%)
+                  </td>
+                  <td className="text-right py-2 text-gray-500">
+                    {h.capacity?.toLocaleString()}
+                  </td>
+                </tr>
+              ))}
+              <tr className="font-bold bg-blue-50">
+                <td className="py-2 rounded-l">
+                  <div>{new Date(event.event_date).getFullYear()} <span className="text-xs font-normal text-gray-500">current</span></div>
+                  <div className="text-xs text-gray-400 font-normal">{event.event_date?.slice(0, 10)}</div>
+                </td>
+                <td className="text-right py-2 text-blue-600">
+                  {event.tickets_sold?.toLocaleString()} ({event.sell_through?.toFixed(1)}%)
+                </td>
+                <td className="text-right py-2 text-blue-600">
+                  {event.projected_final?.toLocaleString()} proj
+                </td>
+                <td className="text-right py-2 text-gray-500 rounded-r">
+                  {event.capacity?.toLocaleString()}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          {event.pace_vs_historical !== 0 && event.historical_median_at_point > 0 && (
+            <div className="mt-3 text-sm">
+              Pace vs median: <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>{event.pace_vs_historical >= 0 ? '+' : ''}{event.pace_vs_historical?.toFixed(0)}%</strong>
+            </div>
           )}
         </div>
       )}
