@@ -15,7 +15,7 @@ from enum import Enum
 
 try:
     import requests
-except ImportError
+except ImportError:
     requests = None
 
 try:
