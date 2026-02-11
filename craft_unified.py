@@ -806,29 +806,7 @@ class EventbriteSync:
         if not email:
             return None
 
-        try:
-            order_date = datetime.fromisoformat(created.replace('Z', '+00:00')).replace(tzinfo=None)
-            days_before = max(0, (event_date - order_date).days)
-        except:
-            order_date = datetime.now()
-            days_before = 0
-
-        costs = data.get('costs') or {}
-        gross = costs.get('gross') or {}
-        gross_amount = float(gross.get('major_value') or 0)
-
-        attendees = data.get('attendees', [])
-        ticket_count = len(attendees) if attendees else 1
-
-        ticket_type = None
-        if attendees:
-            ticket_type = attendees[0].get('ticket_class_name')
-
-        return {
-            'order_id': order_id,
-            'event_id': event_id,
-            'email': email,
-            'order_timestamp': order_date.isoformat(),
+        try:tamp': order_date.isoformat(),
             'ticket_count': ticket_count,
             'gross_amount': gross_amount,
             'ticket_type': ticket_type,
@@ -965,6 +943,28 @@ class EventbriteSync:
             first_dt = datetime.fromisoformat(first_date)
             last_dt = datetime.fromisoformat(last_date)
             days_since = (datetime.now() - last_dt).days
+            order_date = datetime.fromisoformat(created.replace('Z', '+00:00')).replace(tzinfo=None)
+            days_before = max(0, (event_date - order_date).days)
+        except:
+            order_date = datetime.now()
+            days_before = 0
+
+        costs = data.get('costs') or {}
+        gross = costs.get('gross') or {}
+        gross_amount = float(gross.get('major_value') or 0)
+
+        attendees = data.get('attendees', [])
+        ticket_count = len(attendees) if attendees else 1
+
+        ticket_type = None
+        if attendees:
+            ticket_type = attendees[0].get('ticket_class_name')
+
+        return {
+            'order_id': order_id,
+            'event_id': event_id,
+            'email': email,
+            'order_times
             tenure = (datetime.now() - first_dt).days
         except:
             days_since = 0
@@ -1416,17 +1416,154 @@ class DecisionEngine:
             ]
         )
 
+    def _detect_timed_entry_groups(self, analyses):
+        """Detect timed-entry events (same name, within 3 days of each other)."""
+        by_pattern = defaultdict(list)
+        for a in analyses:
+            by_pattern[self._get_pattern(a.event_name)].append(a)
+        result = {}
+        for pattern, group in by_pattern.items():
+            if len(group) < 2:
+                continue
+            dates = [datetime.fromisoformat(a.event_date).date() for a in group]
+            if 0 < (max(dates) - min(dates)).days <= 3:
+                result[pattern] = group
+        return result
+
+    def _create_day_event(self, pattern, day_analyses, all_analyses_for_pattern):
+        """Combine multiple time-slot EventPacing objects for same day into one."""
+        import hashlib
+        first_date = datetime.fromisoformat(day_analyses[0].event_date).date()
+        day_name = first_date.strftime("%A")
+        names = [a.event_name for a in all_analyses_for_pattern]
+        base_name = names[0]
+        if len(names) > 1:
+            prefix = names[0]
+            for n in names[1:]:
+                while not n.startswith(prefix):
+                    prefix = prefix[:-1]
+            prefix = prefix.rstrip(" -:/")
+            if len(prefix) > 10:
+                base_name = prefix
+        logical_name = f"{base_name} - {day_name}"
+        eid = hashlib.md5(f"{logical_name}_{first_date}".encode()).hexdigest()
+        total_tickets = sum(a.tickets_sold for a in day_analyses)
+        total_revenue = sum(a.revenue for a in day_analyses)
+        max_capacity = max(a.capacity for a in day_analyses) if day_analyses else 0
+        total_spend = sum(a.ad_spend for a in day_analyses)
+        sell_through = (total_tickets / max_capacity * 100) if max_capacity > 0 else 0
+        cac_val = (total_spend / total_tickets) if total_tickets > 0 else 0
+        days_until = day_analyses[0].days_until
+        best_urgency = max(a.urgency for a in day_analyses)
+        best_decision = best_rationale = best_actions = None, "", []
+        for a in day_analyses:
+            if a.urgency == best_urgency:
+                best_decision = a.decision
+                best_rationale = a.rationale
+                best_actions = a.actions
+                break
+        historical_comparisons = []
+        all_events = self.db.get_events()
+        past_by_date = defaultdict(list)
+        for pe in all_events:
+            if self._get_pattern(pe['name']) != pattern:
+                continue
+            pe_date = datetime.fromisoformat(pe['event_date']).date()
+            is_current = any(pe['event_id'] == a.event_id for a in all_analyses_for_pattern)
+            if is_current:
+                continue
+            past_by_date[(pe_date.year, pe_date)].append(pe)
+        for (year, pdate), events_on_date in past_by_date.items():
+            pd_weekday = pdate.strftime("%A")
+            if pd_weekday != day_name:
+                continue
+            date_tickets = 0
+            date_revenue = 0
+            date_capacity = 0
+            for pe in events_on_date:
+                t = self.db.get_event_tickets(pe['event_id'])
+                r = self.db.get_event_revenue(pe['event_id'])
+                c = pe.get('capacity', 0)
+                date_tickets += t
+                date_revenue += r
+                date_capacity = max(date_capacity, c)
+            date_sell = (date_tickets / date_capacity * 100) if date_capacity > 0 else 0
+            snap_tickets = 0
+            snap_revenue = 0
+            snap_found = False
+            for pe in events_on_date:
+                s = self.db.get_snapshot_at_days(pe['event_id'], days_until)
+                if s:
+                    snap_tickets += s['tickets_cumulative']
+                    snap_revenue += s['revenue_cumulative']
+                    snap_found = True
+            snap_sell = round(snap_tickets / date_capacity * 100, 1) if snap_found and date_capacity > 0 else 0
+            comp = {
+                'event_name': events_on_date[0]['name'],
+                'event_date': str(pdate),
+                'year': year,
+                'day_of_week': pd_weekday,
+                'final_tickets': date_tickets,
+                'final_revenue': date_revenue,
+                'capacity': date_capacity,
+                'final_sell_through': round(date_sell, 1),
+            }
+            if snap_found:
+                comp['at_days_out'] = {'days': days_until, 'tickets': snap_tickets, 'revenue': snap_revenue, 'sell_through': snap_sell}
+            else:
+                comp['at_days_out'] = None
+            historical_comparisons.append(comp)
+        historical_comparisons.sort(key=lambda x: x['year'])
+        proj_finals = [a.projected_final for a in day_analyses]
+        proj_ranges = [a.projected_range for a in day_analyses]
+        hist_medians = [a.historical_median_at_point for a in day_analyses if a.historical_median_at_point > 0]
+        hist_lo = [a.historical_range[0] for a in day_analyses if a.historical_range[0] > 0]
+        hist_hi = [a.historical_range[1] for a in day_analyses if a.historical_range[1] > 0]
+        return EventPacing(
+            event_id=eid, event_name=logical_name,
+            event_date=day_analyses[0].event_date, days_until=days_until,
+            tickets_sold=total_tickets, capacity=max_capacity,
+            revenue=total_revenue, ad_spend=total_spend,
+            sell_through=round(sell_through, 1), cac=round(cac_val, 2),
+            historical_median_at_point=sum(hist_medians) if hist_medians else 0,
+            historical_range=(sum(hist_lo) if hist_lo else 0, sum(hist_hi) if hist_hi else 0),
+            pace_vs_historical=0,
+            comparison_events=[c['event_name'] for c in historical_comparisons],
+            comparison_years=[c['year'] for c in historical_comparisons],
+            projected_final=sum(proj_finals),
+            projected_range=(sum(r[0] for r in proj_ranges), sum(r[1] for r in proj_ranges)),
+            confidence=max(a.confidence for a in day_analyses) if day_analyses else 0.5,
+            decision=best_decision, urgency=best_urgency,
+            rationale=best_rationale, actions=best_actions,
+            high_value_targets=max(a.high_value_targets for a in day_analyses) if day_analyses else 0,
+            reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
+            historical_comparisons=historical_comparisons,
+        )
+
     def analyze_portfolio(self) -> List[EventPacing]:
-        """Analyze all upcoming events."""
+        """Analyze all upcoming events, grouping timed-entry events by day."""
         events = self.db.get_events(upcoming_only=True)
         analyses = []
-
         for event in events:
             analysis = self.analyze_event(event['event_id'])
             if analysis:
                 analyses.append(analysis)
-
-        # Sort by urgency
+        timed_groups = self._detect_timed_entry_groups(analyses)
+        if timed_groups:
+            grouped_ids = set()
+            for pattern, group in timed_groups.items():
+                for a in group:
+                    grouped_ids.add(a.event_id)
+            ungrouped = [a for a in analyses if a.event_id not in grouped_ids]
+            for pattern, group in timed_groups.items():
+                by_date = defaultdict(list)
+                for a in group:
+                    d = datetime.fromisoformat(a.event_date).date()
+                    by_date[d].append(a)
+                for date, day_group in by_date.items():
+                    day_event = self._create_day_event(pattern, day_group, group)
+                    ungrouped.append(day_event)
+            analyses = ungrouped
         analyses.sort(key=lambda x: (-x.urgency, x.days_until))
         return analyses
 
