@@ -1674,22 +1674,27 @@ class DecisionEngine:
             date_tickets = 0
             date_revenue = 0
             date_capacity = 0
+            date_spend = 0
             for pe in events_on_date:
                 t = self.db.get_event_tickets(pe['event_id'])
                 r = self.db.get_event_revenue(pe['event_id'])
                 c = pe.get('capacity', 0)
+                sp = self.db.get_event_spend(pe['event_id'])
                 date_tickets += t
                 date_revenue += r
                 date_capacity = max(date_capacity, c)
+                date_spend += sp
             date_sell = (date_tickets / date_capacity * 100) if date_capacity > 0 else 0
             snap_tickets = 0
             snap_revenue = 0
+            snap_spend = 0
             snap_found = False
             for pe in events_on_date:
                 s = self.db.get_snapshot_at_days(pe['event_id'], days_until)
                 if s:
                     snap_tickets += s['tickets_cumulative']
                     snap_revenue += s['revenue_cumulative']
+                    snap_spend += s.get('ad_spend_cumulative', 0) or 0
                     snap_found = True
             snap_sell = round(snap_tickets / date_capacity * 100, 1) if snap_found and date_capacity > 0 else 0
             comp = {
@@ -1701,9 +1706,10 @@ class DecisionEngine:
                 'final_revenue': date_revenue,
                 'capacity': date_capacity,
                 'final_sell_through': round(date_sell, 1),
+                'ad_spend_total': round(date_spend, 2),
             }
             if snap_found:
-                comp['at_days_out'] = {'days': days_until, 'tickets': snap_tickets, 'revenue': snap_revenue, 'sell_through': snap_sell}
+                comp['at_days_out'] = {'days': days_until, 'tickets': snap_tickets, 'revenue': snap_revenue, 'sell_through': snap_sell, 'ad_spend': round(float(snap_spend), 2)}
             else:
                 comp['at_days_out'] = None
             historical_comparisons.append(comp)
@@ -1776,7 +1782,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     engine = DecisionEngine(db)
 
     # Sync status tracking
-    _sync_state = {'done': False, 'running': False, 'result': None, 'error': None}
+    _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
 
     def _do_background_sync():
         """Run Eventbrite sync in background thread."""
