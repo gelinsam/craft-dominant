@@ -728,6 +728,22 @@ class EventbriteSync:
 
         return results
 
+    # Patterns that indicate non-event items (vendor fees, payment links, etc.)
+    JUNK_PATTERNS = [
+        'vendor fee', 'vendor payment', 'payment link', 'vendor registration',
+        'vendor', 'sponsor fee', 'sponsorship payment', 'booth fee',
+        'exhibitor fee', 'exhibitor registration', 'vendor app',
+        'test event', 'do not use', 'draft event'
+    ]
+
+    def _is_junk_event(self, name: str) -> bool:
+        """Filter out vendor fees, payment links, and other non-consumer events."""
+        name_lower = name.lower().strip()
+        for pattern in self.JUNK_PATTERNS:
+            if pattern in name_lower:
+                return True
+        return False
+
     def _parse_event(self, data: dict) -> Optional[dict]:
         event_id = data.get('id')
         if not event_id:
@@ -736,6 +752,11 @@ class EventbriteSync:
         name = data.get('name', {})
         if isinstance(name, dict):
             name = name.get('text', '')
+
+        # Filter out junk events (vendor fees, payment links, etc.)
+        if not name or self._is_junk_event(name):
+            log.debug(f"Skipping junk event: {name}")
+            return None
 
         start = data.get('start', {})
         event_date = start.get('local') or start.get('utc', '')
@@ -1375,12 +1396,49 @@ class DecisionEngine:
 # FLASK API
 # =============================================================================
 
-def create_app(db: Database) -> Flask:
+def create_app(db: Database, auto_sync: bool = False) -> Flask:
     """Create Flask app with all endpoints."""
+    import threading
+
     app = Flask(__name__)
     CORS(app)
 
     engine = DecisionEngine(db)
+
+    # Sync status tracking
+    _sync_state = {'done': False, 'running': False, 'result': None, 'error': None}
+
+    def _do_background_sync():
+        """Run Eventbrite sync in background thread."""
+        _sync_state['running'] = True
+        try:
+            api_key = os.environ.get('EVENTBRITE_API_KEY')
+            if not api_key:
+                _sync_state['error'] = 'EVENTBRITE_API_KEY not set'
+                log.error("EVENTBRITE_API_KEY not set - cannot sync")
+                return
+
+            log.info("Starting Eventbrite sync...")
+            eb = EventbriteSync(api_key, db)
+            result = eb.sync_all(years_back=2)
+            _sync_state['result'] = result
+
+            # Reload decision engine curves after sync
+            engine._load_curves()
+            log.info(f"Sync complete: {result.get('events', 0)} events, "
+                     f"{result.get('orders', 0)} orders, "
+                     f"{result.get('customers', 0)} customers, "
+                     f"{result.get('curves', 0)} curves")
+        except Exception as e:
+            _sync_state['error'] = str(e)
+            log.error(f"Sync error: {e}")
+        finally:
+            _sync_state['done'] = True
+            _sync_state['running'] = False
+
+    # Auto-sync on app creation (for gunicorn deployment)
+    if auto_sync:
+        threading.Thread(target=_do_background_sync, daemon=True).start()
 
     def _serialize_pacing(obj):
         """Convert EventPacing dataclass to JSON-safe dict."""
@@ -1394,34 +1452,50 @@ def create_app(db: Database) -> Flask:
     def home():
         return jsonify({
             'name': 'Craft Dominant API',
-            'endpoints': ['/api/dashboard', '/api/events', '/api/customers', '/api/curves'],
-            'status': 'running'
+            'endpoints': ['/api/dashboard', '/api/events', '/api/customers', '/api/curves',
+                          '/api/sync-status'],
+            'status': 'running',
+            'sync_done': _sync_state['done'],
+            'sync_running': _sync_state['running']
         })
 
     @app.route('/api/health')
     def health():
-        return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
+        return jsonify({
+            'status': 'ok',
+            'time': datetime.now().isoformat(),
+            'sync_done': _sync_state['done'],
+            'sync_running': _sync_state['running']
+        })
+
+    @app.route('/api/sync-status')
+    def sync_status():
+        """Check sync progress."""
+        return jsonify({
+            'done': _sync_state['done'],
+            'running': _sync_state['running'],
+            'result': _sync_state['result'],
+            'error': _sync_state['error']
+        })
 
     @app.route('/api/sync')
     def sync_endpoint():
-        """Trigger Eventbrite sync via URL."""
+        """Trigger Eventbrite sync (runs in background)."""
+        if _sync_state['running']:
+            return jsonify({'status': 'already_running', 'message': 'Sync is already in progress'})
+
         api_key = os.environ.get('EVENTBRITE_API_KEY')
         if not api_key:
             return jsonify({'error': 'EVENTBRITE_API_KEY not set'}), 500
 
-        try:
-            eb = EventbriteSync(api_key, db)
-            result = eb.sync_all(years_back=2)
-            return jsonify({
-                'status': 'success',
-                'events': result.get('events', 0),
-                'orders': result.get('orders', 0),
-                'customers': result.get('customers', 0),
-                'curves': result.get('curves', 0),
-                'errors': len(result.get('errors', []))
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+        # Reset state and run in background
+        _sync_state['done'] = False
+        _sync_state['running'] = False
+        _sync_state['result'] = None
+        _sync_state['error'] = None
+
+        threading.Thread(target=_do_background_sync, daemon=True).start()
+        return jsonify({'status': 'started', 'message': 'Sync started in background. Poll /api/sync-status for progress.'})
 
     # === Dashboard ===
 
@@ -1461,7 +1535,12 @@ def create_app(db: Database) -> Flask:
                 'total': total_customers,
                 'segments': segments
             },
-            'updated_at': datetime.now().isoformat()
+            'updated_at': datetime.now().isoformat(),
+            'sync': {
+                'done': _sync_state['done'],
+                'running': _sync_state['running'],
+                'error': _sync_state['error']
+            }
         })
 
     @app.route('/api/events')
@@ -1678,10 +1757,10 @@ class CraftDominant:
         print("\n" + "=" * 70)
 
 
-def create_app_with_db():
-    """Factory function for gunicorn deployment."""
+def create_app_with_db(auto_sync: bool = True):
+    """Factory function for gunicorn deployment. Auto-syncs on creation."""
     db = Database(os.environ.get('DB_PATH', 'craft_unified.db'))
-    return create_app(db)
+    return create_app(db, auto_sync=auto_sync)
 
 
 def main():
@@ -1764,6 +1843,14 @@ Then:
 
     else:
         print(f"Unknown command: {cmd}")
+
+# =============================================================================
+# MODULE-LEVEL APP FOR GUNICORN
+# =============================================================================
+# gunicorn craft_unified:app will use this.
+# auto_sync=True starts Eventbrite sync in background immediately.
+app = create_app_with_db(auto_sync=True)
+
 
 if __name__ == "__main__":
     main()
