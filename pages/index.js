@@ -4,11 +4,11 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 const API_BASE = 'https://craft-dominant-production.up.railway.app';
 
 const DECISIONS = {
-  pivot: { color: '#dc2626', bg: '#fef2f2', icon: '🚨', label: 'PIVOT' },
-  push: { color: '#ea580c', bg: '#fff7ed', icon: '🚀', label: 'PUSH' },
-  maintain: { color: '#16a34a', bg: '#f0fdf4', icon: '✅', label: 'MAINTAIN' },
-  coast: { color: '#2563eb', bg: '#eff6ff', icon: '😎', label: 'COAST' },
-  not_started: { color: '#6b7280', bg: '#f3f4f6', icon: '⏳', label: 'FUTURE' },
+  pivot: { color: '#dc2626', bg: '#fef2f2', icon: 'ð¨', label: 'PIVOT' },
+  push: { color: '#ea580c', bg: '#fff7ed', icon: 'ð', label: 'PUSH' },
+  maintain: { color: '#16a34a', bg: '#f0fdf4', icon: 'â', label: 'MAINTAIN' },
+  coast: { color: '#2563eb', bg: '#eff6ff', icon: 'ð', label: 'COAST' },
+  not_started: { color: '#6b7280', bg: '#f3f4f6', icon: 'â³', label: 'FUTURE' },
 };
 
 const SEGMENTS = {
@@ -75,7 +75,7 @@ const EventDetail = ({ event }) => {
       <div className="flex justify-between mb-4">
         <div>
           <h2 className="text-xl font-bold">{event.event_name}</h2>
-          <p className="text-gray-500">{event.event_date?.slice(0, 10)} • {event.days_until} days</p>
+          <p className="text-gray-500">{event.event_date?.slice(0, 10)} â¢ {event.days_until} days</p>
         </div>
         <Badge color={cfg.color} bg={cfg.bg}>{cfg.icon} {cfg.label}</Badge>
       </div>
@@ -242,16 +242,31 @@ export default function CraftDashboard() {
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [customerOrders, setCustomerOrders] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState(null);
 
-  useEffect(() => {
+  const fetchDashboard = () => {
     fetch(`${API_BASE}/api/dashboard`)
       .then(r => r.json())
       .then(d => {
         setDashboard(d);
         if (d.events?.length) setSelectedEvent(d.events[0]);
         setLoading(false);
+        // Check if backend is still syncing
+        if (d.sync?.running) {
+          setSyncing(true);
+          // Poll every 10 seconds until sync is done
+          setTimeout(fetchDashboard, 10000);
+        } else {
+          setSyncing(false);
+          if (d.sync?.error) setSyncError(d.sync.error);
+        }
       })
       .catch(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchDashboard();
   }, []);
 
   useEffect(() => {
@@ -271,9 +286,39 @@ export default function CraftDashboard() {
       });
   };
 
-  if (loading) return <div className="min-h-screen bg-gray-50 flex items-center justify-center">Loading...</div>;
+  const triggerSync = () => {
+    setSyncing(true);
+    setSyncError(null);
+    fetch(`${API_BASE}/api/sync`)
+      .then(r => r.json())
+      .then(() => {
+        // Poll for completion
+        const poll = () => {
+          fetch(`${API_BASE}/api/sync-status`)
+            .then(r => r.json())
+            .then(s => {
+              if (s.done) {
+                setSyncing(false);
+                if (s.error) setSyncError(s.error);
+                fetchDashboard();
+              } else {
+                setTimeout(poll, 5000);
+              }
+            });
+        };
+        setTimeout(poll, 5000);
+      });
+  };
+
+  if (loading) return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+      <div className="text-2xl font-bold">Craft Dominant</div>
+      <div className="text-gray-500">Loading dashboard...</div>
+    </div>
+  );
 
   const { portfolio, decisions, events, customers: cs } = dashboard || {};
+  const isEmpty = !events?.length && !portfolio?.total_tickets;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -298,15 +343,40 @@ export default function CraftDashboard() {
             <div className="flex bg-gray-100 rounded-lg p-1">
               {['events', 'crm'].map(t => (
                 <button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>
-                  {t === 'events' ? '📊 Events' : '👥 CRM'}
+                  {t === 'events' ? 'Events' : 'CRM'}
                 </button>
               ))}
             </div>
+            <button onClick={() => { if (!syncing) triggerSync(); }} className={`px-3 py-2 rounded-lg text-sm font-medium ${syncing ? 'bg-gray-200 text-gray-400' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} disabled={syncing}>
+              {syncing ? 'Syncing...' : 'Refresh Data'}
+            </button>
           </div>
         </div>
       </header>
 
+      {syncing && (
+        <div className="bg-blue-600 text-white py-2 px-6 text-center text-sm">
+          Syncing data from Eventbrite... This may take a few minutes on first load. Dashboard will update automatically.
+        </div>
+      )}
+
+      {syncError && (
+        <div className="bg-red-100 text-red-700 py-2 px-6 text-center text-sm">
+          Sync error: {syncError}
+        </div>
+      )}
+
       <main className="max-w-7xl mx-auto px-6 py-6">
+        {isEmpty && !syncing && (
+          <Card className="p-8 text-center mb-6">
+            <div className="text-xl font-bold text-gray-700 mb-2">No Data Yet</div>
+            <p className="text-gray-500 mb-4">The dashboard needs to sync with Eventbrite to load your events and sales data.</p>
+            <button onClick={triggerSync} className="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700">
+              Sync Now
+            </button>
+          </Card>
+        )}
+
         <div className="grid grid-cols-5 gap-4 mb-6">
           <Card className="p-4"><Stat label="Tickets" value={portfolio?.total_tickets?.toLocaleString() || 0} /></Card>
           <Card className="p-4"><Stat label="Revenue" value={`$${portfolio?.total_revenue?.toLocaleString() || 0}`} /></Card>
@@ -318,7 +388,11 @@ export default function CraftDashboard() {
         {tab === 'events' && (
           <div className="grid grid-cols-12 gap-6">
             <div className="col-span-4 space-y-4 max-h-[70vh] overflow-auto">
-              {events?.map(e => <EventCard key={e.event_id} event={e} selected={selectedEvent?.event_id === e.event_id} onSelect={setSelectedEvent} />)}
+              {events?.length ? events.map(e => <EventCard key={e.event_id} event={e} selected={selectedEvent?.event_id === e.event_id} onSelect={setSelectedEvent} />) : (
+                <Card className="p-6 text-center text-gray-500">
+                  {syncing ? 'Loading events...' : 'No upcoming events found'}
+                </Card>
+              )}
             </div>
             <div className="col-span-8"><EventDetail event={selectedEvent} /></div>
           </div>
@@ -345,7 +419,7 @@ export default function CraftDashboard() {
       {decisions?.pivot > 0 && (
         <div className="fixed bottom-0 left-0 right-0 bg-red-600 text-white py-3 px-6 z-50">
           <div className="max-w-7xl mx-auto flex items-center justify-between">
-            <span className="font-bold">🚨 {decisions.pivot} event(s) require PIVOT</span>
+            <span className="font-bold">ð¨ {decisions.pivot} event(s) require PIVOT</span>
             <button onClick={() => setTab('events')} className="px-4 py-1 bg-white text-red-600 rounded font-bold">View</button>
           </div>
         </div>
