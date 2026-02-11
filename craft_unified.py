@@ -15,7 +15,7 @@ from enum import Enum
 
 try:
     import requests
-except ImportError:
+except ImportError
     requests = None
 
 try:
@@ -1455,7 +1455,9 @@ class DecisionEngine:
         cac_val = (total_spend / total_tickets) if total_tickets > 0 else 0
         days_until = day_analyses[0].days_until
         best_urgency = max(a.urgency for a in day_analyses)
-        best_decision = best_rationale = best_actions = None, "", []
+        best_decision = None
+        best_rationale = ""
+        best_actions = []
         for a in day_analyses:
             if a.urgency == best_urgency:
                 best_decision = a.decision
