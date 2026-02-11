@@ -103,19 +103,29 @@ const EventDetail = ({ event }) => {
               <tr className="border-b text-gray-500">
                 <th className="text-left py-2">Year</th>
                 <th className="text-right py-2">@ {event.days_until}d out</th>
+                <th className="text-right py-2">Spend @ {event.days_until}d</th>
                 <th className="text-right py-2">Final</th>
                 <th className="text-right py-2">Capacity</th>
               </tr>
             </thead>
             <tbody>
-              {event.historical_comparisons?.map((h, i) => (
+              {event.historical_comparisons?.map((h, i) => {
+                const currSpend = h.at_days_out?.ad_spend || 0;
+                const prevH = i > 0 ? event.historical_comparisons[i-1] : null;
+                const prevSpend = prevH?.at_days_out?.ad_spend || 0;
+                const spendDelta = prevSpend > 0 ? ((currSpend - prevSpend) / prevSpend * 100) : null;
+                return (
                 <tr key={i} className="border-b border-gray-100">
                   <td className="py-2">
                     <div className="font-medium">{h.year}</div>
-                    <div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}{h.day_of_week ? ` • ${h.day_of_week.slice(0,3)}` : ''}</div>
+                    <div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}</div>
                   </td>
                   <td className="text-right py-2 font-medium">
                     {h.at_days_out ? `${h.at_days_out.tickets.toLocaleString()} (${h.at_days_out.sell_through?.toFixed(1)}%)` : '\u2014'}
+                  </td>
+                  <td className="text-right py-2">
+                    {currSpend > 0 ? <span className="font-medium">${currSpend.toLocaleString()}</span> : '\u2014'}
+                    {spendDelta !== null && <div className={`text-xs ${spendDelta >= 0 ? 'text-red-500' : 'text-green-500'}`}>{spendDelta >= 0 ? '+' : ''}{spendDelta.toFixed(0)}% YOY</div>}
                   </td>
                   <td className="text-right py-2">
                     {h.final_tickets?.toLocaleString()} ({h.final_sell_through}%)
@@ -124,7 +134,8 @@ const EventDetail = ({ event }) => {
                     {h.capacity?.toLocaleString()}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
               <tr className="font-bold bg-blue-50">
                 <td className="py-2 rounded-l">
                   <div>{new Date(event.event_date).getFullYear()} <span className="text-xs font-normal text-gray-500">current</span></div>
@@ -132,6 +143,22 @@ const EventDetail = ({ event }) => {
                 </td>
                 <td className="text-right py-2 text-blue-600">
                   {event.tickets_sold?.toLocaleString()} ({event.sell_through?.toFixed(1)}%)
+                </td>
+                <td className="text-right py-2 text-blue-600">
+                  {event.ad_spend > 0 ? (
+                    <div>
+                      <span>${event.ad_spend?.toLocaleString()}</span>
+                      {(() => {
+                        const lastComp = event.historical_comparisons?.[event.historical_comparisons.length - 1];
+                        const lastSpend = lastComp?.at_days_out?.ad_spend || 0;
+                        if (lastSpend > 0 && event.ad_spend > 0) {
+                          const delta = ((event.ad_spend - lastSpend) / lastSpend * 100);
+                          return <div className={`text-xs font-normal ${delta >= 0 ? 'text-red-500' : 'text-green-500'}`}>{delta >= 0 ? '+' : ''}{delta.toFixed(0)}% YOY</div>;
+                        }
+                        return null;
+                      })()}
+                    </div>
+                  ) : '$0'}
                 </td>
                 <td className="text-right py-2 text-blue-600">
                   {event.projected_final?.toLocaleString()} proj
