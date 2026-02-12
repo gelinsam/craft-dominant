@@ -385,7 +385,9 @@ class Database:
         )
     def get_customers(self, segment: str = None, min_ltv: float = None,
                       limit: int = 100, offset: int = 0,
-                      sort_by: str = 'ltv_score', order: str = 'DESC') -> List[dict]:
+                      sort_by: str = 'ltv_score', order: str = 'DESC',
+                      search: str = None, city: str = None,
+                      event_type: str = None) -> List[dict]:
         query = "SELECT * FROM customers WHERE 1=1"
         params = []
         if segment:
@@ -394,8 +396,19 @@ class Database:
         if min_ltv is not None:
             query += " AND ltv_score >= ?"
             params.append(min_ltv)
+        if search:
+            query += " AND email LIKE ?"
+            params.append(f"%{search.lower()}%")
+        if city:
+            query += " AND favorite_city = ?"
+            params.append(city)
+        if event_type:
+            query += " AND favorite_event_type = ?"
+            params.append(event_type)
         # Validate sort column
-        valid_sorts = ['ltv_score', 'total_spent', 'total_orders', 'days_since_last', 'total_events']
+        valid_sorts = ['ltv_score', 'total_spent', 'total_orders', 'days_since_last',
+                       'total_events', 'favorite_city', 'favorite_event_type',
+                       'avg_order_value', 'total_tickets', 'tenure_days']
         if sort_by not in valid_sorts:
             sort_by = 'ltv_score'
         order = 'DESC' if order.upper() == 'DESC' else 'ASC'
@@ -403,14 +416,38 @@ class Database:
         params.extend([limit, offset])
         rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
-    def get_customer_count(self, segment: str = None) -> int:
-        query = "SELECT COUNT(*) as cnt FROM customers"
+    def get_customer_count(self, segment: str = None, search: str = None,
+                           city: str = None, event_type: str = None) -> int:
+        query = "SELECT COUNT(*) as cnt FROM customers WHERE 1=1"
         params = []
         if segment:
-            query += " WHERE rfm_segment = ?"
+            query += " AND rfm_segment = ?"
             params.append(segment)
+        if search:
+            query += " AND email LIKE ?"
+            params.append(f"%{search.lower()}%")
+        if city:
+            query += " AND favorite_city = ?"
+            params.append(city)
+        if event_type:
+            query += " AND favorite_event_type = ?"
+            params.append(event_type)
         row = self.conn.execute(query, params).fetchone()
         return row['cnt'] if row else 0
+    def get_distinct_cities(self) -> List[str]:
+        rows = self.conn.execute("""
+            SELECT DISTINCT favorite_city FROM customers
+            WHERE favorite_city IS NOT NULL AND favorite_city != ''
+            ORDER BY favorite_city
+        """).fetchall()
+        return [r['favorite_city'] for r in rows]
+    def get_distinct_event_types(self) -> List[str]:
+        rows = self.conn.execute("""
+            SELECT DISTINCT favorite_event_type FROM customers
+            WHERE favorite_event_type IS NOT NULL AND favorite_event_type != ''
+            ORDER BY favorite_event_type
+        """).fetchall()
+        return [r['favorite_event_type'] for r in rows]
     def get_segment_counts(self) -> Dict[str, int]:
         rows = self.conn.execute("""
             SELECT rfm_segment, COUNT(*) as cnt
@@ -1827,15 +1864,19 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     # === CRM ===
     @app.route('/api/customers')
     def customers():
-        """List customers with filters."""
+        """List customers with filters, search, sorting."""
         segment = request.args.get('segment')
         min_ltv = request.args.get('min_ltv', type=float)
         limit = request.args.get('limit', 100, type=int)
         offset = request.args.get('offset', 0, type=int)
         sort_by = request.args.get('sort', 'ltv_score')
         order = request.args.get('order', 'DESC')
-        customers = db.get_customers(segment, min_ltv, limit, offset, sort_by, order)
-        total = db.get_customer_count(segment)
+        search = request.args.get('search')
+        city = request.args.get('city')
+        event_type = request.args.get('event_type')
+        customers = db.get_customers(segment, min_ltv, limit, offset, sort_by, order,
+                                     search, city, event_type)
+        total = db.get_customer_count(segment, search, city, event_type)
         return jsonify({
             'customers': customers,
             'total': total,
@@ -1857,6 +1898,14 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     def customer_segments():
         """Segment breakdown."""
         return jsonify(db.get_segment_counts())
+    @app.route('/api/customers/cities')
+    def customer_cities():
+        """Distinct cities from customer data."""
+        return jsonify(db.get_distinct_cities())
+    @app.route('/api/customers/event-types')
+    def customer_event_types():
+        """Distinct event types from customer data."""
+        return jsonify(db.get_distinct_event_types())
     @app.route('/api/customers/high-value')
     def high_value_customers():
         """High value customers for targeting."""

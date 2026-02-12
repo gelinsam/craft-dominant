@@ -210,15 +210,32 @@ const EventDetail = ({ event }) => {
   );
 };
 
-const CustomerTable = ({ customers, onSelect }) => (
-  <table className="w-full">
-    <thead className="bg-gray-50 text-left text-sm font-semibold text-gray-600">
+const SortHeader = ({ label, field, sortBy, sortOrder, onSort, align }) => {
+  const active = sortBy === field;
+  return (
+    <th className={`px-4 py-3 cursor-pointer hover:bg-gray-100 select-none ${align === 'right' ? 'text-right' : 'text-left'}`}
+        onClick={() => onSort(field)}>
+      <span className="inline-flex items-center gap-1">
+        {label}
+        {active && <span className="text-blue-600">{sortOrder === 'DESC' ? '\u25BC' : '\u25B2'}</span>}
+        {!active && <span className="text-gray-300">\u25BC</span>}
+      </span>
+    </th>
+  );
+};
+
+const CustomerTable = ({ customers, onSelect, sortBy, sortOrder, onSort }) => (
+  <table className="w-full text-sm">
+    <thead className="bg-gray-50 text-left font-semibold text-gray-600">
       <tr>
         <th className="px-4 py-3">Email</th>
+        <SortHeader label="City" field="favorite_city" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />
         <th className="px-4 py-3">Segment</th>
-        <th className="px-4 py-3 text-right">Orders</th>
-        <th className="px-4 py-3 text-right">Spent</th>
-        <th className="px-4 py-3 text-right">LTV</th>
+        <SortHeader label="Type" field="favorite_event_type" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} />
+        <SortHeader label="Events" field="total_events" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
+        <SortHeader label="Orders" field="total_orders" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
+        <SortHeader label="Spent" field="total_spent" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
+        <SortHeader label="LTV" field="ltv_score" sortBy={sortBy} sortOrder={sortOrder} onSort={onSort} align="right" />
       </tr>
     </thead>
     <tbody className="divide-y">
@@ -226,8 +243,11 @@ const CustomerTable = ({ customers, onSelect }) => (
         const seg = SEGMENTS[c.rfm_segment] || SEGMENTS.other;
         return (
           <tr key={i} className="hover:bg-gray-50 cursor-pointer" onClick={() => onSelect(c.email)}>
-            <td className="px-4 py-3 text-sm font-medium">{c.email}</td>
+            <td className="px-4 py-3 font-medium truncate max-w-[200px]" title={c.email}>{c.email}</td>
+            <td className="px-4 py-3 text-gray-600">{c.favorite_city || '\u2014'}</td>
             <td className="px-4 py-3"><Badge color={seg.color} bg={seg.color + '20'}>{seg.label}</Badge></td>
+            <td className="px-4 py-3 text-gray-600 capitalize">{c.favorite_event_type || '\u2014'}</td>
+            <td className="px-4 py-3 text-right">{c.total_events}</td>
             <td className="px-4 py-3 text-right">{c.total_orders}</td>
             <td className="px-4 py-3 text-right">${c.total_spent?.toFixed(0)}</td>
             <td className="px-4 py-3 text-right font-bold text-blue-600">{c.ltv_score?.toFixed(0)}</td>
@@ -307,12 +327,24 @@ export default function CraftDashboard() {
   const [tab, setTab] = useState('events');
   const [dashboard, setDashboard] = useState(null);
   const [customers, setCustomers] = useState([]);
+  const [customerTotal, setCustomerTotal] = useState(0);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [customerOrders, setCustomerOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState(null);
+  // CRM filters & sorting
+  const [crmSearch, setCrmSearch] = useState('');
+  const [crmSegment, setCrmSegment] = useState('');
+  const [crmCity, setCrmCity] = useState('');
+  const [crmType, setCrmType] = useState('');
+  const [crmSort, setCrmSort] = useState('ltv_score');
+  const [crmOrder, setCrmOrder] = useState('DESC');
+  const [crmPage, setCrmPage] = useState(0);
+  const [crmCities, setCrmCities] = useState([]);
+  const [crmTypes, setCrmTypes] = useState([]);
+  const CRM_LIMIT = 50;
 
   const fetchDashboard = () => {
     fetch(`${API_BASE}/api/dashboard`)
@@ -338,13 +370,35 @@ export default function CraftDashboard() {
     fetchDashboard();
   }, []);
 
+  const fetchCustomers = () => {
+    const params = new URLSearchParams({
+      limit: CRM_LIMIT,
+      offset: crmPage * CRM_LIMIT,
+      sort: crmSort,
+      order: crmOrder,
+    });
+    if (crmSearch) params.set('search', crmSearch);
+    if (crmSegment) params.set('segment', crmSegment);
+    if (crmCity) params.set('city', crmCity);
+    if (crmType) params.set('event_type', crmType);
+    fetch(`${API_BASE}/api/customers?${params}`)
+      .then(r => r.json())
+      .then(d => {
+        setCustomers(d.customers || []);
+        setCustomerTotal(d.total || 0);
+      });
+  };
+
   useEffect(() => {
     if (tab === 'crm') {
-      fetch(`${API_BASE}/api/customers?limit=50`)
-        .then(r => r.json())
-        .then(d => setCustomers(d.customers || []));
+      fetchCustomers();
+      // Load filter options once
+      if (!crmCities.length) {
+        fetch(`${API_BASE}/api/customers/cities`).then(r => r.json()).then(setCrmCities).catch(() => {});
+        fetch(`${API_BASE}/api/customers/event-types`).then(r => r.json()).then(setCrmTypes).catch(() => {});
+      }
     }
-  }, [tab]);
+  }, [tab, crmSearch, crmSegment, crmCity, crmType, crmSort, crmOrder, crmPage]);
 
   const handleSelectCustomer = (email) => {
     fetch(`${API_BASE}/api/customers/${encodeURIComponent(email)}`)
@@ -472,15 +526,74 @@ export default function CraftDashboard() {
             <div className="grid grid-cols-6 gap-4 mb-6">
               {Object.entries(cs?.segments || {}).map(([s, n]) => {
                 const cfg = SEGMENTS[s] || SEGMENTS.other;
+                const isActive = crmSegment === s;
                 return (
-                  <Card key={s} className="p-4 text-center">
+                  <Card key={s} className={`p-4 text-center cursor-pointer hover:shadow-md ${isActive ? 'ring-2 ring-blue-500' : ''}`}
+                        onClick={() => { setCrmSegment(isActive ? '' : s); setCrmPage(0); }}>
                     <div className="text-2xl font-bold" style={{ color: cfg.color }}>{n}</div>
                     <div className="text-sm text-gray-500">{cfg.label}</div>
                   </Card>
                 );
               })}
             </div>
-            <Card><CustomerTable customers={customers} onSelect={handleSelectCustomer} /></Card>
+            <Card className="overflow-hidden">
+              <div className="p-4 border-b bg-gray-50 flex flex-wrap gap-3 items-center">
+                <input
+                  type="text"
+                  placeholder="Search email..."
+                  value={crmSearch}
+                  onChange={e => { setCrmSearch(e.target.value); setCrmPage(0); }}
+                  className="px-3 py-2 border rounded-lg text-sm w-64 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <select value={crmCity} onChange={e => { setCrmCity(e.target.value); setCrmPage(0); }}
+                        className="px-3 py-2 border rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="">All Cities</option>
+                  {crmCities.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+                <select value={crmType} onChange={e => { setCrmType(e.target.value); setCrmPage(0); }}
+                        className="px-3 py-2 border rounded-lg text-sm bg-white capitalize focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="">All Types</option>
+                  {crmTypes.map(t => <option key={t} value={t} className="capitalize">{t}</option>)}
+                </select>
+                {(crmSearch || crmSegment || crmCity || crmType) && (
+                  <button onClick={() => { setCrmSearch(''); setCrmSegment(''); setCrmCity(''); setCrmType(''); setCrmPage(0); }}
+                          className="px-3 py-2 text-sm text-red-600 hover:bg-red-50 rounded-lg">
+                    Clear filters
+                  </button>
+                )}
+                <div className="ml-auto text-sm text-gray-500">
+                  {customerTotal} customer{customerTotal !== 1 ? 's' : ''}
+                </div>
+              </div>
+              <div className="overflow-x-auto">
+                <CustomerTable customers={customers} onSelect={handleSelectCustomer}
+                               sortBy={crmSort} sortOrder={crmOrder}
+                               onSort={(field) => {
+                                 if (crmSort === field) {
+                                   setCrmOrder(crmOrder === 'DESC' ? 'ASC' : 'DESC');
+                                 } else {
+                                   setCrmSort(field);
+                                   setCrmOrder('DESC');
+                                 }
+                                 setCrmPage(0);
+                               }} />
+              </div>
+              {customerTotal > CRM_LIMIT && (
+                <div className="p-4 border-t flex items-center justify-between">
+                  <button onClick={() => setCrmPage(Math.max(0, crmPage - 1))} disabled={crmPage === 0}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium ${crmPage === 0 ? 'text-gray-300' : 'text-blue-600 hover:bg-blue-50'}`}>
+                    Previous
+                  </button>
+                  <span className="text-sm text-gray-500">
+                    Page {crmPage + 1} of {Math.ceil(customerTotal / CRM_LIMIT)}
+                  </span>
+                  <button onClick={() => setCrmPage(crmPage + 1)} disabled={(crmPage + 1) * CRM_LIMIT >= customerTotal}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium ${(crmPage + 1) * CRM_LIMIT >= customerTotal ? 'text-gray-300' : 'text-blue-600 hover:bg-blue-50'}`}>
+                    Next
+                  </button>
+                </div>
+              )}
+            </Card>
           </div>
         )}
       </main>
