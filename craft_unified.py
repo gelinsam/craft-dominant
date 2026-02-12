@@ -1344,7 +1344,7 @@ class DecisionEngine:
         projected_range = (tickets, capacity)
         confidence = 0.5
         if curve and curve['curve_data']:
-            # Find closest day in curve
+            # Find closest day in curve for pace calculation
             available_days = sorted(curve['curve_data'].keys(), reverse=True)
             closest_day = None
             for d in available_days:
@@ -1363,22 +1363,6 @@ class DecisionEngine:
                 comparison_years = [int(re.search(r'20\d{2}', e).group())
                                    for e in curve['source_events']
                                    if re.search(r'20\d{2}', e)]
-                # Projection
-                if curve['avg_final_sell_through'] > 0:
-                    pace_mult = sell_through / hist_median if hist_median > 0 else 1
-                    proj_pct = curve['avg_final_sell_through'] * pace_mult
-                    projected_final = int(capacity * proj_pct / 100)
-                    projected_final = max(tickets, min(capacity, projected_final))
-                    low_mult = sell_through / hist_range[1] if hist_range[1] > 0 else pace_mult
-                    high_mult = sell_through / hist_range[0] if hist_range[0] > 0 else pace_mult
-                    proj_low = int(capacity * curve['avg_final_sell_through'] * low_mult / 100)
-                    proj_high = int(capacity * curve['avg_final_sell_through'] * high_mult / 100)
-                    projected_range = (
-                        max(tickets, min(capacity, proj_low)),
-                        max(tickets, min(capacity, proj_high))
-                    )
-                samples = point.get('samples', 1)
-                confidence = 0.9 if samples >= 3 else 0.75 if samples >= 2 else 0.5
         # Decision
         decision, urgency, rationale, actions = self._decide(
             tickets, capacity, sell_through, pace, cac, days_until, hist_median, comparison_events
@@ -1426,6 +1410,25 @@ class DecisionEngine:
                 comp['at_days_out'] = None
             historical_comparisons.append(comp)
         historical_comparisons.sort(key=lambda x: x['year'])
+        # YOY Projection: this_year_tickets / last_year_tickets_at_point * last_year_final
+        comps_with_data = [c for c in historical_comparisons
+                           if c.get('at_days_out') and c['at_days_out']['tickets'] > 0
+                           and c['final_tickets'] > 0]
+        if comps_with_data and tickets > 0:
+            # Use most recent year for primary projection
+            last_year = comps_with_data[-1]
+            last_at_point = last_year['at_days_out']['tickets']
+            last_final = last_year['final_tickets']
+            projected_final = int(tickets / last_at_point * last_final)
+            projected_final = max(tickets, projected_final)
+            # Range from all available years
+            all_projections = []
+            for c in comps_with_data:
+                at_point = c['at_days_out']['tickets']
+                proj = int(tickets / at_point * c['final_tickets'])
+                all_projections.append(max(tickets, proj))
+            projected_range = (min(all_projections), max(all_projections))
+            confidence = 0.9 if len(comps_with_data) >= 3 else 0.75 if len(comps_with_data) >= 2 else 0.6
         return EventPacing(
             event_id=event_id,
             event_name=event['name'],
@@ -1618,8 +1621,26 @@ class DecisionEngine:
                 comp['at_days_out'] = None
             historical_comparisons.append(comp)
         historical_comparisons.sort(key=lambda x: x['year'])
-        proj_finals = [a.projected_final for a in day_analyses]
-        proj_ranges = [a.projected_range for a in day_analyses]
+        # YOY Projection for grouped events
+        grouped_proj_final = total_tickets
+        grouped_proj_range = (total_tickets, max_capacity)
+        grouped_confidence = 0.5
+        comps_with_data = [c for c in historical_comparisons
+                           if c.get('at_days_out') and c['at_days_out']['tickets'] > 0
+                           and c['final_tickets'] > 0]
+        if comps_with_data and total_tickets > 0:
+            last_year = comps_with_data[-1]
+            last_at_point = last_year['at_days_out']['tickets']
+            last_final = last_year['final_tickets']
+            grouped_proj_final = int(total_tickets / last_at_point * last_final)
+            grouped_proj_final = max(total_tickets, grouped_proj_final)
+            all_projections = []
+            for c in comps_with_data:
+                at_point = c['at_days_out']['tickets']
+                proj = int(total_tickets / at_point * c['final_tickets'])
+                all_projections.append(max(total_tickets, proj))
+            grouped_proj_range = (min(all_projections), max(all_projections))
+            grouped_confidence = 0.9 if len(comps_with_data) >= 3 else 0.75 if len(comps_with_data) >= 2 else 0.6
         hist_medians = [a.historical_median_at_point for a in day_analyses if a.historical_median_at_point > 0]
         hist_lo = [a.historical_range[0] for a in day_analyses if a.historical_range[0] > 0]
         hist_hi = [a.historical_range[1] for a in day_analyses if a.historical_range[1] > 0]
@@ -1634,9 +1655,9 @@ class DecisionEngine:
             pace_vs_historical=0,
             comparison_events=[c['event_name'] for c in historical_comparisons],
             comparison_years=[c['year'] for c in historical_comparisons],
-            projected_final=sum(proj_finals),
-            projected_range=(sum(r[0] for r in proj_ranges), sum(r[1] for r in proj_ranges)),
-            confidence=max(a.confidence for a in day_analyses) if day_analyses else 0.5,
+            projected_final=grouped_proj_final,
+            projected_range=grouped_proj_range,
+            confidence=grouped_confidence,
             decision=best_decision, urgency=best_urgency,
             rationale=best_rationale, actions=best_actions,
             high_value_targets=max(a.high_value_targets for a in day_analyses) if day_analyses else 0,
