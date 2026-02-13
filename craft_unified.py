@@ -2410,25 +2410,75 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         audience = request.args.get('audience')  # past_attendees, city_prospects, type_fans, at_risk
         if not event_id or not audience:
             return jsonify({'error': 'event_id and audience required'}), 400
-        # Get the event
+        # --- Resolve event_id (same logic as targeting endpoint) ---
         event = None
-        for e in db.get_events(upcoming_only=False):
+        all_sibling_ids = [event_id]
+        base_event_name = ''
+        events_list = db.get_events(upcoming_only=False)
+        for e in events_list:
             if e['event_id'] == event_id:
                 event = e
+                base_event_name = e['name']
                 break
+        if event:
+            # Real event — find timed-entry siblings
+            event_pattern = engine._get_pattern(event['name'])
+            event_date = datetime.fromisoformat(event['event_date']).date()
+            for e in events_list:
+                if e['event_id'] == event_id:
+                    continue
+                if engine._get_pattern(e['name']) != event_pattern:
+                    continue
+                e_date = datetime.fromisoformat(e['event_date']).date()
+                if abs((e_date - event_date).days) <= 3:
+                    all_sibling_ids.append(e['event_id'])
+        else:
+            # Synthetic grouped event — resolve via portfolio analysis
+            analyses = engine.analyze_portfolio()
+            for a in analyses:
+                if a.event_id == event_id:
+                    all_sibling_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
+                    for e in events_list:
+                        if e['event_id'] in all_sibling_ids:
+                            base_event_name = e['name']
+                            event = {
+                                'event_id': event_id, 'name': a.event_name,
+                                'event_date': a.event_date, 'capacity': a.capacity,
+                                'city': e.get('city', ''), 'event_type': e.get('event_type', ''),
+                            }
+                            break
+                    if not event:
+                        event = {'event_id': event_id, 'name': a.event_name,
+                                 'event_date': a.event_date, 'capacity': a.capacity,
+                                 'city': '', 'event_type': ''}
+                    break
         if not event:
             return jsonify({'error': 'Event not found'}), 404
-        current_buyers = db.get_event_buyers(event_id)
+        # Combine buyers from ALL siblings
+        current_buyers = set()
+        for eid in all_sibling_ids:
+            current_buyers.update(db.get_event_buyers(eid))
+        pattern_name = base_event_name or event['name']
+        # --- Build audience list ---
         customers_list = []
         if audience == 'past_attendees':
-            customers_list = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            customers_list = db.get_past_attendees_not_purchased(
+                event_id, pattern_name, limit=10000,
+                current_buyer_emails=current_buyers,
+                exclude_event_ids=list(set(all_sibling_ids)))
         elif audience == 'city_prospects':
-            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            past = db.get_past_attendees_not_purchased(
+                event_id, pattern_name, limit=10000,
+                current_buyer_emails=current_buyers,
+                exclude_event_ids=list(set(all_sibling_ids)))
             exclude = {c['email'] for c in past}
             exclude.update(current_buyers)
             customers_list = db.get_city_prospects(event.get('city', ''), exclude_emails=exclude, limit=10000)
         elif audience == 'type_fans':
-            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            past = db.get_past_attendees_not_purchased(
+                event_id, pattern_name, limit=10000,
+                current_buyer_emails=current_buyers,
+                exclude_event_ids=list(set(all_sibling_ids)))
             exclude = {c['email'] for c in past}
             exclude.update(current_buyers)
             city_p = db.get_city_prospects(event.get('city', ''), exclude_emails=exclude, limit=10000)
@@ -2445,8 +2495,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                    (event.get('city') and event['city'] in str(ecities)):
                     customers_list.append(c)
         elif audience == 'all':
-            # Export all audiences combined
-            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            past = db.get_past_attendees_not_purchased(
+                event_id, pattern_name, limit=10000,
+                current_buyer_emails=current_buyers,
+                exclude_event_ids=list(set(all_sibling_ids)))
             seen = {c['email'] for c in past}
             seen.update(current_buyers)
             customers_list.extend(past)
