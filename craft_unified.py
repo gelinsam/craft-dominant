@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import csv
+import io
 import sqlite3
 import hashlib
 import logging
@@ -479,6 +481,118 @@ class Database:
             ORDER BY total_spent DESC
         """, (min_orders, min_days_inactive)).fetchall()
         return [dict(r) for r in rows]
+    # === Targeting ===
+    def get_event_buyers(self, event_id: str) -> set:
+        """Get set of emails that have orders for a specific event."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT lower(email) as email FROM orders WHERE event_id = ?",
+            (event_id,)
+        ).fetchall()
+        return {r['email'] for r in rows}
+    def get_pattern_event_ids(self, pattern: str, exclude_ids: list = None) -> List[str]:
+        """Get all event IDs matching a pattern name (for finding past editions)."""
+        rows = self.conn.execute("SELECT event_id, name FROM events").fetchall()
+        # Use same pattern extraction logic
+        matched = []
+        for r in rows:
+            name_lower = r['name'].lower()
+            name_lower = re.sub(r'20\d{2}', '', name_lower)
+            replacements = {
+                'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
+                'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
+            }
+            for old, new in replacements.items():
+                name_lower = name_lower.replace(old, new)
+            name_lower = re.sub(r'[^a-z\s]', '', name_lower)
+            name_lower = '_'.join(name_lower.split())
+            name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+            if name_lower == pattern or pattern in name_lower or name_lower in pattern:
+                if not exclude_ids or r['event_id'] not in exclude_ids:
+                    matched.append(r['event_id'])
+        return matched
+    def get_past_attendees_not_purchased(self, event_id: str, event_name: str,
+                                          limit: int = 2000) -> List[dict]:
+        """Find customers who attended past editions of this event but haven't bought this year's."""
+        # Get current event's buyers
+        current_buyers = self.get_event_buyers(event_id)
+        # Get pattern for this event
+        name_lower = event_name.lower()
+        name_lower = re.sub(r'20\d{2}', '', name_lower)
+        replacements = {
+            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
+            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
+        }
+        for old, new in replacements.items():
+            name_lower = name_lower.replace(old, new)
+        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
+        name_lower = '_'.join(name_lower.split())
+        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+        pattern = name_lower
+        # Find all past event IDs with same pattern
+        past_event_ids = self.get_pattern_event_ids(pattern, exclude_ids=[event_id])
+        if not past_event_ids:
+            return []
+        # Get all past attendee emails
+        placeholders = ','.join(['?' for _ in past_event_ids])
+        rows = self.conn.execute(f"""
+            SELECT DISTINCT lower(o.email) as email,
+                   COUNT(DISTINCT o.event_id) as past_editions,
+                   SUM(o.gross_amount) as past_spent,
+                   MAX(o.order_timestamp) as last_purchase
+            FROM orders o
+            WHERE o.event_id IN ({placeholders})
+            GROUP BY lower(o.email)
+            ORDER BY past_spent DESC
+        """, past_event_ids).fetchall()
+        # Filter out current buyers, enrich with customer data
+        results = []
+        for r in rows:
+            if r['email'] in current_buyers:
+                continue
+            # Get customer record
+            cust = self.conn.execute(
+                "SELECT * FROM customers WHERE email = ?", (r['email'],)
+            ).fetchone()
+            if cust:
+                result = dict(cust)
+                result['past_editions'] = r['past_editions']
+                result['past_event_spent'] = r['past_spent']
+                result['last_event_purchase'] = r['last_purchase']
+                results.append(result)
+            if len(results) >= limit:
+                break
+        return results
+    def get_city_prospects(self, city: str, exclude_emails: set = None,
+                           limit: int = 1000) -> List[dict]:
+        """Get customers in a city who might be interested (bought other events there)."""
+        rows = self.conn.execute("""
+            SELECT * FROM customers
+            WHERE favorite_city = ? AND ltv_score >= 20
+            ORDER BY ltv_score DESC
+            LIMIT ?
+        """, (city, limit)).fetchall()
+        results = []
+        for r in rows:
+            if exclude_emails and r['email'] in exclude_emails:
+                continue
+            results.append(dict(r))
+        return results
+    def get_type_prospects(self, event_type: str, exclude_emails: set = None,
+                           limit: int = 1000) -> List[dict]:
+        """Get customers who like this event type but haven't bought current event."""
+        rows = self.conn.execute("""
+            SELECT * FROM customers
+            WHERE (favorite_event_type = ? OR event_types LIKE ?)
+              AND ltv_score >= 20
+            ORDER BY ltv_score DESC
+            LIMIT ?
+        """, (event_type, f'%"{event_type}"%', limit)).fetchall()
+        results = []
+        for r in rows:
+            if exclude_emails and r['email'] in exclude_emails:
+                continue
+            results.append(dict(r))
+        return results
     # === Snapshots ===
     def save_snapshot(self, event_id: str, snapshot_date: str, days_before: int,
                       tickets: int, revenue: float, tickets_today: int = 0,
@@ -1948,6 +2062,351 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'count': len(customers),
             'total_historical_value': total_value
         })
+    # === Targeting ===
+    @app.route('/api/targeting/<event_id>')
+    def targeting(event_id: str):
+        """Get targeting audiences with revenue gap, repeat rate, timing intelligence."""
+        event = None
+        events_list = db.get_events(upcoming_only=False)
+        for e in events_list:
+            if e['event_id'] == event_id:
+                event = e
+                break
+        if not event:
+            return jsonify({'error': 'Event not found'}), 404
+        current_buyers = db.get_event_buyers(event_id)
+        current_tickets = db.get_event_tickets(event_id)
+        current_revenue = db.get_event_revenue(event_id)
+        capacity = event.get('capacity', 500)
+        avg_ticket_price = current_revenue / current_tickets if current_tickets > 0 else 0
+        # ---- REVENUE GAP ANALYSIS ----
+        # Find last year's edition of this event
+        name_lower = event['name'].lower()
+        name_lower = re.sub(r'20\d{2}', '', name_lower)
+        replacements = {
+            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
+            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
+        }
+        for old, new in replacements.items():
+            name_lower = name_lower.replace(old, new)
+        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
+        name_lower = '_'.join(name_lower.split())
+        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+        pattern = name_lower
+        past_event_ids = db.get_pattern_event_ids(pattern, exclude_ids=[event_id])
+        # Get last year's stats
+        last_year_data = None
+        last_year_buyers = set()
+        all_past_buyers = set()
+        for pid in past_event_ids:
+            pe = None
+            for ev in events_list:
+                if ev['event_id'] == pid:
+                    pe = ev
+                    break
+            if pe:
+                pe_tickets = db.get_event_tickets(pid)
+                pe_revenue = db.get_event_revenue(pid)
+                pe_buyers = db.get_event_buyers(pid)
+                all_past_buyers.update(pe_buyers)
+                pe_year = datetime.fromisoformat(pe['event_date']).year
+                if last_year_data is None or pe_year > last_year_data.get('year', 0):
+                    last_year_data = {
+                        'year': pe_year,
+                        'event_name': pe['name'],
+                        'tickets': pe_tickets,
+                        'revenue': pe_revenue,
+                        'buyers': pe_buyers,
+                        'capacity': pe.get('capacity', 0),
+                    }
+                    last_year_buyers = pe_buyers
+        # Repeat buyer rate
+        repeat_buyers = current_buyers & all_past_buyers
+        repeat_rate = len(repeat_buyers) / len(all_past_buyers) * 100 if all_past_buyers else 0
+        # Revenue gap
+        revenue_gap = {}
+        if last_year_data:
+            tickets_gap = max(0, last_year_data['tickets'] - current_tickets)
+            revenue_needed = max(0, last_year_data['revenue'] - current_revenue)
+            ly_avg_price = last_year_data['revenue'] / last_year_data['tickets'] if last_year_data['tickets'] > 0 else avg_ticket_price
+            revenue_gap = {
+                'last_year': last_year_data['year'],
+                'last_year_tickets': last_year_data['tickets'],
+                'last_year_revenue': round(last_year_data['revenue'], 2),
+                'last_year_capacity': last_year_data['capacity'],
+                'tickets_gap': tickets_gap,
+                'revenue_gap': round(revenue_needed, 2),
+                'avg_ticket_price': round(avg_ticket_price or ly_avg_price, 2),
+                'pct_of_last_year': round(current_tickets / last_year_data['tickets'] * 100, 1) if last_year_data['tickets'] > 0 else 0,
+            }
+        # ---- AUDIENCE BUILDING ----
+        # 1. Past attendees who haven't purchased (sorted by priority)
+        past_attendees = db.get_past_attendees_not_purchased(
+            event_id, event['name'], limit=5000
+        )
+        # Priority score each customer: champions first, then by timing urgency
+        days_until = (datetime.fromisoformat(event['event_date']).date() - date.today()).days
+        priority_weights = {'champion': 100, 'loyal': 80, 'potential': 60, 'at_risk': 40, 'hibernating': 20, 'other': 30}
+        for c in past_attendees:
+            seg_score = priority_weights.get(c.get('rfm_segment', 'other'), 30)
+            ltv = c.get('ltv_score', 0) or 0
+            # Timing urgency: early_birds who haven't bought yet are overdue
+            timing = c.get('timing_segment', '')
+            timing_urgency = 0
+            if timing == 'super_early_bird' and days_until < 60: timing_urgency = 30
+            elif timing == 'early_bird' and days_until < 45: timing_urgency = 25
+            elif timing == 'planner' and days_until < 30: timing_urgency = 15
+            elif timing == 'last_minute' and days_until < 14: timing_urgency = 10
+            past_editions = c.get('past_editions', 1) or 1
+            c['priority_score'] = seg_score + ltv * 0.3 + timing_urgency + (past_editions * 10)
+        past_attendees.sort(key=lambda x: x.get('priority_score', 0), reverse=True)
+        past_value = sum(c.get('total_spent', 0) for c in past_attendees)
+        # Timing breakdown for past attendees
+        timing_breakdown = {}
+        for c in past_attendees:
+            ts = c.get('timing_segment', 'unknown') or 'unknown'
+            if ts not in timing_breakdown:
+                timing_breakdown[ts] = {'count': 0, 'overdue': False}
+            timing_breakdown[ts]['count'] += 1
+        # Mark which timing segments are overdue
+        if days_until < 60: timing_breakdown.get('super_early_bird', {}).update({'overdue': True})
+        if days_until < 45: timing_breakdown.get('early_bird', {}).update({'overdue': True})
+        if days_until < 30: timing_breakdown.get('planner', {}).update({'overdue': True})
+        # Segment breakdown for past attendees
+        segment_breakdown = {}
+        for c in past_attendees:
+            seg = c.get('rfm_segment', 'other') or 'other'
+            segment_breakdown[seg] = segment_breakdown.get(seg, 0) + 1
+        # 2. City prospects
+        city_prospects = []
+        if event.get('city'):
+            all_past_emails = {c['email'] for c in past_attendees}
+            all_past_emails.update(current_buyers)
+            city_prospects = db.get_city_prospects(
+                event['city'], exclude_emails=all_past_emails, limit=1000
+            )
+        city_value = sum(c.get('total_spent', 0) for c in city_prospects)
+        # 3. Event type fans
+        type_prospects = []
+        if event.get('event_type'):
+            all_exclude = {c['email'] for c in past_attendees}
+            all_exclude.update(current_buyers)
+            all_exclude.update({c['email'] for c in city_prospects})
+            type_prospects = db.get_type_prospects(
+                event['event_type'], exclude_emails=all_exclude, limit=1000
+            )
+        type_value = sum(c.get('total_spent', 0) for c in type_prospects)
+        # 4. At-risk with affinity
+        at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
+        at_risk_for_event = []
+        for c in at_risk:
+            if c['email'] in current_buyers:
+                continue
+            etypes = c.get('event_types', '{}')
+            ecities = c.get('cities', '{}')
+            has_affinity = False
+            if event.get('event_type') and event['event_type'] in str(etypes):
+                has_affinity = True
+            if event.get('city') and event['city'] in str(ecities):
+                has_affinity = True
+            if has_affinity:
+                at_risk_for_event.append(c)
+        at_risk_value = sum(c.get('total_spent', 0) for c in at_risk_for_event)
+        # ---- QUICK WIN CALCULATION ----
+        # Estimate: if we email top-priority past attendees, how many tickets at historical rebuy rate?
+        historical_rebuy_rate = repeat_rate / 100 if repeat_rate > 0 else 0.10  # default 10%
+        champion_count = segment_breakdown.get('champion', 0) + segment_breakdown.get('loyal', 0)
+        quick_win_emails = champion_count if champion_count > 0 else len(past_attendees)
+        quick_win_tickets = int(quick_win_emails * min(historical_rebuy_rate * 1.5, 0.25))  # champions convert 1.5x avg
+        quick_win_revenue = round(quick_win_tickets * (avg_ticket_price or 45), 2)
+        # ---- TIMING RECOMMENDATIONS ----
+        timing_recs = []
+        if days_until > 45:
+            overdue_early = timing_breakdown.get('super_early_bird', {}).get('count', 0)
+            if overdue_early > 0:
+                timing_recs.append({
+                    'urgency': 'now',
+                    'action': f'Email {overdue_early} super-early-bird past attendees — they usually buy 60+ days out',
+                    'count': overdue_early
+                })
+        if days_until > 14 and days_until <= 45:
+            overdue_count = sum(
+                timing_breakdown.get(ts, {}).get('count', 0)
+                for ts in ['super_early_bird', 'early_bird']
+            )
+            if overdue_count > 0:
+                timing_recs.append({
+                    'urgency': 'now',
+                    'action': f'Email {overdue_count} early birds NOW — they are overdue to buy',
+                    'count': overdue_count
+                })
+            planner_count = timing_breakdown.get('planner', {}).get('count', 0)
+            if planner_count > 0:
+                timing_recs.append({
+                    'urgency': 'soon',
+                    'action': f'{planner_count} planners typically buy 14-28 days out — email this week',
+                    'count': planner_count
+                })
+        if days_until <= 14:
+            all_overdue = len(past_attendees)
+            timing_recs.append({
+                'urgency': 'critical',
+                'action': f'FINAL PUSH: Email all {all_overdue} past attendees with urgency/scarcity messaging',
+                'count': all_overdue
+            })
+            last_min = timing_breakdown.get('last_minute', {}).get('count', 0) + timing_breakdown.get('spontaneous', {}).get('count', 0)
+            if last_min > 0:
+                timing_recs.append({
+                    'urgency': 'now',
+                    'action': f'{last_min} last-minute buyers are entering their buying window',
+                    'count': last_min
+                })
+        return jsonify({
+            'event': event,
+            'current_buyers': len(current_buyers),
+            'current_tickets': current_tickets,
+            'current_revenue': round(current_revenue, 2),
+            'capacity': capacity,
+            'days_until': days_until,
+            'avg_ticket_price': round(avg_ticket_price, 2),
+            'revenue_gap': revenue_gap,
+            'repeat_buyers': {
+                'count': len(repeat_buyers),
+                'total_past_buyers': len(all_past_buyers),
+                'rate': round(repeat_rate, 1),
+                'last_year_buyers': len(last_year_buyers),
+                'rebought_from_last_year': len(current_buyers & last_year_buyers),
+                'last_year_rebuy_rate': round(
+                    len(current_buyers & last_year_buyers) / len(last_year_buyers) * 100, 1
+                ) if last_year_buyers else 0,
+            },
+            'quick_win': {
+                'audience': 'Champion & Loyal past attendees',
+                'emails_to_send': quick_win_emails,
+                'expected_tickets': quick_win_tickets,
+                'expected_revenue': quick_win_revenue,
+                'conversion_rate_used': round(min(historical_rebuy_rate * 1.5, 0.25) * 100, 1),
+            },
+            'timing_recommendations': timing_recs,
+            'audiences': {
+                'past_attendees': {
+                    'label': 'Past Attendees Not Purchased',
+                    'description': f'Attended previous editions but no ticket this year — sorted by conversion likelihood',
+                    'count': len(past_attendees),
+                    'historical_value': round(past_value, 2),
+                    'customers': past_attendees[:100],
+                    'total_available': len(past_attendees),
+                    'segment_breakdown': segment_breakdown,
+                    'timing_breakdown': timing_breakdown,
+                },
+                'city_prospects': {
+                    'label': f'{event.get("city", "Local")} Event Fans',
+                    'description': f'High-value customers who attend events in {event.get("city", "this city")} but never attended this one',
+                    'count': len(city_prospects),
+                    'historical_value': round(city_value, 2),
+                    'customers': city_prospects[:100],
+                    'total_available': len(city_prospects),
+                },
+                'type_fans': {
+                    'label': f'{(event.get("event_type") or "Similar").title()} Lovers',
+                    'description': f'Customers who love {event.get("event_type", "this type of")} events but have not attended this one',
+                    'count': len(type_prospects),
+                    'historical_value': round(type_value, 2),
+                    'customers': type_prospects[:100],
+                    'total_available': len(type_prospects),
+                },
+                'at_risk': {
+                    'label': 'Win-Back Targets',
+                    'description': 'Previously active customers going cold — re-engage before they churn',
+                    'count': len(at_risk_for_event),
+                    'historical_value': round(at_risk_value, 2),
+                    'customers': at_risk_for_event[:100],
+                    'total_available': len(at_risk_for_event),
+                }
+            }
+        })
+    @app.route('/api/export/csv')
+    def export_csv():
+        """Export a targeting audience as CSV."""
+        event_id = request.args.get('event_id')
+        audience = request.args.get('audience')  # past_attendees, city_prospects, type_fans, at_risk
+        if not event_id or not audience:
+            return jsonify({'error': 'event_id and audience required'}), 400
+        # Get the event
+        event = None
+        for e in db.get_events(upcoming_only=False):
+            if e['event_id'] == event_id:
+                event = e
+                break
+        if not event:
+            return jsonify({'error': 'Event not found'}), 404
+        current_buyers = db.get_event_buyers(event_id)
+        customers_list = []
+        if audience == 'past_attendees':
+            customers_list = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+        elif audience == 'city_prospects':
+            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            exclude = {c['email'] for c in past}
+            exclude.update(current_buyers)
+            customers_list = db.get_city_prospects(event.get('city', ''), exclude_emails=exclude, limit=10000)
+        elif audience == 'type_fans':
+            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            exclude = {c['email'] for c in past}
+            exclude.update(current_buyers)
+            city_p = db.get_city_prospects(event.get('city', ''), exclude_emails=exclude, limit=10000)
+            exclude.update({c['email'] for c in city_p})
+            customers_list = db.get_type_prospects(event.get('event_type', ''), exclude_emails=exclude, limit=10000)
+        elif audience == 'at_risk':
+            at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
+            for c in at_risk:
+                if c['email'] in current_buyers:
+                    continue
+                etypes = c.get('event_types', '{}')
+                ecities = c.get('cities', '{}')
+                if (event.get('event_type') and event['event_type'] in str(etypes)) or \
+                   (event.get('city') and event['city'] in str(ecities)):
+                    customers_list.append(c)
+        elif audience == 'all':
+            # Export all audiences combined
+            past = db.get_past_attendees_not_purchased(event_id, event['name'], limit=10000)
+            seen = {c['email'] for c in past}
+            seen.update(current_buyers)
+            customers_list.extend(past)
+            if event.get('city'):
+                city_p = db.get_city_prospects(event['city'], exclude_emails=seen, limit=10000)
+                customers_list.extend(city_p)
+                seen.update({c['email'] for c in city_p})
+            if event.get('event_type'):
+                type_p = db.get_type_prospects(event['event_type'], exclude_emails=seen, limit=10000)
+                customers_list.extend(type_p)
+                seen.update({c['email'] for c in type_p})
+            at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
+            for c in at_risk:
+                if c['email'] not in seen:
+                    etypes = c.get('event_types', '{}')
+                    ecities = c.get('cities', '{}')
+                    if (event.get('event_type') and event['event_type'] in str(etypes)) or \
+                       (event.get('city') and event['city'] in str(ecities)):
+                        customers_list.append(c)
+        # Build CSV
+        output = io.StringIO()
+        fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
+                  'total_orders', 'total_events', 'total_spent', 'ltv_score',
+                  'days_since_last', 'last_order_date']
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for c in customers_list:
+            writer.writerow(c)
+        from flask import Response
+        csv_data = output.getvalue()
+        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', event['name'])
+        filename = f"{safe_name}_{audience}.csv"
+        return Response(
+            csv_data,
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename={filename}',
+                     'Access-Control-Allow-Origin': '*'}
+        )
     # === Pacing ===
     @app.route('/api/curves')
     def pacing_curves():
