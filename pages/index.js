@@ -392,8 +392,16 @@ export default function CraftDashboard() {
   const handleSelectCustomer = (email) => {
     fetch(`${API_BASE}/api/customers/${encodeURIComponent(email)}`).then(r => r.json()).then(d => { setSelectedCustomer(d.customer); setCustomerOrders(d.orders || []); });
   };
-  const handleExportCSV = (audienceKey) => { if (targetEvent) window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=${audienceKey}`, '_blank'); };
-  const handleExportAll = () => { if (targetEvent) window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=all`, '_blank'); };
+  const handleExportCSV = (audienceKey) => {
+    if (!targetEvent) return;
+    const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
+    window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=${audienceKey}${keyParam}`, '_blank');
+  };
+  const handleExportAll = () => {
+    if (!targetEvent) return;
+    const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
+    window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=all${keyParam}`, '_blank');
+  };
 
   const triggerSync = () => {
     setSyncing(true); setSyncError(null);

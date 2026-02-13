@@ -105,6 +105,8 @@ class EventPacing:
     reactivation_targets: int
     # Historical year-by-year comparisons
     historical_comparisons: List[dict] = field(default_factory=list)
+    # For timed-entry groups: the real DB event_ids that make up this grouped event
+    constituent_event_ids: List[str] = field(default_factory=list)
 # =============================================================================
 # DATABASE - UNIFIED SCHEMA
 # =============================================================================
@@ -511,10 +513,19 @@ class Database:
                     matched.append(r['event_id'])
         return matched
     def get_past_attendees_not_purchased(self, event_id: str, event_name: str,
-                                          limit: int = 2000) -> List[dict]:
-        """Find customers who attended past editions of this event but haven't bought this year's."""
-        # Get current event's buyers
-        current_buyers = self.get_event_buyers(event_id)
+                                          limit: int = 2000,
+                                          current_buyer_emails: set = None,
+                                          exclude_event_ids: list = None) -> List[dict]:
+        """Find customers who attended past editions of this event but haven't bought this year's.
+
+        Args:
+            current_buyer_emails: Pre-computed set of buyer emails to exclude (for grouped events).
+                                  If None, looks up buyers for event_id only.
+            exclude_event_ids: All current-year event_ids to exclude from "past" events.
+                               If None, only excludes event_id.
+        """
+        # Get current buyers — use provided set or look up single event
+        current_buyers = current_buyer_emails if current_buyer_emails is not None else self.get_event_buyers(event_id)
         # Get pattern for this event
         name_lower = event_name.lower()
         name_lower = re.sub(r'20\d{2}', '', name_lower)
@@ -529,7 +540,8 @@ class Database:
         name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
         pattern = name_lower
         # Find all past event IDs with same pattern
-        past_event_ids = self.get_pattern_event_ids(pattern, exclude_ids=[event_id])
+        ids_to_exclude = exclude_event_ids or [event_id]
+        past_event_ids = self.get_pattern_event_ids(pattern, exclude_ids=ids_to_exclude)
         if not past_event_ids:
             return []
         # Get all past attendee emails
@@ -544,21 +556,30 @@ class Database:
             GROUP BY lower(o.email)
             ORDER BY past_spent DESC
         """, past_event_ids).fetchall()
-        # Filter out current buyers, enrich with customer data
+        # Filter out current buyers
+        eligible = [r for r in rows if r['email'] not in current_buyers]
+        if not eligible:
+            return []
+        # Batch fetch customer records (fixes N+1 query)
+        emails_to_fetch = [r['email'] for r in eligible[:limit * 2]]
+        cust_map = {}
+        batch_size = 500
+        for i in range(0, len(emails_to_fetch), batch_size):
+            batch = emails_to_fetch[i:i + batch_size]
+            ph = ','.join(['?' for _ in batch])
+            cust_rows = self.conn.execute(
+                f"SELECT * FROM customers WHERE email IN ({ph})", batch
+            ).fetchall()
+            for c in cust_rows:
+                cust_map[c['email']] = dict(c)
         results = []
-        for r in rows:
-            if r['email'] in current_buyers:
-                continue
-            # Get customer record
-            cust = self.conn.execute(
-                "SELECT * FROM customers WHERE email = ?", (r['email'],)
-            ).fetchone()
+        for r in eligible:
+            cust = cust_map.get(r['email'])
             if cust:
-                result = dict(cust)
-                result['past_editions'] = r['past_editions']
-                result['past_event_spent'] = r['past_spent']
-                result['last_event_purchase'] = r['last_purchase']
-                results.append(result)
+                cust['past_editions'] = r['past_editions']
+                cust['past_event_spent'] = r['past_spent']
+                cust['last_event_purchase'] = r['last_purchase']
+                results.append(cust)
             if len(results) >= limit:
                 break
         return results
@@ -1777,6 +1798,7 @@ class DecisionEngine:
             high_value_targets=max(a.high_value_targets for a in day_analyses) if day_analyses else 0,
             reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
             historical_comparisons=historical_comparisons,
+            constituent_event_ids=[a.event_id for a in all_analyses_for_pattern],
         )
     def analyze_portfolio(self) -> List[EventPacing]:
         """Analyze all upcoming events, grouping timed-entry events by day."""
@@ -2065,61 +2087,107 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     # === Targeting ===
     @app.route('/api/targeting/<event_id>')
     def targeting(event_id: str):
-        """Get targeting audiences with revenue gap, repeat rate, timing intelligence."""
+        """Get targeting audiences with revenue gap, repeat rate, timing intelligence.
+
+        Handles both real DB event_ids and synthetic grouped event_ids from timed-entry grouping.
+        Combines buyers from ALL sessions of a timed-entry festival for accurate exclusion.
+        """
         event = None
+        real_event_ids = [event_id]  # IDs for ticket/revenue counting (same day)
+        all_sibling_ids = [event_id]  # ALL session IDs for buyer exclusion
+        base_event_name = ''  # Un-grouped name for pattern matching
         events_list = db.get_events(upcoming_only=False)
+        # --- Step 1: Resolve event_id (real DB event or synthetic grouped event) ---
         for e in events_list:
             if e['event_id'] == event_id:
                 event = e
+                base_event_name = e['name']
                 break
+        if event:
+            # Real event found — check for timed-entry siblings (same pattern, within 3 days)
+            event_pattern = engine._get_pattern(event['name'])
+            event_date = datetime.fromisoformat(event['event_date']).date()
+            for e in events_list:
+                if e['event_id'] == event_id:
+                    continue
+                if engine._get_pattern(e['name']) != event_pattern:
+                    continue
+                e_date = datetime.fromisoformat(e['event_date']).date()
+                if abs((e_date - event_date).days) <= 3:
+                    all_sibling_ids.append(e['event_id'])
+                    if e_date == event_date:
+                        real_event_ids.append(e['event_id'])
+        else:
+            # Not in DB — likely a synthetic grouped event from timed-entry grouping
+            analyses = engine.analyze_portfolio()
+            for a in analyses:
+                if a.event_id == event_id:
+                    real_event_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
+                    all_sibling_ids = list(real_event_ids)
+                    # Get city/type from first real constituent event
+                    city = ''
+                    event_type = ''
+                    for e in events_list:
+                        if e['event_id'] in real_event_ids:
+                            city = e.get('city', '')
+                            event_type = e.get('event_type', '')
+                            base_event_name = e['name']  # Real name for pattern matching
+                            break
+                    event = {
+                        'event_id': event_id,
+                        'name': a.event_name,
+                        'event_date': a.event_date,
+                        'capacity': a.capacity,
+                        'city': city,
+                        'event_type': event_type,
+                    }
+                    break
         if not event:
             return jsonify({'error': 'Event not found'}), 404
-        current_buyers = db.get_event_buyers(event_id)
-        current_tickets = db.get_event_tickets(event_id)
-        current_revenue = db.get_event_revenue(event_id)
+        # --- Step 2: Combine buyers from ALL sessions for accurate exclusion ---
+        current_buyers = set()
+        for eid in all_sibling_ids:
+            current_buyers.update(db.get_event_buyers(eid))
+        # Tickets/revenue from same-day sessions only
+        current_tickets = sum(db.get_event_tickets(eid) for eid in real_event_ids)
+        current_revenue = sum(db.get_event_revenue(eid) for eid in real_event_ids)
         capacity = event.get('capacity', 500)
         avg_ticket_price = current_revenue / current_tickets if current_tickets > 0 else 0
+        # Use base_event_name (real name) for pattern matching, not synthetic grouped name
+        pattern_name = base_event_name or event['name']
         # ---- REVENUE GAP ANALYSIS ----
-        # Find last year's edition of this event
-        name_lower = event['name'].lower()
-        name_lower = re.sub(r'20\d{2}', '', name_lower)
-        replacements = {
-            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
-            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
-        }
-        for old, new in replacements.items():
-            name_lower = name_lower.replace(old, new)
-        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
-        name_lower = '_'.join(name_lower.split())
-        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-        pattern = name_lower
-        past_event_ids = db.get_pattern_event_ids(pattern, exclude_ids=[event_id])
-        # Get last year's stats
+        pattern = engine._get_pattern(pattern_name)
+        past_event_ids = db.get_pattern_event_ids(pattern, exclude_ids=list(set(all_sibling_ids)))
+        # For past editions, group by (year, date) to handle past timed-entry events too
+        events_by_id = {e['event_id']: e for e in events_list}
+        past_by_year_date = defaultdict(list)
+        for pid in past_event_ids:
+            pe = events_by_id.get(pid)
+            if pe:
+                pe_date = datetime.fromisoformat(pe['event_date']).date()
+                past_by_year_date[(pe_date.year, pe_date)].append(pe)
+        # Aggregate past editions by (year, date) — combine timed-entry slots
         last_year_data = None
         last_year_buyers = set()
         all_past_buyers = set()
-        for pid in past_event_ids:
-            pe = None
-            for ev in events_list:
-                if ev['event_id'] == pid:
-                    pe = ev
-                    break
-            if pe:
-                pe_tickets = db.get_event_tickets(pid)
-                pe_revenue = db.get_event_revenue(pid)
-                pe_buyers = db.get_event_buyers(pid)
-                all_past_buyers.update(pe_buyers)
-                pe_year = datetime.fromisoformat(pe['event_date']).year
-                if last_year_data is None or pe_year > last_year_data.get('year', 0):
-                    last_year_data = {
-                        'year': pe_year,
-                        'event_name': pe['name'],
-                        'tickets': pe_tickets,
-                        'revenue': pe_revenue,
-                        'buyers': pe_buyers,
-                        'capacity': pe.get('capacity', 0),
-                    }
-                    last_year_buyers = pe_buyers
+        for (yr, dt), pe_group in past_by_year_date.items():
+            grp_tickets = sum(db.get_event_tickets(p['event_id']) for p in pe_group)
+            grp_revenue = sum(db.get_event_revenue(p['event_id']) for p in pe_group)
+            grp_buyers = set()
+            for p in pe_group:
+                grp_buyers.update(db.get_event_buyers(p['event_id']))
+            all_past_buyers.update(grp_buyers)
+            grp_capacity = max(p.get('capacity', 0) for p in pe_group)
+            if last_year_data is None or yr > last_year_data.get('year', 0):
+                last_year_data = {
+                    'year': yr,
+                    'event_name': pe_group[0]['name'],
+                    'tickets': grp_tickets,
+                    'revenue': grp_revenue,
+                    'buyers': grp_buyers,
+                    'capacity': grp_capacity,
+                }
+                last_year_buyers = grp_buyers
         # Repeat buyer rate
         repeat_buyers = current_buyers & all_past_buyers
         repeat_rate = len(repeat_buyers) / len(all_past_buyers) * 100 if all_past_buyers else 0
@@ -2141,8 +2209,11 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             }
         # ---- AUDIENCE BUILDING ----
         # 1. Past attendees who haven't purchased (sorted by priority)
+        #    Pass combined buyer set and all sibling IDs so grouped events are handled correctly
         past_attendees = db.get_past_attendees_not_purchased(
-            event_id, event['name'], limit=5000
+            event_id, pattern_name, limit=5000,
+            current_buyer_emails=current_buyers,
+            exclude_event_ids=list(set(all_sibling_ids))
         )
         # Priority score each customer: champions first, then by timing urgency
         days_until = (datetime.fromisoformat(event['event_date']).date() - date.today()).days
@@ -2263,6 +2334,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 })
         return jsonify({
             'event': event,
+            'export_token': os.environ.get('EXPORT_API_KEY', ''),
             'current_buyers': len(current_buyers),
             'current_tickets': current_tickets,
             'current_revenue': round(current_revenue, 2),
@@ -2328,6 +2400,12 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     @app.route('/api/export/csv')
     def export_csv():
         """Export a targeting audience as CSV."""
+        # --- Auth check: require EXPORT_API_KEY if set ---
+        export_key = os.environ.get('EXPORT_API_KEY', '')
+        if export_key:
+            provided = request.args.get('key', '') or request.headers.get('X-Export-Key', '')
+            if provided != export_key:
+                return jsonify({'error': 'Unauthorized — set EXPORT_API_KEY in Railway and pass ?key= parameter'}), 401
         event_id = request.args.get('event_id')
         audience = request.args.get('audience')  # past_attendees, city_prospects, type_fans, at_risk
         if not event_id or not audience:
