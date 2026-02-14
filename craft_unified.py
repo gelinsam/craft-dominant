@@ -598,16 +598,28 @@ class Database:
                 continue
             results.append(dict(r))
         return results
-    def get_type_prospects(self, event_type: str, exclude_emails: set = None,
+    def get_type_prospects(self, event_type: str, city: str = '',
+                           exclude_emails: set = None,
                            limit: int = 1000) -> List[dict]:
-        """Get customers who like this event type but haven't bought current event."""
-        rows = self.conn.execute("""
-            SELECT * FROM customers
-            WHERE (favorite_event_type = ? OR event_types LIKE ?)
-              AND ltv_score >= 20
-            ORDER BY ltv_score DESC
-            LIMIT ?
-        """, (event_type, f'%"{event_type}"%', limit)).fetchall()
+        """Get customers who like this event type AND are in the same city."""
+        if city:
+            # Primary: same city + same type (strongest signal)
+            rows = self.conn.execute("""
+                SELECT * FROM customers
+                WHERE (favorite_event_type = ? OR event_types LIKE ?)
+                  AND favorite_city = ?
+                  AND ltv_score >= 20
+                ORDER BY ltv_score DESC
+                LIMIT ?
+            """, (event_type, f'%"{event_type}"%', city, limit)).fetchall()
+        else:
+            rows = self.conn.execute("""
+                SELECT * FROM customers
+                WHERE (favorite_event_type = ? OR event_types LIKE ?)
+                  AND ltv_score >= 20
+                ORDER BY ltv_score DESC
+                LIMIT ?
+            """, (event_type, f'%"{event_type}"%', limit)).fetchall()
         results = []
         for r in rows:
             if exclude_emails and r['email'] in exclude_emails:
@@ -2264,10 +2276,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             all_exclude.update(current_buyers)
             all_exclude.update({c['email'] for c in city_prospects})
             type_prospects = db.get_type_prospects(
-                event['event_type'], exclude_emails=all_exclude, limit=1000
+                event['event_type'], city=event.get('city', ''), exclude_emails=all_exclude, limit=1000
             )
         type_value = sum(c.get('total_spent', 0) for c in type_prospects)
-        # 4. At-risk with affinity
+        # 4. At-risk with affinity — require CITY match, boost if type also matches
         at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
         at_risk_for_event = []
         for c in at_risk:
@@ -2275,13 +2287,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 continue
             etypes = c.get('event_types', '{}')
             ecities = c.get('cities', '{}')
-            has_affinity = False
-            if event.get('event_type') and event['event_type'] in str(etypes):
-                has_affinity = True
-            if event.get('city') and event['city'] in str(ecities):
-                has_affinity = True
-            if has_affinity:
-                at_risk_for_event.append(c)
+            # Must be in the same city — no cross-city commingling
+            city_match = event.get('city') and event['city'] in str(ecities)
+            if not city_match:
+                continue
+            type_match = event.get('event_type') and event['event_type'] in str(etypes)
+            c['affinity_strength'] = 'strong' if type_match else 'city_only'
+            at_risk_for_event.append(c)
+        # Sort: strong affinity (city + type) first, then by total_spent
+        at_risk_for_event.sort(key=lambda x: (0 if x.get('affinity_strength') == 'strong' else 1, -(x.get('total_spent', 0) or 0)))
         at_risk_value = sum(c.get('total_spent', 0) for c in at_risk_for_event)
         # ---- QUICK WIN CALCULATION ----
         # Estimate: if we email top-priority past attendees, how many tickets at historical rebuy rate?
@@ -2483,17 +2497,16 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             exclude.update(current_buyers)
             city_p = db.get_city_prospects(event.get('city', ''), exclude_emails=exclude, limit=10000)
             exclude.update({c['email'] for c in city_p})
-            customers_list = db.get_type_prospects(event.get('event_type', ''), exclude_emails=exclude, limit=10000)
+            customers_list = db.get_type_prospects(event.get('event_type', ''), city=event.get('city', ''), exclude_emails=exclude, limit=10000)
         elif audience == 'at_risk':
             at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
             for c in at_risk:
                 if c['email'] in current_buyers:
                     continue
-                etypes = c.get('event_types', '{}')
                 ecities = c.get('cities', '{}')
-                if (event.get('event_type') and event['event_type'] in str(etypes)) or \
-                   (event.get('city') and event['city'] in str(ecities)):
-                    customers_list.append(c)
+                if not (event.get('city') and event['city'] in str(ecities)):
+                    continue
+                customers_list.append(c)
         elif audience == 'all':
             past = db.get_past_attendees_not_purchased(
                 event_id, pattern_name, limit=10000,
@@ -2507,16 +2520,14 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 customers_list.extend(city_p)
                 seen.update({c['email'] for c in city_p})
             if event.get('event_type'):
-                type_p = db.get_type_prospects(event['event_type'], exclude_emails=seen, limit=10000)
+                type_p = db.get_type_prospects(event['event_type'], city=event.get('city', ''), exclude_emails=seen, limit=10000)
                 customers_list.extend(type_p)
                 seen.update({c['email'] for c in type_p})
             at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
             for c in at_risk:
                 if c['email'] not in seen:
-                    etypes = c.get('event_types', '{}')
                     ecities = c.get('cities', '{}')
-                    if (event.get('event_type') and event['event_type'] in str(etypes)) or \
-                       (event.get('city') and event['city'] in str(ecities)):
+                    if event.get('city') and event['city'] in str(ecities):
                         customers_list.append(c)
         # Build CSV
         output = io.StringIO()
