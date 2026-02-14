@@ -26,6 +26,18 @@ except ImportError:
     HAS_FLASK = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger('craft')
+
+def _json_key_match(json_field, key: str) -> bool:
+    """Check if key exists in a JSON dict field — safe, no substring false positives."""
+    if not key or not json_field:
+        return False
+    try:
+        d = json.loads(json_field) if isinstance(json_field, str) else json_field
+        if isinstance(d, dict):
+            return key in d
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
 # =============================================================================
 # DATA MODELS
 # =============================================================================
@@ -2285,13 +2297,12 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         for c in at_risk:
             if c['email'] in current_buyers:
                 continue
-            etypes = c.get('event_types', '{}')
             ecities = c.get('cities', '{}')
-            # Must be in the same city — no cross-city commingling
-            city_match = event.get('city') and event['city'] in str(ecities)
-            if not city_match:
+            # Must be in the same city — parse JSON, no substring false positives
+            if not _json_key_match(ecities, event.get('city')):
                 continue
-            type_match = event.get('event_type') and event['event_type'] in str(etypes)
+            etypes = c.get('event_types', '{}')
+            type_match = _json_key_match(etypes, event.get('event_type'))
             c['affinity_strength'] = 'strong' if type_match else 'city_only'
             at_risk_for_event.append(c)
         # Sort: strong affinity (city + type) first, then by total_spent
@@ -2504,7 +2515,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 if c['email'] in current_buyers:
                     continue
                 ecities = c.get('cities', '{}')
-                if not (event.get('city') and event['city'] in str(ecities)):
+                if not _json_key_match(ecities, event.get('city')):
                     continue
                 customers_list.append(c)
         elif audience == 'all':
@@ -2527,7 +2538,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             for c in at_risk:
                 if c['email'] not in seen:
                     ecities = c.get('cities', '{}')
-                    if event.get('city') and event['city'] in str(ecities):
+                    if _json_key_match(ecities, event.get('city')):
                         customers_list.append(c)
         # Build CSV
         output = io.StringIO()
