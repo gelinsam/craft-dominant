@@ -1861,6 +1861,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     engine = DecisionEngine(db)
     # Sync status tracking
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
+    _portfolio_cache = {'analyses': None, 'ts': 0}  # Cache portfolio analysis for 60s
+    def _get_portfolio():
+        """Get cached portfolio analysis (avoids re-analyzing on every targeting request)."""
+        import time
+        now = time.time()
+        if _portfolio_cache['analyses'] is None or (now - _portfolio_cache['ts']) > 60:
+            _portfolio_cache['analyses'] = engine.analyze_portfolio()
+            _portfolio_cache['ts'] = now
+        return _portfolio_cache['analyses']
     def _do_background_sync():
         """Run Eventbrite sync in background thread."""
         _sync_state['running'] = True
@@ -1993,7 +2002,11 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     @app.route('/api/dashboard')
     def dashboard():
         """Complete dashboard data."""
+        import time
         analyses = engine.analyze_portfolio()
+        # Populate cache so targeting/export endpoints don't re-analyze
+        _portfolio_cache['analyses'] = analyses
+        _portfolio_cache['ts'] = time.time()
         # Portfolio totals
         total_tickets = sum(a.tickets_sold for a in analyses)
         total_capacity = sum(a.capacity for a in analyses)
@@ -2143,8 +2156,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                         real_event_ids.append(e['event_id'])
         else:
             # Not in DB — likely a synthetic grouped event from timed-entry grouping
-            analyses = engine.analyze_portfolio()
-            for a in analyses:
+            for a in _get_portfolio():
                 if a.event_id == event_id:
                     real_event_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
                     all_sibling_ids = list(real_event_ids)
@@ -2291,14 +2303,17 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 event['event_type'], city=event.get('city', ''), exclude_emails=all_exclude, limit=1000
             )
         type_value = sum(c.get('total_spent', 0) for c in type_prospects)
-        # 4. At-risk with affinity — require CITY match, boost if type also matches
+        # 4. At-risk with affinity — require CITY match, exclude already-listed customers
+        all_already_listed = {c['email'] for c in past_attendees}
+        all_already_listed.update({c['email'] for c in city_prospects})
+        all_already_listed.update({c['email'] for c in type_prospects})
+        all_already_listed.update(current_buyers)
         at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
         at_risk_for_event = []
         for c in at_risk:
-            if c['email'] in current_buyers:
+            if c['email'] in all_already_listed:
                 continue
             ecities = c.get('cities', '{}')
-            # Must be in the same city — parse JSON, no substring false positives
             if not _json_key_match(ecities, event.get('city')):
                 continue
             etypes = c.get('event_types', '{}')
@@ -2458,9 +2473,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 if abs((e_date - event_date).days) <= 3:
                     all_sibling_ids.append(e['event_id'])
         else:
-            # Synthetic grouped event — resolve via portfolio analysis
-            analyses = engine.analyze_portfolio()
-            for a in analyses:
+            # Synthetic grouped event — resolve via cached portfolio analysis
+            for a in _get_portfolio():
                 if a.event_id == event_id:
                     all_sibling_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
                     for e in events_list:
