@@ -1881,7 +1881,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 return
             log.info("Starting Eventbrite sync...")
             eb = EventbriteSync(api_key, db)
-            result = eb.sync_all(years_back=2)
+            result = eb.sync_all(years_back=4)
             _sync_state['result'] = result
             # Reload decision engine curves after sync
             engine._load_curves()
