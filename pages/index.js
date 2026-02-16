@@ -588,10 +588,18 @@ export default function CraftDashboard() {
                         <div className="space-y-2">
                           {targeting.timing_recommendations.map((rec, i) => {
                             const u = URGENCY_COLORS[rec.urgency] || URGENCY_COLORS.soon;
+                            const timingParam = rec.timing_segments?.join(',') || 'all';
+                            const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
                             return (
                               <div key={i} className="flex items-center gap-3 p-3 rounded-lg" style={{ backgroundColor: u.bg }}>
                                 <span className="text-xs font-bold px-2 py-1 rounded shrink-0" style={{ backgroundColor: u.color, color: 'white' }}>{u.label}</span>
-                                <span className="text-sm font-medium text-gray-800">{rec.action}</span>
+                                <span className="text-sm font-medium text-gray-800 flex-1">{rec.action}</span>
+                                <button
+                                  onClick={() => window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=timing&timing=${timingParam}${keyParam}`, '_blank')}
+                                  className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-white transition-colors hover:opacity-90"
+                                  style={{ backgroundColor: u.color }}>
+                                  {'\u2B07\uFE0F'} Download {rec.count} emails
+                                </button>
                               </div>
                             );
                           })}

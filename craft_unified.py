@@ -2338,7 +2338,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 timing_recs.append({
                     'urgency': 'now',
                     'action': f'Email {overdue_early} super-early-bird past attendees — they usually buy 60+ days out',
-                    'count': overdue_early
+                    'count': overdue_early,
+                    'timing_segments': ['super_early_bird'],
                 })
         if days_until > 14 and days_until <= 45:
             overdue_count = sum(
@@ -2349,28 +2350,32 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 timing_recs.append({
                     'urgency': 'now',
                     'action': f'Email {overdue_count} early birds NOW — they are overdue to buy',
-                    'count': overdue_count
+                    'count': overdue_count,
+                    'timing_segments': ['super_early_bird', 'early_bird'],
                 })
             planner_count = timing_breakdown.get('planner', {}).get('count', 0)
             if planner_count > 0:
                 timing_recs.append({
                     'urgency': 'soon',
                     'action': f'{planner_count} planners typically buy 14-28 days out — email this week',
-                    'count': planner_count
+                    'count': planner_count,
+                    'timing_segments': ['planner'],
                 })
         if days_until <= 14:
             all_overdue = len(past_attendees)
             timing_recs.append({
                 'urgency': 'critical',
                 'action': f'FINAL PUSH: Email all {all_overdue} past attendees with urgency/scarcity messaging',
-                'count': all_overdue
+                'count': all_overdue,
+                'timing_segments': ['all'],
             })
             last_min = timing_breakdown.get('last_minute', {}).get('count', 0) + timing_breakdown.get('spontaneous', {}).get('count', 0)
             if last_min > 0:
                 timing_recs.append({
                     'urgency': 'now',
                     'action': f'{last_min} last-minute buyers are entering their buying window',
-                    'count': last_min
+                    'count': last_min,
+                    'timing_segments': ['last_minute', 'spontaneous'],
                 })
         return jsonify({
             'event': event,
@@ -2499,8 +2504,20 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             current_buyers.update(db.get_event_buyers(eid))
         pattern_name = base_event_name or event['name']
         # --- Build audience list ---
+        timing_filter = request.args.get('timing', '')  # comma-separated timing segments or 'all'
         customers_list = []
-        if audience == 'past_attendees':
+        if audience == 'timing':
+            # Timing-filtered past attendees (for "DO NOW" / "THIS WEEK" downloads)
+            all_past = db.get_past_attendees_not_purchased(
+                event_id, pattern_name, limit=10000,
+                current_buyer_emails=current_buyers,
+                exclude_event_ids=list(set(all_sibling_ids)))
+            if timing_filter == 'all':
+                customers_list = all_past
+            elif timing_filter:
+                segments = [s.strip() for s in timing_filter.split(',')]
+                customers_list = [c for c in all_past if c.get('timing_segment', '') in segments]
+        elif audience == 'past_attendees':
             customers_list = db.get_past_attendees_not_purchased(
                 event_id, pattern_name, limit=10000,
                 current_buyer_emails=current_buyers,
