@@ -27,6 +27,32 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger('craft')
 
+def _normalize_event_pattern(name: str, include_season: bool = False) -> str:
+    """Single source of truth for event pattern extraction.
+
+    Normalizes event names so 'Philly Cocktail Festival 2025' and 'Philly Cocktail Fest 2026'
+    produce the same pattern. Used for matching past editions, timed-entry grouping, and pacing curves.
+    """
+    name_lower = name.lower()
+    name_lower = re.sub(r'20\d{2}', '', name_lower)
+    replacements = {
+        'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
+        'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd',
+        'festival': 'fest', 'experience': 'exp', 'celebration': 'fest',
+        'tasting event': 'tasting', 'pop-up': 'popup', 'pop up': 'popup',
+    }
+    for old, new in replacements.items():
+        name_lower = name_lower.replace(old, new)
+    season = ''
+    if include_season:
+        if 'winter' in name_lower: season = '_winter'
+        elif 'spring' in name_lower: season = '_spring'
+        elif 'fall' in name_lower: season = '_fall'
+    name_lower = re.sub(r'[^a-z\s]', '', name_lower)
+    name_lower = '_'.join(name_lower.split())
+    name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
+    return name_lower + season
+
 def _json_key_match(json_field, key: str) -> bool:
     """Check if key exists in a JSON dict field — safe, no substring false positives."""
     if not key or not json_field:
@@ -506,21 +532,10 @@ class Database:
     def get_pattern_event_ids(self, pattern: str, exclude_ids: list = None) -> List[str]:
         """Get all event IDs matching a pattern name (for finding past editions)."""
         rows = self.conn.execute("SELECT event_id, name FROM events").fetchall()
-        # Use same pattern extraction logic
         matched = []
         for r in rows:
-            name_lower = r['name'].lower()
-            name_lower = re.sub(r'20\d{2}', '', name_lower)
-            replacements = {
-                'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
-                'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
-            }
-            for old, new in replacements.items():
-                name_lower = name_lower.replace(old, new)
-            name_lower = re.sub(r'[^a-z\s]', '', name_lower)
-            name_lower = '_'.join(name_lower.split())
-            name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-            if name_lower == pattern or pattern in name_lower or name_lower in pattern:
+            candidate = _normalize_event_pattern(r['name'], include_season=False)
+            if candidate == pattern or pattern in candidate or candidate in pattern:
                 if not exclude_ids or r['event_id'] not in exclude_ids:
                     matched.append(r['event_id'])
         return matched
@@ -538,19 +553,8 @@ class Database:
         """
         # Get current buyers — use provided set or look up single event
         current_buyers = current_buyer_emails if current_buyer_emails is not None else self.get_event_buyers(event_id)
-        # Get pattern for this event
-        name_lower = event_name.lower()
-        name_lower = re.sub(r'20\d{2}', '', name_lower)
-        replacements = {
-            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
-            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
-        }
-        for old, new in replacements.items():
-            name_lower = name_lower.replace(old, new)
-        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
-        name_lower = '_'.join(name_lower.split())
-        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-        pattern = name_lower
+        # Get pattern for this event (no season — match across all seasons)
+        pattern = _normalize_event_pattern(event_name, include_season=False)
         # Find all past event IDs with same pattern
         ids_to_exclude = exclude_event_ids or [event_id]
         past_event_ids = self.get_pattern_event_ids(pattern, exclude_ids=ids_to_exclude)
@@ -1177,22 +1181,7 @@ class EventbriteSync:
         return curves_built
     def _get_pattern(self, name: str) -> str:
         """Extract pattern from event name."""
-        name_lower = name.lower()
-        name_lower = re.sub(r'20\d{2}', '', name_lower)
-        replacements = {
-            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
-            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
-        }
-        for old, new in replacements.items():
-            name_lower = name_lower.replace(old, new)
-        season = ''
-        if 'winter' in name_lower: season = '_winter'
-        elif 'spring' in name_lower: season = '_spring'
-        elif 'fall' in name_lower: season = '_fall'
-        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
-        name_lower = '_'.join(name_lower.split())
-        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-        return name_lower + season
+        return _normalize_event_pattern(name, include_season=True)
 # =============================================================================
 # META ADS SYNC
 # =============================================================================
@@ -1460,23 +1449,8 @@ class DecisionEngine:
             if c:
                 self._curves[c['pattern']] = c
     def _get_pattern(self, name: str) -> str:
-        """Same logic as EventbriteSync."""
-        name_lower = name.lower()
-        name_lower = re.sub(r'20\d{2}', '', name_lower)
-        replacements = {
-            'philadelphia': 'philly', 'washington dc': 'dc', 'district': 'dc',
-            'new york': 'nyc', 'los angeles': 'la', 'san francisco': 'sf', 'san diego': 'sd'
-        }
-        for old, new in replacements.items():
-            name_lower = name_lower.replace(old, new)
-        season = ''
-        if 'winter' in name_lower: season = '_winter'
-        elif 'spring' in name_lower: season = '_spring'
-        elif 'fall' in name_lower: season = '_fall'
-        name_lower = re.sub(r'[^a-z\s]', '', name_lower)
-        name_lower = '_'.join(name_lower.split())
-        name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
-        return name_lower + season
+        """Extract pattern from event name."""
+        return _normalize_event_pattern(name, include_season=True)
     def analyze_event(self, event_id: str) -> Optional[EventPacing]:
         """Full analysis for an event."""
         event = self.db.get_event(event_id)
