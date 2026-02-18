@@ -2303,7 +2303,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 event['event_type'], city=event.get('city', ''), exclude_emails=all_exclude, limit=1000
             )
         type_value = sum(c.get('total_spent', 0) for c in type_prospects)
-        # 4. At-risk with affinity — require CITY match, exclude already-listed customers
+        # 4. At-risk with affinity — require BOTH city AND event type match
+        #    Someone who went to "DC Comedy Show" is not a win-back for "DC Beer Fest"
         all_already_listed = {c['email'] for c in past_attendees}
         all_already_listed.update({c['email'] for c in city_prospects})
         all_already_listed.update({c['email'] for c in type_prospects})
@@ -2314,14 +2315,14 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             if c['email'] in all_already_listed:
                 continue
             ecities = c.get('cities', '{}')
-            if not _json_key_match(ecities, event.get('city')):
-                continue
             etypes = c.get('event_types', '{}')
+            city_match = _json_key_match(ecities, event.get('city'))
             type_match = _json_key_match(etypes, event.get('event_type'))
-            c['affinity_strength'] = 'strong' if type_match else 'city_only'
+            # Must match BOTH city and event type — no random event-goers
+            if not (city_match and type_match):
+                continue
             at_risk_for_event.append(c)
-        # Sort: strong affinity (city + type) first, then by total_spent
-        at_risk_for_event.sort(key=lambda x: (0 if x.get('affinity_strength') == 'strong' else 1, -(x.get('total_spent', 0) or 0)))
+        at_risk_for_event.sort(key=lambda x: -(x.get('total_spent', 0) or 0))
         at_risk_value = sum(c.get('total_spent', 0) for c in at_risk_for_event)
         # ---- QUICK WIN CALCULATION ----
         # Estimate: if we email top-priority past attendees, how many tickets at historical rebuy rate?
@@ -2546,7 +2547,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 if c['email'] in current_buyers:
                     continue
                 ecities = c.get('cities', '{}')
-                if not _json_key_match(ecities, event.get('city')):
+                etypes = c.get('event_types', '{}')
+                if not (_json_key_match(ecities, event.get('city')) and _json_key_match(etypes, event.get('event_type'))):
                     continue
                 customers_list.append(c)
         elif audience == 'all':
@@ -2569,7 +2571,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             for c in at_risk:
                 if c['email'] not in seen:
                     ecities = c.get('cities', '{}')
-                    if _json_key_match(ecities, event.get('city')):
+                    etypes = c.get('event_types', '{}')
+                    if _json_key_match(ecities, event.get('city')) and _json_key_match(etypes, event.get('event_type')):
                         customers_list.append(c)
         # Build CSV
         output = io.StringIO()
