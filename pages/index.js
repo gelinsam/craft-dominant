@@ -337,6 +337,9 @@ export default function CraftDashboard() {
   const [targeting, setTargeting] = useState(null);
   const [targetingLoading, setTargetingLoading] = useState(false);
   const [selectedAudience, setSelectedAudience] = useState(null);
+  const [intel, setIntel] = useState(null);
+  const [intelLoading, setIntelLoading] = useState(false);
+  const [intelOpen, setIntelOpen] = useState({});
 
   // CRM Browse
   const [crmSearch, setCrmSearch] = useState('');
@@ -384,6 +387,8 @@ export default function CraftDashboard() {
     if (!eventId) { setTargeting(null); return; }
     setTargetingLoading(true); setSelectedAudience(null);
     fetch(`${API_BASE}/api/targeting/${eventId}`).then(r => r.json()).then(d => { setTargeting(d); setTargetingLoading(false); }).catch(() => setTargetingLoading(false));
+    setIntelLoading(true);
+    fetch(`${API_BASE}/api/intelligence/${eventId}`).then(r => r.json()).then(d => { setIntel(d); setIntelLoading(false); }).catch(() => setIntelLoading(false));
   }, []);
 
   useEffect(() => { if (tab === 'crm' && crmView === 'targeting' && targetEvent) fetchTargeting(targetEvent); }, [tab, crmView, targetEvent, fetchTargeting]);
@@ -402,6 +407,12 @@ export default function CraftDashboard() {
     const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
     window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=all${keyParam}`, '_blank');
   };
+  const handleIntelExport = (audienceKey) => {
+    if (!targetEvent) return;
+    const keyParam = intel?.export_token ? `&key=${encodeURIComponent(intel.export_token)}` : '';
+    window.open(`${API_BASE}/api/export/intelligence-csv?event_id=${targetEvent}&audience=${audienceKey}${keyParam}`, '_blank');
+  };
+  const toggleIntel = (key) => setIntelOpen(prev => ({ ...prev, [key]: !prev[key] }));
 
   const triggerSync = () => {
     setSyncing(true); setSyncError(null);
@@ -603,6 +614,231 @@ export default function CraftDashboard() {
                               </div>
                             );
                           })}
+                        </div>
+                      </Card>
+                    )}
+
+                    {/* ===== INTELLIGENCE ENGINE ===== */}
+                    {intel && !intelLoading && (
+                      <Card className="p-4 mb-6">
+                        <div className="flex items-center justify-between mb-4">
+                          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wide">{'\u{1F9E0}'} Intelligence Engine</div>
+                        </div>
+
+                        {/* Velocity Alert — always visible */}
+                        {intel.velocity && (
+                          <div className={`p-4 rounded-lg mb-4 ${intel.velocity.will_sell_out ? 'bg-green-50 border border-green-200' : 'bg-amber-50 border border-amber-200'}`}>
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="font-bold text-sm">{intel.velocity.will_sell_out ? '\u2705 On Pace to Sell Out' : '\u26A0\uFE0F Velocity Alert'}</span>
+                              <span className="text-sm font-mono font-bold">{intel.velocity.current_velocity} tickets/day</span>
+                            </div>
+                            {!intel.velocity.will_sell_out && intel.velocity.tickets_remaining > 0 && (
+                              <div className="text-sm text-gray-700 mb-2">
+                                {intel.velocity.projected_unsold > 0
+                                  ? `At current pace: ~${intel.velocity.projected_unsold} tickets unsold. Need ${Math.ceil(intel.velocity.tickets_remaining / Math.max(1, intel.days_until))} tickets/day to sell out.`
+                                  : `${intel.velocity.tickets_remaining} remaining. ${intel.velocity.days_at_current_pace ? `${intel.velocity.days_at_current_pace} days at current pace.` : ''}`}
+                              </div>
+                            )}
+                            {intel.velocity.gap_closing_plan?.length > 0 && (
+                              <div className="mt-3 space-y-2">
+                                <div className="text-xs font-semibold text-gray-500 uppercase">Gap-Closing Plan ({intel.velocity.total_recoverable} tickets recoverable)</div>
+                                {intel.velocity.gap_closing_plan.map((p, i) => (
+                                  <div key={i} className="flex items-center justify-between text-sm bg-white p-2 rounded">
+                                    <span className="flex items-center gap-2">
+                                      <span className="w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-bold">{p.priority}</span>
+                                      {p.action}
+                                    </span>
+                                    <span className="font-bold text-green-600">+{p.expected_tickets} tickets</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Revenue Projection */}
+                        {intel.revenue_projection && (
+                          <div className="p-4 rounded-lg mb-4 bg-blue-50 border border-blue-200">
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <div className="text-xs font-semibold text-blue-700 uppercase mb-1">Revenue Projection</div>
+                                <div className="text-2xl font-bold text-blue-700">${intel.revenue_projection.projected_revenue?.toLocaleString()}</div>
+                                <div className="text-xs text-gray-600">Range: ${intel.revenue_projection.projected_revenue_range?.[0]?.toLocaleString()} — ${intel.revenue_projection.projected_revenue_range?.[1]?.toLocaleString()}</div>
+                              </div>
+                              <div className="text-right">
+                                <div className="text-sm text-gray-600">{intel.revenue_projection.sell_through_pct?.toFixed(1)}% sold</div>
+                                <div className="text-sm text-gray-600">{intel.revenue_projection.projected_final_tickets?.toLocaleString()} projected tickets</div>
+                                <div className="text-xs text-gray-400">{Math.round(intel.revenue_projection.confidence * 100)}% confidence</div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Collapsible Intelligence Sections */}
+                        <div className="space-y-2">
+
+                          {/* Cross-Sell */}
+                          {intel.cross_sell?.candidates > 0 && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('cross_sell')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u{1F504}'} Cross-Sell — {intel.cross_sell.candidates} candidates</span>
+                                <span className="text-xs text-gray-500">{intelOpen.cross_sell ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.cross_sell && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.cross_sell.recommendation}</p>
+                                  <div className="flex flex-wrap gap-2 mb-3">
+                                    {Object.entries(intel.cross_sell.by_source_type || {}).map(([type, count]) => (
+                                      <span key={type} className="px-2 py-1 bg-purple-100 text-purple-700 rounded-full text-xs font-medium">{type}: {count}</span>
+                                    ))}
+                                  </div>
+                                  <button onClick={() => handleIntelExport('cross_sell')} className="px-3 py-1.5 bg-purple-600 text-white rounded-lg text-xs font-bold hover:bg-purple-700">{'\u2B07\uFE0F'} Download {intel.cross_sell.candidates} emails</button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Super-Spreaders */}
+                          {intel.super_spreaders?.total_spreaders > 0 && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('spreaders')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u{1F4E3}'} Super-Spreaders — {intel.super_spreaders.total_spreaders} identified ({intel.super_spreaders.total_estimated_plus_ones} est. +1s)</span>
+                                <span className="text-xs text-gray-500">{intelOpen.spreaders ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.spreaders && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.super_spreaders.recommendation}</p>
+                                  <button onClick={() => handleIntelExport('super_spreaders')} className="px-3 py-1.5 bg-orange-600 text-white rounded-lg text-xs font-bold hover:bg-orange-700">{'\u2B07\uFE0F'} Download {intel.super_spreaders.total_spreaders} spreader emails</button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* VIPs */}
+                          {intel.vips?.vips_not_bought > 0 && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('vips')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u{1F451}'} VIPs Not Purchased — {intel.vips.vips_not_bought} (${intel.vips.vip_total_value?.toLocaleString()} lifetime value)</span>
+                                <span className="text-xs text-gray-500">{intelOpen.vips ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.vips && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.vips.recommendation}</p>
+                                  <button onClick={() => handleIntelExport('vips')} className="px-3 py-1.5 bg-yellow-600 text-white rounded-lg text-xs font-bold hover:bg-yellow-700">{'\u2B07\uFE0F'} Download {intel.vips.vips_not_bought} VIP emails</button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Churn Prediction */}
+                          {intel.churn_prediction?.total_at_risk > 0 && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('churn')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u23F3'} Churn Risk — {intel.churn_prediction.critical} critical, {intel.churn_prediction.urgent} urgent (${intel.churn_prediction.total_value_at_risk?.toLocaleString()} at risk)</span>
+                                <span className="text-xs text-gray-500">{intelOpen.churn ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.churn && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.churn_prediction.recommendation}</p>
+                                  <div className="flex gap-3 mb-3">
+                                    <span className="px-2 py-1 bg-red-100 text-red-700 rounded-full text-xs font-bold">Critical: {intel.churn_prediction.critical}</span>
+                                    <span className="px-2 py-1 bg-orange-100 text-orange-700 rounded-full text-xs font-bold">Urgent: {intel.churn_prediction.urgent}</span>
+                                    <span className="px-2 py-1 bg-yellow-100 text-yellow-700 rounded-full text-xs font-bold">Watch: {intel.churn_prediction.watch}</span>
+                                  </div>
+                                  <button onClick={() => handleIntelExport('churn_critical')} className="px-3 py-1.5 bg-red-600 text-white rounded-lg text-xs font-bold hover:bg-red-700">{'\u2B07\uFE0F'} Download {intel.churn_prediction.critical + intel.churn_prediction.urgent} urgent save emails</button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Purchase Velocity Triggers */}
+                          {intel.purchase_timing?.optimal_followup_days && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('velocity')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u{1F3C3}'} Purchase Velocity — optimal follow-up: {intel.purchase_timing.optimal_followup_days} days post-event</span>
+                                <span className="text-xs text-gray-500">{intelOpen.velocity ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.velocity && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.purchase_timing.recommendation}</p>
+                                  <div className="grid grid-cols-6 gap-2">
+                                    {Object.entries(intel.purchase_timing.buckets || {}).map(([bucket, count]) => (
+                                      <div key={bucket} className="text-center p-2 bg-gray-50 rounded">
+                                        <div className="text-xs text-gray-500">{bucket}d</div>
+                                        <div className="font-bold text-sm">{count}</div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Promo Intelligence */}
+                          {intel.promo_intelligence?.by_segment && Object.keys(intel.promo_intelligence.by_segment).length > 0 && (
+                            <div className="border rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('promo')} className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                                <span className="font-semibold text-sm">{'\u{1F3F7}\uFE0F'} Promo Intelligence — who needs discounts vs. who doesn&apos;t</span>
+                                <span className="text-xs text-gray-500">{intelOpen.promo ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.promo && (
+                                <div className="p-3 text-sm">
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {Object.entries(intel.promo_intelligence.by_segment).map(([seg, data]) => (
+                                      <div key={seg} className="p-2 bg-gray-50 rounded">
+                                        <div className="font-semibold text-xs capitalize mb-1">{seg.replace(/_/g, ' ')}</div>
+                                        <div className="text-xs text-gray-600">Promo rate: {data.promo_rate}%</div>
+                                        <div className="text-xs text-gray-600">Full: ${data.avg_full_price} | Promo: ${data.avg_promo_price}</div>
+                                        <div className={`text-xs mt-1 font-medium ${data.promo_rate < 15 ? 'text-green-600' : 'text-orange-600'}`}>{data.recommendation}</div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Cannibalization */}
+                          {intel.cannibalization?.count > 0 && (
+                            <div className="border border-red-200 rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('cannibal')} className="w-full flex items-center justify-between p-3 bg-red-50 hover:bg-red-100 transition-colors text-left">
+                                <span className="font-semibold text-sm text-red-700">{'\u26A0\uFE0F'} Cannibalization Risk — {intel.cannibalization.count} events too close</span>
+                                <span className="text-xs text-gray-500">{intelOpen.cannibal ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.cannibal && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.cannibalization.recommendation}</p>
+                                  {intel.cannibalization.risk_events?.map((r, i) => (
+                                    <div key={i} className="p-2 bg-white rounded mb-1 flex justify-between items-center">
+                                      <span>{r.event_name} ({r.days_apart > 0 ? '+' : ''}{r.days_apart}d)</span>
+                                      <span className="text-xs text-red-600 font-bold">{r.buyer_overlap} shared buyers ({r.overlap_pct}%)</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Competitor Radar */}
+                          {intel.competitors?.count > 0 && (
+                            <div className="border border-amber-200 rounded-lg overflow-hidden">
+                              <button onClick={() => toggleIntel('competitors')} className="w-full flex items-center justify-between p-3 bg-amber-50 hover:bg-amber-100 transition-colors text-left">
+                                <span className="font-semibold text-sm text-amber-700">{'\u{1F4E1}'} Competitor Radar — {intel.competitors.count} nearby events</span>
+                                <span className="text-xs text-gray-500">{intelOpen.competitors ? '\u25B2' : '\u25BC'}</span>
+                              </button>
+                              {intelOpen.competitors && (
+                                <div className="p-3 text-sm">
+                                  <p className="text-gray-600 mb-2">{intel.competitors.recommendation}</p>
+                                  {intel.competitors.competing_events?.map((c, i) => (
+                                    <div key={i} className="p-2 bg-white rounded mb-1 flex justify-between items-center">
+                                      <span>{c.event_name} <span className="text-xs text-gray-400">({c.event_type})</span></span>
+                                      <span className={`text-xs font-bold ${c.same_weekend ? 'text-red-600' : 'text-amber-600'}`}>{c.same_weekend ? 'SAME WEEKEND' : `${c.days_apart > 0 ? '+' : ''}${c.days_apart}d`}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </Card>
                     )}

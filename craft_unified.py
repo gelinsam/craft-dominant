@@ -521,6 +521,172 @@ class Database:
             ORDER BY total_spent DESC
         """, (min_orders, min_days_inactive)).fetchall()
         return [dict(r) for r in rows]
+    # === Intelligence Queries ===
+    def get_cross_sell_candidates(self, event_type: str, city: str,
+                                   exclude_event_ids: list = None,
+                                   exclude_emails: set = None,
+                                   limit: int = 2000) -> List[dict]:
+        """Find customers who attended OTHER event types in same city — cross-sell targets.
+        E.g., Beer Fest buyers who might like Cocktail Fest."""
+        rows = self.conn.execute("""
+            SELECT DISTINCT o.email, e.event_type, e.city, e.name as event_name
+            FROM orders o
+            JOIN events e ON o.event_id = e.event_id
+            WHERE e.city = ? AND e.event_type != ? AND e.event_type IS NOT NULL
+            ORDER BY o.order_timestamp DESC
+        """, (city, event_type)).fetchall()
+        # Group by email, track which event types they've attended
+        email_types = defaultdict(set)
+        for r in rows:
+            email_types[r['email']].add(r['event_type'])
+        # Get customer records in batch
+        emails = [e for e in email_types if (not exclude_emails or e not in exclude_emails)][:limit * 2]
+        if not emails:
+            return []
+        cust_map = {}
+        batch_size = 500
+        for i in range(0, len(emails), batch_size):
+            batch = emails[i:i + batch_size]
+            ph = ','.join(['?' for _ in batch])
+            cust_rows = self.conn.execute(
+                f"SELECT * FROM customers WHERE email IN ({ph})", batch
+            ).fetchall()
+            for c in cust_rows:
+                cust_map[c['email']] = dict(c)
+        results = []
+        for email in emails:
+            cust = cust_map.get(email)
+            if cust:
+                cust['attended_types'] = list(email_types[email])
+                results.append(cust)
+            if len(results) >= limit:
+                break
+        results.sort(key=lambda x: -(x.get('ltv_score', 0) or 0))
+        return results
+
+    def get_multi_ticket_buyers(self, min_avg_tickets: float = 1.5) -> List[dict]:
+        """Find super-spreaders: customers who consistently buy 2+ tickets (bringing friends)."""
+        rows = self.conn.execute("""
+            SELECT * FROM customers
+            WHERE avg_tickets_per_order >= ? AND total_orders >= 2
+            ORDER BY avg_tickets_per_order DESC, total_spent DESC
+        """, (min_avg_tickets,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_promo_code_stats(self, event_id: str = None) -> List[dict]:
+        """Get promo code usage stats — which codes drive sales and at what discount."""
+        if event_id:
+            rows = self.conn.execute("""
+                SELECT promo_code, COUNT(*) as uses, SUM(ticket_count) as tickets,
+                       SUM(gross_amount) as revenue, AVG(gross_amount) as avg_order,
+                       COUNT(DISTINCT email) as unique_buyers
+                FROM orders
+                WHERE event_id = ? AND promo_code IS NOT NULL AND promo_code != ''
+                GROUP BY promo_code
+                ORDER BY uses DESC
+            """, (event_id,)).fetchall()
+        else:
+            rows = self.conn.execute("""
+                SELECT promo_code, COUNT(*) as uses, SUM(ticket_count) as tickets,
+                       SUM(gross_amount) as revenue, AVG(gross_amount) as avg_order,
+                       COUNT(DISTINCT email) as unique_buyers
+                FROM orders
+                WHERE promo_code IS NOT NULL AND promo_code != ''
+                GROUP BY promo_code
+                ORDER BY uses DESC
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_purchase_velocity(self, event_id: str) -> dict:
+        """Analyze purchase timing patterns for an event's historical buyers."""
+        event = self.get_event(event_id)
+        if not event:
+            return {}
+        # Get orders for this event with timing data
+        rows = self.conn.execute("""
+            SELECT days_before_event, COUNT(*) as order_count, SUM(ticket_count) as tickets,
+                   SUM(gross_amount) as revenue
+            FROM orders
+            WHERE event_id = ? AND days_before_event IS NOT NULL
+            GROUP BY days_before_event
+            ORDER BY days_before_event DESC
+        """, (event_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_churn_risk_customers(self, lookback_window: int = 90) -> List[dict]:
+        """Find customers approaching their churn point based on purchase gap patterns.
+        If avg_days_between_orders is 120 and they're at 100 days since last, they're at risk."""
+        rows = self.conn.execute("""
+            SELECT *,
+                   CASE WHEN avg_days_between_orders > 0
+                        THEN CAST(days_since_last AS REAL) / avg_days_between_orders
+                        ELSE 0 END as gap_ratio
+            FROM customers
+            WHERE total_orders >= 2
+              AND avg_days_between_orders > 0
+              AND days_since_last >= (avg_days_between_orders * 0.7)
+            ORDER BY gap_ratio DESC
+        """).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            gap_ratio = d.get('gap_ratio', 0) or 0
+            avg_gap = d.get('avg_days_between_orders', 0) or 0
+            days_since = d.get('days_since_last', 0) or 0
+            # Predict days until churn (when gap_ratio reaches 2.0 = missed 2 cycles)
+            churn_threshold = avg_gap * 2.0
+            days_until_churn = max(0, int(churn_threshold - days_since))
+            d['gap_ratio'] = round(gap_ratio, 2)
+            d['days_until_churn'] = days_until_churn
+            d['save_window'] = 'critical' if days_until_churn < 14 else 'urgent' if days_until_churn < 30 else 'watch' if days_until_churn < 60 else 'healthy'
+            results.append(d)
+        return results
+
+    def get_vip_customers(self, min_events: int = 3, min_spent: float = 200,
+                           limit: int = 100) -> List[dict]:
+        """Identify VIP customers — top spenders with high attendance."""
+        rows = self.conn.execute("""
+            SELECT * FROM customers
+            WHERE total_events >= ? AND total_spent >= ?
+            ORDER BY total_spent DESC
+            LIMIT ?
+        """, (min_events, min_spent, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_event_ticket_types(self, event_id: str) -> List[dict]:
+        """Break down ticket types for an event — GA vs VIP vs Early Bird etc."""
+        rows = self.conn.execute("""
+            SELECT ticket_type, COUNT(*) as orders, SUM(ticket_count) as tickets,
+                   SUM(gross_amount) as revenue, AVG(gross_amount) as avg_price,
+                   AVG(days_before_event) as avg_days_before
+            FROM orders
+            WHERE event_id = ? AND ticket_type IS NOT NULL AND ticket_type != ''
+            GROUP BY ticket_type
+            ORDER BY tickets DESC
+        """, (event_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_segment_ticket_preferences(self) -> dict:
+        """Which RFM segments prefer which ticket tiers?"""
+        rows = self.conn.execute("""
+            SELECT c.rfm_segment, o.ticket_type, COUNT(*) as count,
+                   AVG(o.gross_amount) as avg_price
+            FROM orders o
+            JOIN customers c ON lower(o.email) = c.email
+            WHERE o.ticket_type IS NOT NULL AND o.ticket_type != ''
+              AND c.rfm_segment IS NOT NULL AND c.rfm_segment != ''
+            GROUP BY c.rfm_segment, o.ticket_type
+            ORDER BY c.rfm_segment, count DESC
+        """).fetchall()
+        result = defaultdict(list)
+        for r in rows:
+            result[r['rfm_segment']].append({
+                'ticket_type': r['ticket_type'],
+                'count': r['count'],
+                'avg_price': round(r['avg_price'], 2)
+            })
+        return dict(result)
+
     # === Targeting ===
     def get_event_buyers(self, event_id: str) -> set:
         """Get set of emails that have orders for a specific event."""
@@ -2417,6 +2583,526 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 }
             }
         })
+    # === Intelligence Engine ===
+    @app.route('/api/intelligence/<event_id>')
+    def intelligence(event_id: str):
+        """Advanced intelligence for an event: cross-sell, velocity, promo codes,
+        super-spreaders, churn prediction, VIP, ticket tiers, cannibalization, competitor radar."""
+        # --- Resolve event (same logic as targeting) ---
+        event = None
+        all_sibling_ids = [event_id]
+        base_event_name = ''
+        events_list = db.get_events(upcoming_only=False)
+        for e in events_list:
+            if e['event_id'] == event_id:
+                event = e
+                base_event_name = e['name']
+                break
+        if event:
+            event_pattern = engine._get_pattern(event['name'])
+            event_date = datetime.fromisoformat(event['event_date']).date()
+            for e in events_list:
+                if e['event_id'] == event_id:
+                    continue
+                if engine._get_pattern(e['name']) != event_pattern:
+                    continue
+                e_date = datetime.fromisoformat(e['event_date']).date()
+                if abs((e_date - event_date).days) <= 3:
+                    all_sibling_ids.append(e['event_id'])
+        else:
+            for a in _get_portfolio():
+                if a.event_id == event_id:
+                    all_sibling_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
+                    for e in events_list:
+                        if e['event_id'] in all_sibling_ids:
+                            base_event_name = e['name']
+                            event = {
+                                'event_id': event_id, 'name': a.event_name,
+                                'event_date': a.event_date, 'capacity': a.capacity,
+                                'city': e.get('city', ''), 'event_type': e.get('event_type', ''),
+                            }
+                            break
+                    break
+        if not event:
+            return jsonify({'error': 'Event not found'}), 404
+
+        current_buyers = set()
+        for eid in all_sibling_ids:
+            current_buyers.update(db.get_event_buyers(eid))
+        pattern_name = base_event_name or event['name']
+        days_until = (datetime.fromisoformat(event['event_date']).date() - date.today()).days
+        current_tickets = sum(db.get_event_tickets(eid) for eid in all_sibling_ids)
+        current_revenue = sum(db.get_event_revenue(eid) for eid in all_sibling_ids)
+        capacity = event.get('capacity', 500)
+        avg_ticket_price = current_revenue / current_tickets if current_tickets > 0 else 0
+
+        # ---- 1. CROSS-SELL ENGINE ----
+        cross_sell = []
+        if event.get('city') and event.get('event_type'):
+            cross_sell = db.get_cross_sell_candidates(
+                event['event_type'], event['city'],
+                exclude_event_ids=all_sibling_ids,
+                exclude_emails=current_buyers,
+                limit=500
+            )
+        cross_sell_by_type = defaultdict(int)
+        for c in cross_sell:
+            for t in c.get('attended_types', []):
+                cross_sell_by_type[t] += 1
+
+        # ---- 2. SELL-THROUGH VELOCITY & GAP-CLOSING PLAN ----
+        pattern = engine._get_pattern(pattern_name)
+        past_event_ids = db.get_pattern_event_ids(pattern, exclude_ids=list(set(all_sibling_ids)))
+        # Calculate sell velocity (tickets per day over last 7 days)
+        recent_velocity = 0
+        for eid in all_sibling_ids:
+            snaps = db.get_snapshots(eid)
+            if len(snaps) >= 2:
+                # Snapshots are ordered by days_before DESC, so first entries are most recent
+                recent = [s for s in snaps if s['days_before_event'] <= days_until + 7]
+                if len(recent) >= 2:
+                    tickets_diff = recent[0]['tickets_cumulative'] - recent[-1]['tickets_cumulative']
+                    days_diff = max(1, len(recent))
+                    recent_velocity += tickets_diff / days_diff
+        tickets_gap = max(0, capacity - current_tickets)
+        days_to_sell = int(tickets_gap / recent_velocity) if recent_velocity > 0 else 999
+        # Build gap-closing action plan
+        past_attendees = db.get_past_attendees_not_purchased(
+            event_id, pattern_name, limit=5000,
+            current_buyer_emails=current_buyers,
+            exclude_event_ids=list(set(all_sibling_ids))
+        )
+        gap_plan = []
+        remaining_gap = tickets_gap
+        if remaining_gap > 0 and past_attendees:
+            # Segment past attendees by likelihood
+            champions = [c for c in past_attendees if c.get('rfm_segment') in ('champion', 'loyal')]
+            est_from_champions = int(len(champions) * 0.20)  # 20% conversion for champions
+            gap_plan.append({
+                'action': f'Email {len(champions)} champion/loyal past attendees',
+                'audience': 'past_champions',
+                'audience_size': len(champions),
+                'expected_tickets': est_from_champions,
+                'conversion_rate': '20%',
+                'priority': 1,
+            })
+            remaining_gap -= est_from_champions
+
+        if remaining_gap > 0 and cross_sell:
+            est_from_cross = int(len(cross_sell) * 0.05)  # 5% conversion for cross-sell
+            gap_plan.append({
+                'action': f'Cross-sell to {len(cross_sell)} fans of other event types in {event.get("city", "city")}',
+                'audience': 'cross_sell',
+                'audience_size': len(cross_sell),
+                'expected_tickets': est_from_cross,
+                'conversion_rate': '5%',
+                'priority': 2,
+            })
+            remaining_gap -= est_from_cross
+
+        if remaining_gap > 0:
+            other_past = [c for c in past_attendees if c.get('rfm_segment') not in ('champion', 'loyal')]
+            est_from_others = int(len(other_past) * 0.08)
+            gap_plan.append({
+                'action': f'Email {len(other_past)} remaining past attendees with urgency',
+                'audience': 'past_other',
+                'audience_size': len(other_past),
+                'expected_tickets': est_from_others,
+                'conversion_rate': '8%',
+                'priority': 3,
+            })
+            remaining_gap -= est_from_others
+
+        velocity_alert = {
+            'current_velocity': round(recent_velocity, 1),
+            'velocity_unit': 'tickets/day',
+            'tickets_remaining': tickets_gap,
+            'days_at_current_pace': days_to_sell if days_to_sell < 999 else None,
+            'will_sell_out': days_to_sell <= days_until if days_to_sell < 999 else False,
+            'projected_unsold': max(0, tickets_gap - int(recent_velocity * days_until)) if recent_velocity > 0 else tickets_gap,
+            'gap_closing_plan': gap_plan,
+            'total_recoverable': sum(p['expected_tickets'] for p in gap_plan),
+        }
+
+        # ---- 3. PURCHASE VELOCITY TRIGGERS ----
+        # For past editions: how quickly do multi-event buyers purchase after attending?
+        post_event_velocity = []
+        if past_event_ids:
+            ph = ','.join(['?' for _ in past_event_ids])
+            rows = db.conn.execute(f"""
+                SELECT o1.email,
+                       o1.order_timestamp as first_purchase,
+                       o2.order_timestamp as next_purchase,
+                       o2.event_id as next_event_id,
+                       e2.name as next_event_name,
+                       CAST(julianday(o2.order_timestamp) - julianday(o1.order_timestamp) AS INTEGER) as days_gap
+                FROM orders o1
+                JOIN orders o2 ON o1.email = o2.email AND o2.order_timestamp > o1.order_timestamp
+                JOIN events e2 ON o2.event_id = e2.event_id
+                WHERE o1.event_id IN ({ph})
+                  AND o2.event_id NOT IN ({ph})
+                ORDER BY days_gap ASC
+                LIMIT 5000
+            """, past_event_ids + past_event_ids).fetchall()
+            # Bucket by timing
+            buckets = {'0-7': 0, '8-14': 0, '15-30': 0, '31-60': 0, '61-90': 0, '90+': 0}
+            gaps = []
+            for r in rows:
+                g = r['days_gap'] or 0
+                gaps.append(g)
+                if g <= 7: buckets['0-7'] += 1
+                elif g <= 14: buckets['8-14'] += 1
+                elif g <= 30: buckets['15-30'] += 1
+                elif g <= 60: buckets['31-60'] += 1
+                elif g <= 90: buckets['61-90'] += 1
+                else: buckets['90+'] += 1
+            optimal_window = None
+            if gaps:
+                # Median gap = optimal follow-up timing
+                gaps.sort()
+                optimal_window = gaps[len(gaps) // 2]
+            post_event_velocity = {
+                'buckets': buckets,
+                'total_repeat_purchases': len(rows),
+                'optimal_followup_days': optimal_window,
+                'recommendation': f'Send follow-up email {optimal_window} days after event for maximum conversion' if optimal_window else 'Not enough data for timing recommendation',
+            }
+
+        # ---- 4. PROMO CODE INTELLIGENCE ----
+        # Compare promo vs non-promo buyers by segment
+        all_event_ids = list(set(all_sibling_ids + past_event_ids[:10]))  # Current + recent past
+        promo_stats = []
+        for eid in all_event_ids[:5]:  # Limit to 5 events for performance
+            stats = db.get_promo_code_stats(eid)
+            evt = db.get_event(eid)
+            if stats and evt:
+                total_revenue = db.get_event_revenue(eid)
+                total_orders_count = len(db.get_orders_for_event(eid))
+                promo_revenue = sum(s['revenue'] for s in stats)
+                promo_orders = sum(s['uses'] for s in stats)
+                promo_stats.append({
+                    'event_name': evt['name'],
+                    'event_id': eid,
+                    'total_orders': total_orders_count,
+                    'promo_orders': promo_orders,
+                    'promo_pct': round(promo_orders / total_orders_count * 100, 1) if total_orders_count > 0 else 0,
+                    'promo_revenue': round(promo_revenue, 2),
+                    'full_price_revenue': round(total_revenue - promo_revenue, 2),
+                    'top_codes': stats[:5],
+                })
+        # Segment-level promo sensitivity
+        promo_by_segment = {}
+        rows = db.conn.execute("""
+            SELECT c.rfm_segment,
+                   COUNT(CASE WHEN o.promo_code IS NOT NULL AND o.promo_code != '' THEN 1 END) as promo_orders,
+                   COUNT(*) as total_orders,
+                   AVG(CASE WHEN o.promo_code IS NOT NULL AND o.promo_code != '' THEN o.gross_amount END) as avg_promo_price,
+                   AVG(CASE WHEN o.promo_code IS NULL OR o.promo_code = '' THEN o.gross_amount END) as avg_full_price
+            FROM orders o
+            JOIN customers c ON lower(o.email) = c.email
+            WHERE c.rfm_segment IS NOT NULL AND c.rfm_segment != ''
+            GROUP BY c.rfm_segment
+        """).fetchall()
+        for r in rows:
+            seg = r['rfm_segment']
+            total = r['total_orders'] or 1
+            promo_by_segment[seg] = {
+                'promo_rate': round((r['promo_orders'] or 0) / total * 100, 1),
+                'avg_promo_price': round(r['avg_promo_price'] or 0, 2),
+                'avg_full_price': round(r['avg_full_price'] or 0, 2),
+                'recommendation': 'Skip discounts — they buy at full price' if (r['promo_orders'] or 0) / total < 0.15 else 'Price sensitive — promos drive conversions'
+            }
+
+        # ---- 5. SUPER-SPREADERS (+1 GOLD MINE) ----
+        spreaders = db.get_multi_ticket_buyers(min_avg_tickets=1.5)
+        # Filter to those relevant to this event (city or type match)
+        relevant_spreaders = []
+        total_plus_ones = 0
+        for s in spreaders:
+            city_match = _json_key_match(s.get('cities', '{}'), event.get('city'))
+            type_match = _json_key_match(s.get('event_types', '{}'), event.get('event_type'))
+            if city_match or type_match:
+                est_plus_ones = round((s.get('avg_tickets_per_order', 1) - 1) * s.get('total_orders', 1), 0)
+                s['estimated_plus_ones'] = int(est_plus_ones)
+                total_plus_ones += int(est_plus_ones)
+                relevant_spreaders.append(s)
+        relevant_spreaders.sort(key=lambda x: -(x.get('avg_tickets_per_order', 0)))
+        spreader_intel = {
+            'total_spreaders': len(relevant_spreaders),
+            'total_estimated_plus_ones': total_plus_ones,
+            'top_spreaders': relevant_spreaders[:20],
+            'recommendation': f'{len(relevant_spreaders)} super-spreaders brought an est. {total_plus_ones} friends. Offer referral incentives to these buyers.' if relevant_spreaders else 'Not enough multi-ticket buyer data yet.',
+            'downloadable': len(relevant_spreaders),
+        }
+
+        # ---- 6. TICKET TIER OPTIMIZATION ----
+        tier_data = {}
+        for eid in all_sibling_ids:
+            tiers = db.get_event_ticket_types(eid)
+            for t in tiers:
+                name = t['ticket_type']
+                if name not in tier_data:
+                    tier_data[name] = {'orders': 0, 'tickets': 0, 'revenue': 0, 'avg_price': 0, 'avg_days_before': 0, 'count': 0}
+                tier_data[name]['orders'] += t['orders']
+                tier_data[name]['tickets'] += t['tickets']
+                tier_data[name]['revenue'] += t['revenue']
+                tier_data[name]['avg_price'] = (tier_data[name]['avg_price'] * tier_data[name]['count'] + t['avg_price']) / (tier_data[name]['count'] + 1)
+                tier_data[name]['avg_days_before'] = (tier_data[name]['avg_days_before'] * tier_data[name]['count'] + (t['avg_days_before'] or 0)) / (tier_data[name]['count'] + 1)
+                tier_data[name]['count'] += 1
+        segment_prefs = db.get_segment_ticket_preferences()
+        tier_recommendations = []
+        for seg, prefs in segment_prefs.items():
+            if prefs:
+                top_tier = prefs[0]
+                tier_recommendations.append({
+                    'segment': seg,
+                    'preferred_tier': top_tier['ticket_type'],
+                    'avg_price': top_tier['avg_price'],
+                    'purchase_count': top_tier['count'],
+                })
+
+        # ---- 7. CHURN PREDICTION WITH SAVE WINDOWS ----
+        churn_risks = db.get_churn_risk_customers()
+        # Filter to event-relevant customers
+        event_churn = []
+        for c in churn_risks:
+            city_match = _json_key_match(c.get('cities', '{}'), event.get('city'))
+            type_match = _json_key_match(c.get('event_types', '{}'), event.get('event_type'))
+            if city_match or type_match:
+                event_churn.append(c)
+        churn_by_window = {'critical': [], 'urgent': [], 'watch': []}
+        for c in event_churn:
+            window = c.get('save_window', 'watch')
+            if window in churn_by_window:
+                churn_by_window[window].append(c)
+        churn_intel = {
+            'total_at_risk': len(event_churn),
+            'critical': len(churn_by_window['critical']),
+            'urgent': len(churn_by_window['urgent']),
+            'watch': len(churn_by_window['watch']),
+            'critical_customers': churn_by_window['critical'][:20],
+            'urgent_customers': churn_by_window['urgent'][:20],
+            'total_value_at_risk': round(sum(c.get('total_spent', 0) for c in event_churn), 2),
+            'recommendation': f'Email {len(churn_by_window["critical"])} critical-window customers THIS WEEK or lose them. {len(churn_by_window["urgent"])} more in the next 30 days.' if churn_by_window['critical'] else f'{len(churn_by_window["urgent"])} customers in urgent save window.',
+        }
+
+        # ---- 8. VIP IDENTIFICATION ----
+        vips = db.get_vip_customers(min_events=3, min_spent=200, limit=50)
+        # Filter to event-relevant
+        relevant_vips = []
+        for v in vips:
+            city_match = _json_key_match(v.get('cities', '{}'), event.get('city'))
+            type_match = _json_key_match(v.get('event_types', '{}'), event.get('event_type'))
+            if city_match or type_match:
+                already_bought = v['email'] in current_buyers
+                v['already_bought'] = already_bought
+                relevant_vips.append(v)
+        vip_not_bought = [v for v in relevant_vips if not v.get('already_bought')]
+        vip_intel = {
+            'total_vips': len(relevant_vips),
+            'vips_not_bought': len(vip_not_bought),
+            'vip_total_value': round(sum(v.get('total_spent', 0) for v in relevant_vips), 2),
+            'top_vips': relevant_vips[:20],
+            'unbought_vips': vip_not_bought[:20],
+            'recommendation': f'{len(vip_not_bought)} VIPs haven\'t bought yet — white-glove outreach, personal invite.' if vip_not_bought else 'All relevant VIPs have purchased!',
+        }
+
+        # ---- 9. COMPETITOR RADAR ----
+        # Check for OTHER upcoming events in same city within +/- 2 weeks
+        competitors = []
+        if event.get('city') and event.get('event_date'):
+            event_date = datetime.fromisoformat(event['event_date']).date()
+            for e in events_list:
+                if e['event_id'] in all_sibling_ids:
+                    continue
+                if e.get('city') != event.get('city'):
+                    continue
+                e_date = datetime.fromisoformat(e['event_date']).date()
+                day_diff = (e_date - event_date).days
+                if abs(day_diff) <= 14 and e_date >= date.today():
+                    competitors.append({
+                        'event_name': e['name'],
+                        'event_date': e['event_date'],
+                        'event_type': e.get('event_type', ''),
+                        'days_apart': day_diff,
+                        'same_weekend': abs(day_diff) <= 2,
+                    })
+        competitor_intel = {
+            'competing_events': competitors,
+            'count': len(competitors),
+            'same_weekend': sum(1 for c in competitors if c.get('same_weekend')),
+            'recommendation': f'WARNING: {len(competitors)} competing events in {event.get("city")} within 2 weeks. Differentiate messaging.' if competitors else 'No competing events detected in your calendar.',
+        }
+
+        # ---- 10. CANNIBALIZATION DETECTOR ----
+        # Check if YOUR OWN events are too close together in same city
+        cannibalization = []
+        upcoming = db.get_events(upcoming_only=True)
+        if event.get('city') and event.get('event_date'):
+            event_date = datetime.fromisoformat(event['event_date']).date()
+            for e in upcoming:
+                if e['event_id'] in all_sibling_ids:
+                    continue
+                if e.get('city') != event.get('city'):
+                    continue
+                e_date = datetime.fromisoformat(e['event_date']).date()
+                day_diff = (e_date - event_date).days
+                if 0 < abs(day_diff) <= 21:  # Within 3 weeks
+                    # Check buyer overlap
+                    other_buyers = db.get_event_buyers(e['event_id'])
+                    overlap = current_buyers & other_buyers
+                    cannibalization.append({
+                        'event_name': e['name'],
+                        'event_date': e['event_date'],
+                        'event_type': e.get('event_type', ''),
+                        'days_apart': day_diff,
+                        'buyer_overlap': len(overlap),
+                        'overlap_pct': round(len(overlap) / len(current_buyers) * 100, 1) if current_buyers else 0,
+                    })
+        cannibal_intel = {
+            'risk_events': cannibalization,
+            'count': len(cannibalization),
+            'recommendation': f'CAUTION: {len(cannibalization)} of your own events are within 3 weeks in {event.get("city")}. Check for audience cannibalization.' if cannibalization else 'No self-cannibalization risk detected.',
+        }
+
+        # ---- 11. REVENUE PROJECTOR ----
+        # Use historical sell-through curves to project final revenue
+        analyses = _get_portfolio()
+        this_analysis = None
+        for a in analyses:
+            if a.event_id == event_id:
+                this_analysis = a
+                break
+        revenue_projection = {
+            'current_tickets': current_tickets,
+            'current_revenue': round(current_revenue, 2),
+            'capacity': capacity,
+            'sell_through_pct': round(current_tickets / capacity * 100, 1) if capacity > 0 else 0,
+            'projected_final_tickets': this_analysis.projected_final if this_analysis else current_tickets,
+            'projected_range': list(this_analysis.projected_range) if this_analysis else [current_tickets, capacity],
+            'projected_revenue': round((this_analysis.projected_final if this_analysis else current_tickets) * avg_ticket_price, 2),
+            'projected_revenue_range': [
+                round(this_analysis.projected_range[0] * avg_ticket_price, 2) if this_analysis else round(current_revenue, 2),
+                round(this_analysis.projected_range[1] * avg_ticket_price, 2) if this_analysis else round(capacity * avg_ticket_price, 2),
+            ],
+            'confidence': this_analysis.confidence if this_analysis else 0.5,
+            'avg_ticket_price': round(avg_ticket_price, 2),
+        }
+
+        return jsonify({
+            'event': event,
+            'days_until': days_until,
+            'cross_sell': {
+                'candidates': len(cross_sell),
+                'by_source_type': dict(cross_sell_by_type),
+                'top_candidates': [{
+                    'email': c['email'],
+                    'attended_types': c.get('attended_types', []),
+                    'ltv_score': c.get('ltv_score', 0),
+                    'total_spent': c.get('total_spent', 0),
+                } for c in cross_sell[:20]],
+                'recommendation': f'{len(cross_sell)} fans of other events in {event.get("city", "city")} who haven\'t tried {event.get("event_type", "this type")} — prime cross-sell targets.' if cross_sell else 'No cross-sell candidates found.',
+            },
+            'velocity': velocity_alert,
+            'purchase_timing': post_event_velocity,
+            'promo_intelligence': {
+                'by_event': promo_stats,
+                'by_segment': promo_by_segment,
+            },
+            'super_spreaders': spreader_intel,
+            'ticket_tiers': {
+                'current_event': tier_data,
+                'segment_preferences': tier_recommendations,
+            },
+            'churn_prediction': churn_intel,
+            'vips': vip_intel,
+            'competitors': competitor_intel,
+            'cannibalization': cannibal_intel,
+            'revenue_projection': revenue_projection,
+            'export_token': os.environ.get('EXPORT_API_KEY', ''),
+        })
+
+    # === Export: Cross-sell and VIP audiences ===
+    @app.route('/api/export/intelligence-csv')
+    def export_intelligence_csv():
+        """Export intelligence audiences (cross-sell, super-spreaders, VIPs, churn) as CSV."""
+        export_key = os.environ.get('EXPORT_API_KEY', '')
+        if export_key:
+            provided = request.args.get('key', '') or request.headers.get('X-Export-Key', '')
+            if provided != export_key:
+                return jsonify({'error': 'Unauthorized'}), 401
+        event_id = request.args.get('event_id')
+        audience = request.args.get('audience')  # cross_sell, super_spreaders, vips, churn_critical, churn_urgent
+        if not event_id or not audience:
+            return jsonify({'error': 'event_id and audience required'}), 400
+        # Resolve event
+        event = None
+        all_sibling_ids = [event_id]
+        events_list = db.get_events(upcoming_only=False)
+        for e in events_list:
+            if e['event_id'] == event_id:
+                event = e
+                break
+        if not event:
+            for a in _get_portfolio():
+                if a.event_id == event_id:
+                    all_sibling_ids = list(a.constituent_event_ids) if a.constituent_event_ids else [event_id]
+                    for e in events_list:
+                        if e['event_id'] in all_sibling_ids:
+                            event = e
+                            break
+                    break
+        if not event:
+            return jsonify({'error': 'Event not found'}), 404
+        current_buyers = set()
+        for eid in all_sibling_ids:
+            current_buyers.update(db.get_event_buyers(eid))
+
+        customers_list = []
+        if audience == 'cross_sell':
+            customers_list = db.get_cross_sell_candidates(
+                event.get('event_type', ''), event.get('city', ''),
+                exclude_emails=current_buyers, limit=5000)
+        elif audience == 'super_spreaders':
+            spreaders = db.get_multi_ticket_buyers(min_avg_tickets=1.5)
+            for s in spreaders:
+                city_match = _json_key_match(s.get('cities', '{}'), event.get('city'))
+                type_match = _json_key_match(s.get('event_types', '{}'), event.get('event_type'))
+                if city_match or type_match:
+                    customers_list.append(s)
+        elif audience == 'vips':
+            vips = db.get_vip_customers(min_events=3, min_spent=200, limit=200)
+            for v in vips:
+                city_match = _json_key_match(v.get('cities', '{}'), event.get('city'))
+                type_match = _json_key_match(v.get('event_types', '{}'), event.get('event_type'))
+                if (city_match or type_match) and v['email'] not in current_buyers:
+                    customers_list.append(v)
+        elif audience == 'churn_critical':
+            churn = db.get_churn_risk_customers()
+            for c in churn:
+                if c.get('save_window') in ('critical', 'urgent'):
+                    city_match = _json_key_match(c.get('cities', '{}'), event.get('city'))
+                    type_match = _json_key_match(c.get('event_types', '{}'), event.get('event_type'))
+                    if city_match or type_match:
+                        customers_list.append(c)
+        # Build CSV
+        output = io.StringIO()
+        fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
+                  'total_orders', 'total_events', 'total_spent', 'ltv_score',
+                  'days_since_last', 'avg_tickets_per_order']
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for c in customers_list:
+            writer.writerow(c)
+        from flask import Response
+        csv_data = output.getvalue()
+        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', event.get('name', 'event'))
+        filename = f"{safe_name}_{audience}.csv"
+        return Response(
+            csv_data, mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename={filename}',
+                     'Access-Control-Allow-Origin': '*'})
+
     @app.route('/api/export/csv')
     def export_csv():
         """Export a targeting audience as CSV."""
