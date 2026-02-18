@@ -2138,6 +2138,59 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'configured': meta_configured,
             'data': status
         })
+    @app.route('/api/meta-debug')
+    def meta_debug():
+        """Diagnostic: test Meta API connection and campaign matching for one event."""
+        meta_token = os.environ.get('META_ACCESS_TOKEN')
+        meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
+        meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
+        if not meta_token or not meta_accounts:
+            return jsonify({'error': 'META_ACCESS_TOKEN or META_AD_ACCOUNT_ID not set',
+                            'token_set': bool(meta_token),
+                            'token_preview': f'{meta_token[:10]}...' if meta_token else None,
+                            'accounts': meta_accounts})
+        # Test the API with first account
+        acct = meta_accounts[0]
+        results = {'token_preview': f'{meta_token[:10]}...{meta_token[-5:]}',
+                    'accounts': meta_accounts, 'tests': []}
+        try:
+            meta = MetaAdsSync(meta_token, acct, db)
+            # Test 1: Can we reach the API at all?
+            test_url = f"{meta.BASE_URL}/act_{meta.ad_account_id}"
+            params = {'fields': 'name,account_status', 'access_token': meta_token}
+            resp = meta.session.get(test_url, params=params, timeout=15)
+            results['tests'].append({
+                'test': 'API connection',
+                'status_code': resp.status_code,
+                'response': resp.json() if resp.status_code == 200 else resp.text[:500],
+            })
+            # Test 2: Can we list campaigns?
+            camp_url = f"{meta.BASE_URL}/act_{meta.ad_account_id}/campaigns"
+            camp_params = {'fields': 'id,name,status', 'limit': 5, 'access_token': meta_token}
+            camp_resp = meta.session.get(camp_url, params=camp_params, timeout=15)
+            camp_data = camp_resp.json() if camp_resp.status_code == 200 else {'error': camp_resp.text[:500]}
+            results['tests'].append({
+                'test': 'List campaigns',
+                'status_code': camp_resp.status_code,
+                'campaign_count': len(camp_data.get('data', [])) if isinstance(camp_data, dict) else 0,
+                'sample_campaigns': [{'name': c.get('name'), 'status': c.get('status')} for c in (camp_data.get('data', []) if isinstance(camp_data, dict) else [])[:5]],
+                'error': camp_data.get('error') if isinstance(camp_data, dict) and 'error' in camp_data else None,
+            })
+            # Test 3: Try matching a known event
+            upcoming = db.get_events(upcoming_only=True)
+            if upcoming:
+                test_event = upcoming[0]
+                keywords = meta._generate_keywords(test_event['name'])
+                campaigns_found = meta._find_campaigns(test_event['name'])
+                results['tests'].append({
+                    'test': f'Campaign match for "{test_event["name"]}"',
+                    'keywords_generated': keywords[:10],
+                    'campaigns_matched': len(campaigns_found),
+                    'matched_names': [c['name'] for c in campaigns_found[:5]],
+                })
+        except Exception as e:
+            results['tests'].append({'test': 'Exception', 'error': str(e)})
+        return jsonify(results)
         # === Dashboard ===
     @app.route('/api/dashboard')
     def dashboard():
