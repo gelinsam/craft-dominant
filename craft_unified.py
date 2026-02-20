@@ -1875,8 +1875,8 @@ class DecisionEngine:
             past_by_date[(pe_date.year, pe_date)].append(pe)
         for (year, pdate), events_on_date in past_by_date.items():
             pd_weekday = pdate.strftime("%A")
-            if pd_weekday != day_name:
-                continue
+            # Don't filter by day-of-week — annual events shift weekdays year to year
+            # (e.g., Seattle Coffee Fest 2024 Friday vs 2025 Saturday)
             date_tickets = 0
             date_revenue = 0
             date_capacity = 0
@@ -1940,25 +1940,43 @@ class DecisionEngine:
                 all_projections.append(max(total_tickets, proj))
             grouped_proj_range = (min(all_projections), max(all_projections))
             grouped_confidence = 0.9 if len(comps_with_data) >= 3 else 0.75 if len(comps_with_data) >= 2 else 0.6
-        hist_medians = [a.historical_median_at_point for a in day_analyses if a.historical_median_at_point > 0]
-        hist_lo = [a.historical_range[0] for a in day_analyses if a.historical_range[0] > 0]
-        hist_hi = [a.historical_range[1] for a in day_analyses if a.historical_range[1] > 0]
+        # Calculate grouped historical median from comparisons at this days-out point
+        grouped_hist_median = 0
+        grouped_hist_lo = 0
+        grouped_hist_hi = 0
+        comps_with_snap = [c for c in historical_comparisons if c.get('at_days_out')]
+        if comps_with_snap:
+            snap_sells = sorted([c['at_days_out']['sell_through'] for c in comps_with_snap])
+            n = len(snap_sells)
+            grouped_hist_median = snap_sells[n // 2]
+            grouped_hist_lo = snap_sells[0]
+            grouped_hist_hi = snap_sells[-1]
+        # Calculate actual pace for grouped event (not hardcoded 0!)
+        grouped_pace = 0
+        if grouped_hist_median > 0:
+            grouped_pace = ((sell_through - grouped_hist_median) / grouped_hist_median) * 100
+        # Re-decide based on grouped data (don't inherit from individual slots)
+        grouped_decision, grouped_urgency, grouped_rationale, grouped_actions = self._decide(
+            total_tickets, max_capacity, sell_through, grouped_pace,
+            cac_val, days_until, grouped_hist_median,
+            [c['event_name'] for c in historical_comparisons]
+        )
         return EventPacing(
             event_id=eid, event_name=logical_name,
             event_date=day_analyses[0].event_date, days_until=days_until,
             tickets_sold=total_tickets, capacity=max_capacity,
             revenue=total_revenue, ad_spend=total_spend,
             sell_through=round(sell_through, 1), cac=round(cac_val, 2),
-            historical_median_at_point=sum(hist_medians) if hist_medians else 0,
-            historical_range=(sum(hist_lo) if hist_lo else 0, sum(hist_hi) if hist_hi else 0),
-            pace_vs_historical=0,
+            historical_median_at_point=grouped_hist_median,
+            historical_range=(grouped_hist_lo, grouped_hist_hi),
+            pace_vs_historical=round(grouped_pace, 1),
             comparison_events=[c['event_name'] for c in historical_comparisons],
             comparison_years=[c['year'] for c in historical_comparisons],
             projected_final=grouped_proj_final,
             projected_range=grouped_proj_range,
             confidence=grouped_confidence,
-            decision=best_decision, urgency=best_urgency,
-            rationale=best_rationale, actions=best_actions,
+            decision=grouped_decision, urgency=grouped_urgency,
+            rationale=grouped_rationale, actions=grouped_actions,
             high_value_targets=max(a.high_value_targets for a in day_analyses) if day_analyses else 0,
             reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
             historical_comparisons=historical_comparisons,
