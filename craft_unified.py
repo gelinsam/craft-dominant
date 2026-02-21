@@ -3622,6 +3622,60 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             import traceback; traceback.print_exc()
             return jsonify({'error': str(e)}), 500
 
+    @app.route('/api/overlap-debug')
+    def overlap_debug():
+        """Debug: show edition grouping and retention pattern matching."""
+        try:
+            all_events = db.conn.execute("""
+                SELECT e.event_id, e.name, e.event_type, e.city, e.event_date,
+                       COUNT(DISTINCT o.email) as attendee_count
+                FROM events e
+                JOIN orders o ON e.event_id = o.event_id
+                GROUP BY e.event_id
+                HAVING attendee_count > 0
+                ORDER BY e.city, e.name
+            """).fetchall()
+            all_events = [dict(r) for r in all_events]
+
+            # Show pattern mapping for every event
+            pattern_map = []
+            for ev in all_events:
+                pattern = _normalize_event_pattern(ev['name'], include_season=True)
+                pattern_no_season = _normalize_event_pattern(ev['name'], include_season=False)
+                year = ev['event_date'][:4]
+                pattern_map.append({
+                    'name': ev['name'],
+                    'city': ev['city'],
+                    'year': year,
+                    'pattern_with_season': pattern,
+                    'pattern_no_season': pattern_no_season,
+                    'attendees': ev['attendee_count']
+                })
+
+            # Group by city+pattern to show which events would match for retention
+            from collections import defaultdict
+            ret_groups = defaultdict(list)
+            for pm in pattern_map:
+                key = f"{pm['city']}|{pm['pattern_with_season']}"
+                ret_groups[key].append({'name': pm['name'], 'year': pm['year'], 'attendees': pm['attendees']})
+
+            # Show groups with only 1 year (these are the ones MISSING from retention)
+            single_year = {k: v for k, v in ret_groups.items() if len(set(e['year'] for e in v)) == 1}
+            multi_year = {k: v for k, v in ret_groups.items() if len(set(e['year'] for e in v)) > 1}
+
+            return jsonify({
+                'total_events': len(all_events),
+                'total_patterns': len(ret_groups),
+                'multi_year_patterns': len(multi_year),
+                'single_year_patterns': len(single_year),
+                'multi_year': {k: v for k, v in sorted(multi_year.items())},
+                'single_year_sample': dict(list(sorted(single_year.items()))[:30]),
+                'pattern_map_sample': pattern_map[:50]
+            })
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return jsonify({'error': str(e)}), 500
+
     @app.route('/api/export/overlap-csv')
     def export_overlap_csv():
         """Download email lists for overlap gap audiences."""
