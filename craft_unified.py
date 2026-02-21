@@ -1862,9 +1862,18 @@ class DecisionEngine:
                 best_rationale = a.rationale
                 best_actions = a.actions
                 break
+        # Figure out which "day ordinal" this grouped day is within the multi-day event
+        # e.g., for a Sat/Sun event, Saturday=Day 1, Sunday=Day 2
+        all_current_dates = sorted(set(
+            datetime.fromisoformat(a.event_date).date() for a in all_analyses_for_pattern
+        ))
+        current_day_ordinal = all_current_dates.index(first_date) if first_date in all_current_dates else 0
+        total_current_days = len(all_current_dates)
+
         historical_comparisons = []
         all_events = self.db.get_events()
-        past_by_date = defaultdict(list)
+        # Group ALL past events by (year) first, then by sorted date within that year
+        past_by_year = defaultdict(list)
         for pe in all_events:
             if self._get_pattern(pe['name']) != pattern:
                 continue
@@ -1872,11 +1881,26 @@ class DecisionEngine:
             is_current = any(pe['event_id'] == a.event_id for a in all_analyses_for_pattern)
             if is_current:
                 continue
-            past_by_date[(pe_date.year, pe_date)].append(pe)
+            past_by_year[pe_date.year].append(pe)
+        # For each past year, sort dates and match by day ordinal position
+        past_by_date = {}
+        for year, year_events in past_by_year.items():
+            year_dates = sorted(set(datetime.fromisoformat(e['event_date']).date() for e in year_events))
+            # Match current day ordinal to past year's day ordinal
+            if current_day_ordinal < len(year_dates):
+                target_date = year_dates[current_day_ordinal]
+                matching_events = [e for e in year_events
+                                   if datetime.fromisoformat(e['event_date']).date() == target_date]
+                if matching_events:
+                    past_by_date[(year, target_date)] = matching_events
+            elif len(year_dates) == 1 and total_current_days > 1 and current_day_ordinal == 0:
+                # Past edition was single-day, current is multi-day: only compare with Day 1
+                target_date = year_dates[0]
+                past_by_date[(year, target_date)] = [e for e in year_events
+                    if datetime.fromisoformat(e['event_date']).date() == target_date]
+
         for (year, pdate), events_on_date in past_by_date.items():
             pd_weekday = pdate.strftime("%A")
-            # Don't filter by day-of-week — annual events shift weekdays year to year
-            # (e.g., Seattle Coffee Fest 2024 Friday vs 2025 Saturday)
             date_tickets = 0
             date_revenue = 0
             date_capacity = 0
