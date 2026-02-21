@@ -341,6 +341,12 @@ export default function CraftDashboard() {
   const [intelLoading, setIntelLoading] = useState(false);
   const [intelOpen, setIntelOpen] = useState({});
 
+  // Overlap
+  const [overlap, setOverlap] = useState(null);
+  const [overlapLoading, setOverlapLoading] = useState(false);
+  const [overlapCity, setOverlapCity] = useState('');
+  const [overlapView, setOverlapView] = useState('matrix'); // matrix | pairs
+
   // CRM Browse
   const [crmSearch, setCrmSearch] = useState('');
   const [crmSegment, setCrmSegment] = useState('');
@@ -390,6 +396,17 @@ export default function CraftDashboard() {
     setIntelLoading(true);
     fetch(`${API_BASE}/api/intelligence/${eventId}`).then(r => r.json()).then(d => { setIntel(d); setIntelLoading(false); }).catch(() => setIntelLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (tab === 'overlap' && !overlap && !overlapLoading) {
+      setOverlapLoading(true);
+      fetch(`${API_BASE}/api/overlap`).then(r => r.json()).then(d => {
+        setOverlap(d);
+        if (d.cities?.length && !overlapCity) setOverlapCity(d.cities[0]);
+        setOverlapLoading(false);
+      }).catch(() => setOverlapLoading(false));
+    }
+  }, [tab]);
 
   useEffect(() => { if (tab === 'crm' && crmView === 'targeting' && targetEvent) fetchTargeting(targetEvent); }, [tab, crmView, targetEvent, fetchTargeting]);
   useEffect(() => { if (tab === 'crm' && crmView === 'targeting' && !targetEvent && dashboard?.events?.length) setTargetEvent(dashboard.events[0].event_id); }, [tab, crmView, dashboard]);
@@ -443,7 +460,7 @@ export default function CraftDashboard() {
               {Object.entries(decisions || {}).map(([d, n]) => { const cfg = DECISIONS[d]; return cfg && n > 0 ? (<div key={d} className="flex items-center gap-1 px-3 py-1 rounded-full" style={{ backgroundColor: cfg.bg }}><span>{cfg.icon}</span><span className="font-bold" style={{ color: cfg.color }}>{n}</span></div>) : null; })}
             </div>
             <div className="flex bg-gray-100 rounded-lg p-1">
-              {['events', 'crm'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : 'CRM'}</button>))}
+              {['events', 'crm', 'overlap'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : t === 'crm' ? 'CRM' : 'Overlap'}</button>))}
             </div>
             <button onClick={() => { if (!syncing) triggerSync(); }} className={`px-3 py-2 rounded-lg text-sm font-medium ${syncing ? 'bg-gray-200 text-gray-400' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} disabled={syncing}>{syncing ? 'Syncing...' : 'Refresh Data'}</button>
           </div>
@@ -968,6 +985,154 @@ export default function CraftDashboard() {
                     </div>
                   )}
                 </Card>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'overlap' && (
+          <div>
+            {overlapLoading && <div className="text-center py-12 text-gray-500">Analyzing attendee overlap across all events...</div>}
+            {overlap && !overlapLoading && (
+              <div className="space-y-6">
+                {/* Summary Banner */}
+                <div className="grid grid-cols-4 gap-4">
+                  <Card className="p-4"><Stat label="Events Analyzed" value={overlap.summary?.total_editions || 0} /></Card>
+                  <Card className="p-4"><Stat label="Overlap Pairs" value={overlap.summary?.total_pairs || 0} /></Card>
+                  <Card className="p-4"><Stat label="Cross-Type Pairs" value={overlap.summary?.cross_type_pairs || 0} /></Card>
+                  <Card className="p-4"><Stat label="Cities" value={overlap.summary?.cities_analyzed || 0} /></Card>
+                </div>
+
+                {/* Top Insight */}
+                {overlap.summary?.highest_cross_type && (
+                  <Card className="p-4 border-l-4 border-purple-500">
+                    <div className="text-sm font-medium text-purple-700 mb-1">Biggest Cross-Event Overlap</div>
+                    <div className="text-lg font-bold">{overlap.summary.highest_cross_type.event_a} & {overlap.summary.highest_cross_type.event_b}</div>
+                    <div className="text-sm text-gray-600">{overlap.summary.highest_cross_type.overlap_count.toLocaleString()} shared attendees in {overlap.summary.highest_cross_type.city}</div>
+                  </Card>
+                )}
+
+                {/* City selector + view toggle */}
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2 flex-wrap">
+                    {overlap.cities?.map(c => (
+                      <button key={c} onClick={() => setOverlapCity(c)} className={`px-4 py-2 rounded-lg text-sm font-medium ${overlapCity === c ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>{c}</button>
+                    ))}
+                  </div>
+                  <div className="flex bg-gray-100 rounded-lg p-1">
+                    <button onClick={() => setOverlapView('matrix')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Matrix</button>
+                    <button onClick={() => setOverlapView('pairs')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Ranked</button>
+                  </div>
+                </div>
+
+                {/* Matrix View */}
+                {overlapView === 'matrix' && overlap.matrices?.[overlapCity] && (() => {
+                  const m = overlap.matrices[overlapCity];
+                  const maxOverlap = Math.max(...m.matrix.flat().filter((_, idx) => Math.floor(idx / m.labels.length) !== idx % m.labels.length), 1);
+                  return (
+                    <Card className="p-0 overflow-auto">
+                      <div className="p-4 border-b"><h3 className="font-bold text-lg">{overlapCity} — Attendee Overlap Matrix</h3><p className="text-sm text-gray-500">Each cell shows shared attendees between two events. Diagonal shows total unique attendees.</p></div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr>
+                              <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[180px]"></th>
+                              {m.labels.map((label, i) => (
+                                <th key={i} className="p-2 text-center bg-gray-50 min-w-[100px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '160px'}}>
+                                  <span className="text-xs font-medium">{label.length > 25 ? label.slice(0, 25) + '...' : label}</span>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {m.labels.map((rowLabel, i) => (
+                              <tr key={i} className="border-t">
+                                <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">{rowLabel}<span className="block text-gray-400">{m.counts[i].toLocaleString()} attendees</span></td>
+                                {m.matrix[i].map((val, j) => {
+                                  const isDiag = i === j;
+                                  const intensity = isDiag ? 0 : Math.min(val / maxOverlap, 1);
+                                  const pctOfRow = isDiag ? 100 : m.counts[i] > 0 ? Math.round(val / m.counts[i] * 100) : 0;
+                                  const bg = isDiag ? '#f3f4f6' : val === 0 ? '#fff' : `rgba(124, 58, 237, ${0.08 + intensity * 0.55})`;
+                                  const textColor = isDiag ? '#374151' : intensity > 0.5 ? '#fff' : '#374151';
+                                  return (
+                                    <td key={j} className="p-2 text-center border-l" style={{backgroundColor: bg, color: textColor}} title={`${rowLabel} ∩ ${m.labels[j]}: ${val} attendees (${pctOfRow}% of ${rowLabel})`}>
+                                      <div className="font-bold text-sm">{val > 0 ? val.toLocaleString() : '-'}</div>
+                                      {!isDiag && val > 0 && <div className="text-xs opacity-75">{pctOfRow}%</div>}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </Card>
+                  );
+                })()}
+
+                {overlapView === 'matrix' && !overlap.matrices?.[overlapCity] && (
+                  <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} to build a matrix (need at least 2 unique events).</Card>
+                )}
+
+                {/* Ranked Pairs View */}
+                {overlapView === 'pairs' && (
+                  <Card className="p-0">
+                    <div className="p-4 border-b"><h3 className="font-bold text-lg">{overlapCity} — Ranked Overlap Pairs</h3><p className="text-sm text-gray-500">All event pairs sorted by shared attendees. Cross-type pairs highlighted.</p></div>
+                    <div className="max-h-[60vh] overflow-auto">
+                      {(overlap.pairs_by_city?.[overlapCity] || []).length === 0 && (
+                        <div className="p-8 text-center text-gray-500">No overlap pairs found for {overlapCity}.</div>
+                      )}
+                      {(overlap.pairs_by_city?.[overlapCity] || []).map((pair, idx) => (
+                        <div key={idx} className={`p-4 border-b flex items-center gap-4 ${!pair.same_event ? 'bg-purple-50' : ''}`}>
+                          <div className="text-2xl font-bold text-gray-300 w-8">#{idx + 1}</div>
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="font-semibold text-sm">{pair.event_a} ({pair.event_a_year})</span>
+                              <span className="text-gray-400">&</span>
+                              <span className="font-semibold text-sm">{pair.event_b} ({pair.event_b_year})</span>
+                              {!pair.same_event && <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full font-medium">Cross-Type</span>}
+                              {pair.same_event && <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full font-medium">Retention</span>}
+                            </div>
+                            <div className="flex gap-4 text-xs text-gray-500">
+                              <span>{pair.overlap_count.toLocaleString()} shared attendees</span>
+                              <span>{pair.pct_of_a}% of {pair.event_a}</span>
+                              <span>{pair.pct_of_b}% of {pair.event_b}</span>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xl font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
+                            <div className="text-xs text-gray-400">shared</div>
+                          </div>
+                          <div className="w-32">
+                            <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                              <div className="h-full rounded-full" style={{width: `${Math.max(pair.pct_of_a, pair.pct_of_b)}%`, backgroundColor: pair.same_event ? '#3b82f6' : '#7c3aed'}} />
+                            </div>
+                            <div className="text-xs text-gray-400 text-center mt-1">{Math.max(pair.pct_of_a, pair.pct_of_b)}%</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
+
+                {/* Global Top Cross-Type Pairs */}
+                {overlap.top_cross_type?.length > 0 && (
+                  <Card className="p-0">
+                    <div className="p-4 border-b"><h3 className="font-bold text-lg">Top Cross-Type Overlaps (All Cities)</h3><p className="text-sm text-gray-500">Your best cross-sell audiences — attendees who go to different event types.</p></div>
+                    <div className="max-h-[40vh] overflow-auto">
+                      {overlap.top_cross_type.slice(0, 20).map((pair, idx) => (
+                        <div key={idx} className="p-3 border-b flex items-center gap-3 hover:bg-purple-50">
+                          <div className="text-lg font-bold text-gray-300 w-7">#{idx + 1}</div>
+                          <div className="flex-1">
+                            <div className="font-medium text-sm">{pair.event_a} & {pair.event_b}</div>
+                            <div className="text-xs text-gray-500">{pair.city} — {pair.overlap_count.toLocaleString()} shared ({pair.pct_of_a}% / {pair.pct_of_b}%)</div>
+                          </div>
+                          <div className="font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
               </div>
             )}
           </div>

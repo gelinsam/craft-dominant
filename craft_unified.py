@@ -3348,6 +3348,177 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             headers={'Content-Disposition': f'attachment; filename={filename}',
                      'Access-Control-Allow-Origin': '*'}
         )
+    # === Overlap Analysis ===
+    @app.route('/api/overlap')
+    def overlap_analysis():
+        """Calculate attendee overlap between all event pairs, grouped by city."""
+        try:
+            # Get all events that have orders
+            all_events = db.conn.execute("""
+                SELECT e.event_id, e.name, e.event_type, e.city, e.event_date,
+                       COUNT(DISTINCT o.email) as attendee_count
+                FROM events e
+                JOIN orders o ON e.event_id = o.event_id
+                GROUP BY e.event_id
+                HAVING attendee_count > 0
+                ORDER BY e.city, e.event_date DESC
+            """).fetchall()
+            all_events = [dict(r) for r in all_events]
+
+            # Normalize: group timed-entry slots into one event per pattern+date
+            # e.g. "Philly Beer Fest 2025 - 12pm" and "...1pm" become one event
+            from collections import defaultdict
+            grouped = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'event_date': '', 'attendee_count': 0})
+            for ev in all_events:
+                pattern = _normalize_event_pattern(ev['name'], include_season=True)
+                ev_date = ev['event_date'][:10]
+                key = f"{pattern}_{ev_date}"
+                g = grouped[key]
+                g['event_ids'].append(ev['event_id'])
+                if not g['name'] or len(ev['name']) < len(g['name']):
+                    # Use shortest name (usually the one without time slot)
+                    g['name'] = re.sub(r'\s*[-–]\s*\d{1,2}(:\d{2})?\s*(am|pm|AM|PM).*$', '', ev['name']).strip()
+                g['event_type'] = ev['event_type'] or g['event_type']
+                g['city'] = ev['city'] or g['city']
+                g['event_date'] = ev_date
+
+            # Further group by pattern (merge dates for multi-day events into one entry per edition)
+            editions = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'year': '', 'attendee_count': 0})
+            for key, g in grouped.items():
+                pattern = key.rsplit('_', 1)[0]
+                year = g['event_date'][:4]
+                edition_key = f"{pattern}_{year}"
+                ed = editions[edition_key]
+                ed['event_ids'].extend(g['event_ids'])
+                if not ed['name'] or len(g['name']) < len(ed['name']):
+                    ed['name'] = g['name']
+                ed['event_type'] = g['event_type'] or ed['event_type']
+                ed['city'] = g['city'] or ed['city']
+                ed['year'] = year
+
+            # Build email sets for each edition
+            edition_list = []
+            for ekey, ed in editions.items():
+                placeholders = ','.join(['?'] * len(ed['event_ids']))
+                rows = db.conn.execute(
+                    f"SELECT DISTINCT email FROM orders WHERE event_id IN ({placeholders})",
+                    ed['event_ids']
+                ).fetchall()
+                emails = set(r['email'] for r in rows)
+                if len(emails) < 5:
+                    continue  # Skip tiny events
+                edition_list.append({
+                    'key': ekey,
+                    'name': ed['name'],
+                    'event_type': ed['event_type'],
+                    'city': ed['city'],
+                    'year': ed['year'],
+                    'attendee_count': len(emails),
+                    'emails': emails
+                })
+
+            # Group editions by city
+            by_city = defaultdict(list)
+            for ed in edition_list:
+                by_city[ed['city'] or 'Unknown'].append(ed)
+
+            # Calculate pairwise overlap within each city
+            city_results = {}
+            all_pairs = []
+            for city, city_editions in sorted(by_city.items()):
+                pairs = []
+                n = len(city_editions)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        a = city_editions[i]
+                        b = city_editions[j]
+                        overlap = a['emails'] & b['emails']
+                        overlap_count = len(overlap)
+                        if overlap_count == 0:
+                            continue
+                        pct_of_a = round(overlap_count / a['attendee_count'] * 100, 1)
+                        pct_of_b = round(overlap_count / b['attendee_count'] * 100, 1)
+                        pair = {
+                            'event_a': a['name'],
+                            'event_a_year': a['year'],
+                            'event_a_type': a['event_type'],
+                            'event_a_count': a['attendee_count'],
+                            'event_b': b['name'],
+                            'event_b_year': b['year'],
+                            'event_b_type': b['event_type'],
+                            'event_b_count': b['attendee_count'],
+                            'overlap_count': overlap_count,
+                            'pct_of_a': pct_of_a,
+                            'pct_of_b': pct_of_b,
+                            'city': city,
+                            'same_event': _normalize_event_pattern(a['name'], include_season=True) == _normalize_event_pattern(b['name'], include_season=True)
+                        }
+                        pairs.append(pair)
+                        all_pairs.append(pair)
+                # Sort by overlap count descending
+                pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
+                city_results[city] = pairs
+
+            # Sort all_pairs globally by overlap count
+            all_pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
+
+            # Build a cross-event matrix per city (unique event names, latest year)
+            city_matrices = {}
+            for city, city_editions in sorted(by_city.items()):
+                # Deduplicate: keep latest year per event pattern
+                latest = {}
+                for ed in city_editions:
+                    pattern = _normalize_event_pattern(ed['name'], include_season=True)
+                    if pattern not in latest or ed['year'] > latest[pattern]['year']:
+                        latest[pattern] = ed
+                unique_editions = sorted(latest.values(), key=lambda e: e['attendee_count'], reverse=True)
+                if len(unique_editions) < 2:
+                    continue
+
+                labels = [f"{e['name']}" for e in unique_editions]
+                matrix = []
+                for i, a in enumerate(unique_editions):
+                    row = []
+                    for j, b in enumerate(unique_editions):
+                        if i == j:
+                            row.append(a['attendee_count'])
+                        else:
+                            overlap = len(a['emails'] & b['emails'])
+                            row.append(overlap)
+                    matrix.append(row)
+
+                city_matrices[city] = {
+                    'labels': labels,
+                    'matrix': matrix,
+                    'counts': [e['attendee_count'] for e in unique_editions],
+                    'types': [e['event_type'] for e in unique_editions]
+                }
+
+            # Summary stats
+            cross_type_pairs = [p for p in all_pairs if not p['same_event']]
+            same_event_pairs = [p for p in all_pairs if p['same_event']]
+
+            return jsonify({
+                'cities': list(city_results.keys()),
+                'pairs_by_city': city_results,
+                'top_pairs': all_pairs[:50],
+                'top_cross_type': cross_type_pairs[:30],
+                'matrices': city_matrices,
+                'summary': {
+                    'total_editions': len(edition_list),
+                    'total_pairs': len(all_pairs),
+                    'cross_type_pairs': len(cross_type_pairs),
+                    'same_event_retention_pairs': len(same_event_pairs),
+                    'cities_analyzed': len(by_city),
+                    'highest_overlap': all_pairs[0] if all_pairs else None,
+                    'highest_cross_type': cross_type_pairs[0] if cross_type_pairs else None
+                }
+            })
+        except Exception as e:
+            log.error(f"Overlap analysis error: {e}")
+            import traceback; traceback.print_exc()
+            return jsonify({'error': str(e)}), 500
+
     # === Pacing ===
     @app.route('/api/curves')
     def pacing_curves():
