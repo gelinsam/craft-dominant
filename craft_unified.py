@@ -3349,174 +3349,351 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                      'Access-Control-Allow-Origin': '*'}
         )
     # === Overlap Analysis ===
+    # In-memory cache so CSV export can reference same data
+    _overlap_cache = {}
+
+    def _build_overlap_data():
+        """Core overlap computation — shared between /api/overlap and CSV export."""
+        all_events = db.conn.execute("""
+            SELECT e.event_id, e.name, e.event_type, e.city, e.event_date,
+                   COUNT(DISTINCT o.email) as attendee_count
+            FROM events e
+            JOIN orders o ON e.event_id = o.event_id
+            GROUP BY e.event_id
+            HAVING attendee_count > 0
+            ORDER BY e.city, e.event_date DESC
+        """).fetchall()
+        all_events = [dict(r) for r in all_events]
+
+        # Normalize: group timed-entry slots into one event per pattern+date
+        grouped = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'event_date': ''})
+        for ev in all_events:
+            pattern = _normalize_event_pattern(ev['name'], include_season=True)
+            ev_date = ev['event_date'][:10]
+            key = f"{pattern}_{ev_date}"
+            g = grouped[key]
+            g['event_ids'].append(ev['event_id'])
+            if not g['name'] or len(ev['name']) < len(g['name']):
+                g['name'] = re.sub(r'\s*[-–]\s*\d{1,2}(:\d{2})?\s*(am|pm|AM|PM).*$', '', ev['name']).strip()
+            g['event_type'] = ev['event_type'] or g['event_type']
+            g['city'] = ev['city'] or g['city']
+            g['event_date'] = ev_date
+
+        # Further group by pattern+year (merge multi-day into one edition)
+        editions = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'year': ''})
+        for key, g in grouped.items():
+            pattern = key.rsplit('_', 1)[0]
+            year = g['event_date'][:4]
+            edition_key = f"{pattern}_{year}"
+            ed = editions[edition_key]
+            ed['event_ids'].extend(g['event_ids'])
+            if not ed['name'] or len(g['name']) < len(ed['name']):
+                ed['name'] = g['name']
+            ed['event_type'] = g['event_type'] or ed['event_type']
+            ed['city'] = g['city'] or ed['city']
+            ed['year'] = year
+
+        # Build email sets for each edition
+        edition_list = []
+        for ekey, ed in editions.items():
+            placeholders = ','.join(['?'] * len(ed['event_ids']))
+            rows = db.conn.execute(
+                f"SELECT DISTINCT email FROM orders WHERE event_id IN ({placeholders})",
+                ed['event_ids']
+            ).fetchall()
+            emails = set(r['email'] for r in rows)
+            if len(emails) < 5:
+                continue
+            edition_list.append({
+                'key': ekey,
+                'name': ed['name'],
+                'event_type': ed['event_type'],
+                'city': ed['city'],
+                'year': ed['year'],
+                'attendee_count': len(emails),
+                'emails': emails,
+                'event_ids': ed['event_ids']
+            })
+
+        # Also build "all-time" editions: merge all years per event pattern per city
+        alltime = defaultdict(lambda: {'emails': set(), 'name': '', 'event_type': '', 'city': '', 'years': set(), 'event_ids': []})
+        for ed in edition_list:
+            pattern = _normalize_event_pattern(ed['name'], include_season=True)
+            key = f"{ed['city']}_{pattern}"
+            at = alltime[key]
+            at['emails'] |= ed['emails']
+            at['years'].add(ed['year'])
+            at['event_ids'].extend(ed['event_ids'])
+            if not at['name'] or len(ed['name']) < len(at['name']):
+                at['name'] = ed['name']
+            at['event_type'] = ed['event_type'] or at['event_type']
+            at['city'] = ed['city'] or at['city']
+
+        alltime_list = []
+        for key, at in alltime.items():
+            alltime_list.append({
+                'key': key,
+                'name': at['name'],
+                'event_type': at['event_type'],
+                'city': at['city'],
+                'years': sorted(at['years']),
+                'attendee_count': len(at['emails']),
+                'emails': at['emails'],
+                'event_ids': at['event_ids']
+            })
+
+        # Group by city
+        by_city = defaultdict(list)
+        for at in alltime_list:
+            by_city[at['city'] or 'Unknown'].append(at)
+
+        # Calculate pairwise: overlap, gap A→B, gap B→A, retention year-over-year
+        city_data = {}
+        all_pairs = []
+        pair_index = {}  # for CSV export lookups
+
+        for city, city_events in sorted(by_city.items()):
+            city_events.sort(key=lambda e: e['attendee_count'], reverse=True)
+            pairs = []
+            n = len(city_events)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    a = city_events[i]
+                    b = city_events[j]
+                    overlap_emails = a['emails'] & b['emails']
+                    only_a_emails = a['emails'] - b['emails']
+                    only_b_emails = b['emails'] - a['emails']
+                    overlap_count = len(overlap_emails)
+                    only_a = len(only_a_emails)
+                    only_b = len(only_b_emails)
+
+                    if overlap_count == 0 and only_a == 0 and only_b == 0:
+                        continue
+
+                    pct_of_a = round(overlap_count / a['attendee_count'] * 100, 1) if a['attendee_count'] > 0 else 0
+                    pct_of_b = round(overlap_count / b['attendee_count'] * 100, 1) if b['attendee_count'] > 0 else 0
+                    same_event = _normalize_event_pattern(a['name'], include_season=True) == _normalize_event_pattern(b['name'], include_season=True)
+
+                    pair_id = f"{city}_{i}_{j}"
+                    pair = {
+                        'pair_id': pair_id,
+                        'event_a': a['name'],
+                        'event_a_type': a['event_type'],
+                        'event_a_count': a['attendee_count'],
+                        'event_a_years': ', '.join(a['years']),
+                        'event_b': b['name'],
+                        'event_b_type': b['event_type'],
+                        'event_b_count': b['attendee_count'],
+                        'event_b_years': ', '.join(b['years']),
+                        'overlap_count': overlap_count,
+                        'only_a_count': only_a,
+                        'only_b_count': only_b,
+                        'pct_of_a': pct_of_a,
+                        'pct_of_b': pct_of_b,
+                        'city': city,
+                        'same_event': same_event,
+                    }
+                    # Generate actionable recommendation
+                    if same_event:
+                        pair['action'] = f"Retention: {pct_of_a}% came back. Target the {only_a} who didn't return."
+                        pair['action_type'] = 'retention'
+                    elif only_a > only_b:
+                        pair['action'] = f"{only_a:,} people went to {a['name']} but NEVER {b['name']}. Push {b['name']} to this list."
+                        pair['action_type'] = 'cross_sell_b'
+                    else:
+                        pair['action'] = f"{only_b:,} people went to {b['name']} but NEVER {a['name']}. Push {a['name']} to this list."
+                        pair['action_type'] = 'cross_sell_a'
+
+                    pairs.append(pair)
+                    all_pairs.append(pair)
+                    # Store email sets for CSV export
+                    pair_index[pair_id] = {
+                        'overlap': overlap_emails,
+                        'only_a': only_a_emails,
+                        'only_b': only_b_emails,
+                        'event_a': a['name'],
+                        'event_b': b['name']
+                    }
+
+            pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
+            city_data[city] = pairs
+
+        all_pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
+        cross_type_pairs = [p for p in all_pairs if not p['same_event']]
+
+        # Year-over-year retention for same events
+        retention = []
+        for city, city_editions_raw in defaultdict(list, {ed['city'] or 'Unknown': [] for ed in edition_list}).items():
+            pass
+        # Re-group edition_list by pattern+city for retention calc
+        ret_groups = defaultdict(list)
+        for ed in edition_list:
+            pattern = _normalize_event_pattern(ed['name'], include_season=True)
+            ret_groups[(ed['city'], pattern)].append(ed)
+        for (city, pattern), eds in ret_groups.items():
+            if len(eds) < 2:
+                continue
+            eds_sorted = sorted(eds, key=lambda e: e['year'])
+            for k in range(len(eds_sorted) - 1):
+                prev = eds_sorted[k]
+                curr = eds_sorted[k + 1]
+                retained = prev['emails'] & curr['emails']
+                churned = prev['emails'] - curr['emails']
+                new_attendees = curr['emails'] - prev['emails']
+                retention.append({
+                    'event': curr['name'],
+                    'city': city,
+                    'prev_year': prev['year'],
+                    'curr_year': curr['year'],
+                    'prev_count': prev['attendee_count'],
+                    'curr_count': curr['attendee_count'],
+                    'retained': len(retained),
+                    'churned': len(churned),
+                    'new_attendees': len(new_attendees),
+                    'retention_pct': round(len(retained) / prev['attendee_count'] * 100, 1) if prev['attendee_count'] > 0 else 0,
+                    'growth_pct': round((curr['attendee_count'] - prev['attendee_count']) / prev['attendee_count'] * 100, 1) if prev['attendee_count'] > 0 else 0
+                })
+        retention.sort(key=lambda r: r['retention_pct'], reverse=True)
+
+        # Build heatmap matrix per city (all-time unique events)
+        city_matrices = {}
+        for city, city_events in by_city.items():
+            if len(city_events) < 2:
+                continue
+            city_events_sorted = sorted(city_events, key=lambda e: e['attendee_count'], reverse=True)
+            labels = [e['name'] for e in city_events_sorted]
+            matrix = []
+            gap_matrix = []  # shows the "target this many" number
+            for i, a in enumerate(city_events_sorted):
+                row = []
+                gap_row = []
+                for j, b in enumerate(city_events_sorted):
+                    if i == j:
+                        row.append(a['attendee_count'])
+                        gap_row.append(0)
+                    else:
+                        overlap = len(a['emails'] & b['emails'])
+                        gap = len(a['emails'] - b['emails'])
+                        row.append(overlap)
+                        gap_row.append(gap)
+                matrix.append(row)
+                gap_matrix.append(gap_row)
+            city_matrices[city] = {
+                'labels': labels,
+                'matrix': matrix,
+                'gap_matrix': gap_matrix,
+                'counts': [e['attendee_count'] for e in city_events_sorted],
+                'types': [e['event_type'] for e in city_events_sorted]
+            }
+
+        # Store in cache for CSV export
+        _overlap_cache['pair_index'] = pair_index
+        _overlap_cache['city_matrices'] = city_matrices
+        _overlap_cache['by_city'] = by_city
+
+        return {
+            'cities': sorted(by_city.keys()),
+            'pairs_by_city': city_data,
+            'top_pairs': all_pairs[:50],
+            'top_cross_type': cross_type_pairs[:30],
+            'matrices': city_matrices,
+            'retention': retention,
+            'summary': {
+                'total_events': len(alltime_list),
+                'total_pairs': len(all_pairs),
+                'cross_type_pairs': len(cross_type_pairs),
+                'retention_pairs': len(retention),
+                'cities_analyzed': len(by_city),
+                'highest_overlap': all_pairs[0] if all_pairs else None,
+                'highest_cross_type': cross_type_pairs[0] if cross_type_pairs else None,
+                'best_retention': retention[0] if retention else None,
+                'total_cross_sell_opportunities': sum(p['only_a_count'] + p['only_b_count'] for p in cross_type_pairs)
+            }
+        }
+
     @app.route('/api/overlap')
     def overlap_analysis():
-        """Calculate attendee overlap between all event pairs, grouped by city."""
+        """Attendee overlap, gap audiences, retention, and cross-sell opportunities."""
         try:
-            # Get all events that have orders
-            all_events = db.conn.execute("""
-                SELECT e.event_id, e.name, e.event_type, e.city, e.event_date,
-                       COUNT(DISTINCT o.email) as attendee_count
-                FROM events e
-                JOIN orders o ON e.event_id = o.event_id
-                GROUP BY e.event_id
-                HAVING attendee_count > 0
-                ORDER BY e.city, e.event_date DESC
-            """).fetchall()
-            all_events = [dict(r) for r in all_events]
-
-            # Normalize: group timed-entry slots into one event per pattern+date
-            # e.g. "Philly Beer Fest 2025 - 12pm" and "...1pm" become one event
-            from collections import defaultdict
-            grouped = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'event_date': '', 'attendee_count': 0})
-            for ev in all_events:
-                pattern = _normalize_event_pattern(ev['name'], include_season=True)
-                ev_date = ev['event_date'][:10]
-                key = f"{pattern}_{ev_date}"
-                g = grouped[key]
-                g['event_ids'].append(ev['event_id'])
-                if not g['name'] or len(ev['name']) < len(g['name']):
-                    # Use shortest name (usually the one without time slot)
-                    g['name'] = re.sub(r'\s*[-–]\s*\d{1,2}(:\d{2})?\s*(am|pm|AM|PM).*$', '', ev['name']).strip()
-                g['event_type'] = ev['event_type'] or g['event_type']
-                g['city'] = ev['city'] or g['city']
-                g['event_date'] = ev_date
-
-            # Further group by pattern (merge dates for multi-day events into one entry per edition)
-            editions = defaultdict(lambda: {'event_ids': [], 'name': '', 'event_type': '', 'city': '', 'year': '', 'attendee_count': 0})
-            for key, g in grouped.items():
-                pattern = key.rsplit('_', 1)[0]
-                year = g['event_date'][:4]
-                edition_key = f"{pattern}_{year}"
-                ed = editions[edition_key]
-                ed['event_ids'].extend(g['event_ids'])
-                if not ed['name'] or len(g['name']) < len(ed['name']):
-                    ed['name'] = g['name']
-                ed['event_type'] = g['event_type'] or ed['event_type']
-                ed['city'] = g['city'] or ed['city']
-                ed['year'] = year
-
-            # Build email sets for each edition
-            edition_list = []
-            for ekey, ed in editions.items():
-                placeholders = ','.join(['?'] * len(ed['event_ids']))
-                rows = db.conn.execute(
-                    f"SELECT DISTINCT email FROM orders WHERE event_id IN ({placeholders})",
-                    ed['event_ids']
-                ).fetchall()
-                emails = set(r['email'] for r in rows)
-                if len(emails) < 5:
-                    continue  # Skip tiny events
-                edition_list.append({
-                    'key': ekey,
-                    'name': ed['name'],
-                    'event_type': ed['event_type'],
-                    'city': ed['city'],
-                    'year': ed['year'],
-                    'attendee_count': len(emails),
-                    'emails': emails
-                })
-
-            # Group editions by city
-            by_city = defaultdict(list)
-            for ed in edition_list:
-                by_city[ed['city'] or 'Unknown'].append(ed)
-
-            # Calculate pairwise overlap within each city
-            city_results = {}
-            all_pairs = []
-            for city, city_editions in sorted(by_city.items()):
-                pairs = []
-                n = len(city_editions)
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        a = city_editions[i]
-                        b = city_editions[j]
-                        overlap = a['emails'] & b['emails']
-                        overlap_count = len(overlap)
-                        if overlap_count == 0:
-                            continue
-                        pct_of_a = round(overlap_count / a['attendee_count'] * 100, 1)
-                        pct_of_b = round(overlap_count / b['attendee_count'] * 100, 1)
-                        pair = {
-                            'event_a': a['name'],
-                            'event_a_year': a['year'],
-                            'event_a_type': a['event_type'],
-                            'event_a_count': a['attendee_count'],
-                            'event_b': b['name'],
-                            'event_b_year': b['year'],
-                            'event_b_type': b['event_type'],
-                            'event_b_count': b['attendee_count'],
-                            'overlap_count': overlap_count,
-                            'pct_of_a': pct_of_a,
-                            'pct_of_b': pct_of_b,
-                            'city': city,
-                            'same_event': _normalize_event_pattern(a['name'], include_season=True) == _normalize_event_pattern(b['name'], include_season=True)
-                        }
-                        pairs.append(pair)
-                        all_pairs.append(pair)
-                # Sort by overlap count descending
-                pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
-                city_results[city] = pairs
-
-            # Sort all_pairs globally by overlap count
-            all_pairs.sort(key=lambda p: p['overlap_count'], reverse=True)
-
-            # Build a cross-event matrix per city (unique event names, latest year)
-            city_matrices = {}
-            for city, city_editions in sorted(by_city.items()):
-                # Deduplicate: keep latest year per event pattern
-                latest = {}
-                for ed in city_editions:
-                    pattern = _normalize_event_pattern(ed['name'], include_season=True)
-                    if pattern not in latest or ed['year'] > latest[pattern]['year']:
-                        latest[pattern] = ed
-                unique_editions = sorted(latest.values(), key=lambda e: e['attendee_count'], reverse=True)
-                if len(unique_editions) < 2:
-                    continue
-
-                labels = [f"{e['name']}" for e in unique_editions]
-                matrix = []
-                for i, a in enumerate(unique_editions):
-                    row = []
-                    for j, b in enumerate(unique_editions):
-                        if i == j:
-                            row.append(a['attendee_count'])
-                        else:
-                            overlap = len(a['emails'] & b['emails'])
-                            row.append(overlap)
-                    matrix.append(row)
-
-                city_matrices[city] = {
-                    'labels': labels,
-                    'matrix': matrix,
-                    'counts': [e['attendee_count'] for e in unique_editions],
-                    'types': [e['event_type'] for e in unique_editions]
-                }
-
-            # Summary stats
-            cross_type_pairs = [p for p in all_pairs if not p['same_event']]
-            same_event_pairs = [p for p in all_pairs if p['same_event']]
-
-            return jsonify({
-                'cities': list(city_results.keys()),
-                'pairs_by_city': city_results,
-                'top_pairs': all_pairs[:50],
-                'top_cross_type': cross_type_pairs[:30],
-                'matrices': city_matrices,
-                'summary': {
-                    'total_editions': len(edition_list),
-                    'total_pairs': len(all_pairs),
-                    'cross_type_pairs': len(cross_type_pairs),
-                    'same_event_retention_pairs': len(same_event_pairs),
-                    'cities_analyzed': len(by_city),
-                    'highest_overlap': all_pairs[0] if all_pairs else None,
-                    'highest_cross_type': cross_type_pairs[0] if cross_type_pairs else None
-                }
-            })
+            data = _build_overlap_data()
+            return jsonify(data)
         except Exception as e:
             log.error(f"Overlap analysis error: {e}")
             import traceback; traceback.print_exc()
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/export/overlap-csv')
+    def export_overlap_csv():
+        """Download email lists for overlap gap audiences."""
+        pair_id = request.args.get('pair_id', '')
+        audience = request.args.get('audience', '')  # overlap, only_a, only_b
+        city = request.args.get('city', '')
+        row_idx = request.args.get('row', '')
+        col_idx = request.args.get('col', '')
+
+        if not _overlap_cache.get('pair_index'):
+            _build_overlap_data()
+
+        try:
+            emails = set()
+            filename = 'overlap_audience.csv'
+
+            # Matrix cell export: row event attendees who HAVEN'T been to col event
+            if city and row_idx and col_idx:
+                row_i = int(row_idx)
+                col_j = int(col_idx)
+                by_city = _overlap_cache.get('by_city', {})
+                city_events = by_city.get(city, [])
+                city_events_sorted = sorted(city_events, key=lambda e: e['attendee_count'], reverse=True)
+                if row_i < len(city_events_sorted) and col_j < len(city_events_sorted):
+                    a = city_events_sorted[row_i]
+                    b = city_events_sorted[col_j]
+                    if row_i == col_j:
+                        emails = a['emails']
+                        filename = f"{a['name']}_all_attendees.csv"
+                    else:
+                        emails = a['emails'] - b['emails']
+                        filename = f"{a['name']}_NOT_{b['name']}.csv"
+
+            # Pair-based export
+            elif pair_id and audience:
+                pair_data = _overlap_cache.get('pair_index', {}).get(pair_id)
+                if pair_data:
+                    emails = pair_data.get(audience, set())
+                    if audience == 'only_a':
+                        filename = f"{pair_data['event_a']}_NOT_{pair_data['event_b']}.csv"
+                    elif audience == 'only_b':
+                        filename = f"{pair_data['event_b']}_NOT_{pair_data['event_a']}.csv"
+                    else:
+                        filename = f"{pair_data['event_a']}_AND_{pair_data['event_b']}.csv"
+
+            if not emails:
+                return jsonify({'error': 'No emails found for this audience'}), 404
+
+            # Build CSV with customer data
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['email', 'total_orders', 'total_spent', 'total_events', 'favorite_event_type', 'favorite_city', 'last_order_date'])
+            for email in sorted(emails):
+                cust = db.conn.execute(
+                    "SELECT email, total_orders, total_spent, total_events, favorite_event_type, favorite_city, last_order_date FROM customers WHERE email = ?",
+                    (email,)
+                ).fetchone()
+                if cust:
+                    writer.writerow([cust['email'], cust['total_orders'], f"{cust['total_spent']:.2f}",
+                                     cust['total_events'], cust['favorite_event_type'], cust['favorite_city'],
+                                     cust['last_order_date']])
+                else:
+                    writer.writerow([email, '', '', '', '', '', ''])
+
+            csv_data = output.getvalue()
+            filename = re.sub(r'[^a-zA-Z0-9_\-.]', '_', filename)
+            from flask import Response
+            return Response(csv_data, mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={filename}',
+                                     'Access-Control-Allow-Origin': '*'})
+        except Exception as e:
+            log.error(f"Overlap CSV export error: {e}")
             return jsonify({'error': str(e)}), 500
 
     # === Pacing ===

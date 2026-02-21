@@ -996,19 +996,22 @@ export default function CraftDashboard() {
             {overlap && !overlapLoading && (
               <div className="space-y-6">
                 {/* Summary Banner */}
-                <div className="grid grid-cols-4 gap-4">
-                  <Card className="p-4"><Stat label="Events Analyzed" value={overlap.summary?.total_editions || 0} /></Card>
+                <div className="grid grid-cols-5 gap-4">
+                  <Card className="p-4"><Stat label="Events" value={overlap.summary?.total_events || 0} /></Card>
                   <Card className="p-4"><Stat label="Overlap Pairs" value={overlap.summary?.total_pairs || 0} /></Card>
-                  <Card className="p-4"><Stat label="Cross-Type Pairs" value={overlap.summary?.cross_type_pairs || 0} /></Card>
+                  <Card className="p-4"><Stat label="Cross-Sell Pairs" value={overlap.summary?.cross_type_pairs || 0} /></Card>
+                  <Card className="p-4"><Stat label="Cross-Sell Opps" value={(overlap.summary?.total_cross_sell_opportunities || 0).toLocaleString()} /></Card>
                   <Card className="p-4"><Stat label="Cities" value={overlap.summary?.cities_analyzed || 0} /></Card>
                 </div>
 
-                {/* Top Insight */}
+                {/* Top Actionable Insight */}
                 {overlap.summary?.highest_cross_type && (
-                  <Card className="p-4 border-l-4 border-purple-500">
-                    <div className="text-sm font-medium text-purple-700 mb-1">Biggest Cross-Event Overlap</div>
-                    <div className="text-lg font-bold">{overlap.summary.highest_cross_type.event_a} & {overlap.summary.highest_cross_type.event_b}</div>
-                    <div className="text-sm text-gray-600">{overlap.summary.highest_cross_type.overlap_count.toLocaleString()} shared attendees in {overlap.summary.highest_cross_type.city}</div>
+                  <Card className="p-5 border-l-4 border-green-500 bg-green-50">
+                    <div className="text-sm font-bold text-green-800 mb-1">BIGGEST UNTAPPED AUDIENCE</div>
+                    <div className="text-lg font-bold text-gray-900 mb-1">
+                      {overlap.summary.highest_cross_type.only_a_count?.toLocaleString()} people went to {overlap.summary.highest_cross_type.event_a} but NEVER {overlap.summary.highest_cross_type.event_b}
+                    </div>
+                    <div className="text-sm text-green-700">{overlap.summary.highest_cross_type.city} — {overlap.summary.highest_cross_type.overlap_count.toLocaleString()} already go to both. The gap is your target list.</div>
                   </Card>
                 )}
 
@@ -1020,26 +1023,31 @@ export default function CraftDashboard() {
                     ))}
                   </div>
                   <div className="flex bg-gray-100 rounded-lg p-1">
-                    <button onClick={() => setOverlapView('matrix')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Matrix</button>
-                    <button onClick={() => setOverlapView('pairs')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Ranked</button>
+                    <button onClick={() => setOverlapView('matrix')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Gap Matrix</button>
+                    <button onClick={() => setOverlapView('pairs')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Action List</button>
+                    <button onClick={() => setOverlapView('retention')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'retention' ? 'bg-white shadow' : 'text-gray-600'}`}>Retention</button>
                   </div>
                 </div>
 
-                {/* Matrix View */}
+                {/* GAP MATRIX — the money view */}
                 {overlapView === 'matrix' && overlap.matrices?.[overlapCity] && (() => {
                   const m = overlap.matrices[overlapCity];
+                  const maxGap = Math.max(...(m.gap_matrix || m.matrix).flat().filter(v => v > 0), 1);
                   const maxOverlap = Math.max(...m.matrix.flat().filter((_, idx) => Math.floor(idx / m.labels.length) !== idx % m.labels.length), 1);
                   return (
                     <Card className="p-0 overflow-auto">
-                      <div className="p-4 border-b"><h3 className="font-bold text-lg">{overlapCity} — Attendee Overlap Matrix</h3><p className="text-sm text-gray-500">Each cell shows shared attendees between two events. Diagonal shows total unique attendees.</p></div>
+                      <div className="p-4 border-b">
+                        <h3 className="font-bold text-lg">{overlapCity} — Gap Matrix</h3>
+                        <p className="text-sm text-gray-500">Each cell = people who went to the ROW event but NOT the COLUMN event. <strong>These are your target lists.</strong> Click any cell to download the CSV.</p>
+                      </div>
                       <div className="overflow-x-auto">
                         <table className="w-full text-sm">
                           <thead>
                             <tr>
-                              <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[180px]"></th>
+                              <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[200px]"><span className="text-xs text-gray-400">ROW went to... but NOT COLUMN</span></th>
                               {m.labels.map((label, i) => (
-                                <th key={i} className="p-2 text-center bg-gray-50 min-w-[100px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '160px'}}>
-                                  <span className="text-xs font-medium">{label.length > 25 ? label.slice(0, 25) + '...' : label}</span>
+                                <th key={i} className="p-2 text-center bg-gray-50 min-w-[110px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '160px'}}>
+                                  <span className="text-xs font-medium">{label.length > 28 ? label.slice(0, 28) + '...' : label}</span>
                                 </th>
                               ))}
                             </tr>
@@ -1047,17 +1055,36 @@ export default function CraftDashboard() {
                           <tbody>
                             {m.labels.map((rowLabel, i) => (
                               <tr key={i} className="border-t">
-                                <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">{rowLabel}<span className="block text-gray-400">{m.counts[i].toLocaleString()} attendees</span></td>
-                                {m.matrix[i].map((val, j) => {
+                                <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">
+                                  {rowLabel}
+                                  <span className="block text-gray-400">{m.counts[i].toLocaleString()} total</span>
+                                </td>
+                                {m.matrix[i].map((overlapVal, j) => {
                                   const isDiag = i === j;
-                                  const intensity = isDiag ? 0 : Math.min(val / maxOverlap, 1);
-                                  const pctOfRow = isDiag ? 100 : m.counts[i] > 0 ? Math.round(val / m.counts[i] * 100) : 0;
-                                  const bg = isDiag ? '#f3f4f6' : val === 0 ? '#fff' : `rgba(124, 58, 237, ${0.08 + intensity * 0.55})`;
-                                  const textColor = isDiag ? '#374151' : intensity > 0.5 ? '#fff' : '#374151';
+                                  const gapVal = m.gap_matrix ? m.gap_matrix[i][j] : (m.counts[i] - overlapVal);
+                                  const gapIntensity = isDiag ? 0 : Math.min(gapVal / maxGap, 1);
+                                  const overlapPct = isDiag ? 100 : m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0;
+
+                                  if (isDiag) {
+                                    return (
+                                      <td key={j} className="p-2 text-center border-l bg-gray-100 cursor-pointer hover:bg-gray-200"
+                                          onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}>
+                                        <div className="font-bold text-sm text-gray-600">{m.counts[i].toLocaleString()}</div>
+                                        <div className="text-xs text-gray-400">all</div>
+                                      </td>
+                                    );
+                                  }
+
+                                  const bg = gapVal === 0 ? '#f0fdf4' : `rgba(124, 58, 237, ${0.06 + gapIntensity * 0.5})`;
+                                  const textColor = gapIntensity > 0.5 ? '#fff' : '#374151';
+
                                   return (
-                                    <td key={j} className="p-2 text-center border-l" style={{backgroundColor: bg, color: textColor}} title={`${rowLabel} ∩ ${m.labels[j]}: ${val} attendees (${pctOfRow}% of ${rowLabel})`}>
-                                      <div className="font-bold text-sm">{val > 0 ? val.toLocaleString() : '-'}</div>
-                                      {!isDiag && val > 0 && <div className="text-xs opacity-75">{pctOfRow}%</div>}
+                                    <td key={j} className="p-2 text-center border-l cursor-pointer hover:ring-2 hover:ring-purple-400 hover:z-10 relative"
+                                        style={{backgroundColor: bg, color: textColor}}
+                                        title={`${gapVal.toLocaleString()} people went to ${rowLabel} but NOT ${m.labels[j]}. Click to download CSV.`}
+                                        onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}>
+                                      <div className="font-bold text-sm">{gapVal > 0 ? gapVal.toLocaleString() : '-'}</div>
+                                      {gapVal > 0 && <div className="text-xs opacity-75">{overlapPct}% overlap</div>}
                                     </td>
                                   );
                                 })}
@@ -1066,6 +1093,7 @@ export default function CraftDashboard() {
                           </tbody>
                         </table>
                       </div>
+                      <div className="p-3 bg-purple-50 border-t text-xs text-purple-700 text-center">Click any cell to download that audience as a CSV. Darker purple = bigger untapped audience.</div>
                     </Card>
                   );
                 })()}
@@ -1074,40 +1102,68 @@ export default function CraftDashboard() {
                   <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} to build a matrix (need at least 2 unique events).</Card>
                 )}
 
-                {/* Ranked Pairs View */}
+                {/* ACTION LIST — ranked pairs with download buttons */}
                 {overlapView === 'pairs' && (
                   <Card className="p-0">
-                    <div className="p-4 border-b"><h3 className="font-bold text-lg">{overlapCity} — Ranked Overlap Pairs</h3><p className="text-sm text-gray-500">All event pairs sorted by shared attendees. Cross-type pairs highlighted.</p></div>
-                    <div className="max-h-[60vh] overflow-auto">
+                    <div className="p-4 border-b">
+                      <h3 className="font-bold text-lg">{overlapCity} — Cross-Sell Action List</h3>
+                      <p className="text-sm text-gray-500">Every event pair ranked by gap size. Download the audience that went to one but not the other.</p>
+                    </div>
+                    <div className="max-h-[65vh] overflow-auto">
                       {(overlap.pairs_by_city?.[overlapCity] || []).length === 0 && (
                         <div className="p-8 text-center text-gray-500">No overlap pairs found for {overlapCity}.</div>
                       )}
                       {(overlap.pairs_by_city?.[overlapCity] || []).map((pair, idx) => (
-                        <div key={idx} className={`p-4 border-b flex items-center gap-4 ${!pair.same_event ? 'bg-purple-50' : ''}`}>
-                          <div className="text-2xl font-bold text-gray-300 w-8">#{idx + 1}</div>
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2 mb-1">
-                              <span className="font-semibold text-sm">{pair.event_a} ({pair.event_a_year})</span>
-                              <span className="text-gray-400">&</span>
-                              <span className="font-semibold text-sm">{pair.event_b} ({pair.event_b_year})</span>
-                              {!pair.same_event && <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full font-medium">Cross-Type</span>}
-                              {pair.same_event && <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full font-medium">Retention</span>}
+                        <div key={idx} className={`p-4 border-b ${!pair.same_event ? 'hover:bg-purple-50' : 'hover:bg-blue-50'}`}>
+                          <div className="flex items-start gap-4">
+                            <div className="text-xl font-bold text-gray-300 w-7 pt-1">#{idx + 1}</div>
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2 mb-2">
+                                <span className="font-semibold">{pair.event_a}</span>
+                                <span className="text-gray-400">&times;</span>
+                                <span className="font-semibold">{pair.event_b}</span>
+                                {!pair.same_event && <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full font-medium">Cross-Sell</span>}
+                                {pair.same_event && <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full font-medium">Retention</span>}
+                              </div>
+                              {/* Action recommendation */}
+                              <div className="text-sm text-gray-700 mb-3 bg-yellow-50 border border-yellow-200 rounded p-2">
+                                {pair.action}
+                              </div>
+                              {/* Stats row */}
+                              <div className="flex gap-6 text-sm mb-3">
+                                <div className="text-center">
+                                  <div className="font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
+                                  <div className="text-xs text-gray-400">shared</div>
+                                </div>
+                                <div className="text-center">
+                                  <div className="font-bold text-orange-600">{pair.only_a_count.toLocaleString()}</div>
+                                  <div className="text-xs text-gray-400">only {pair.event_a.length > 20 ? pair.event_a.slice(0, 20) + '...' : pair.event_a}</div>
+                                </div>
+                                <div className="text-center">
+                                  <div className="font-bold text-orange-600">{pair.only_b_count.toLocaleString()}</div>
+                                  <div className="text-xs text-gray-400">only {pair.event_b.length > 20 ? pair.event_b.slice(0, 20) + '...' : pair.event_b}</div>
+                                </div>
+                              </div>
+                              {/* Download buttons */}
+                              <div className="flex gap-2 flex-wrap">
+                                {pair.only_a_count > 0 && (
+                                  <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_a`, '_blank')}
+                                    className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
+                                    Download {pair.only_a_count.toLocaleString()} — went to {pair.event_a.length > 18 ? pair.event_a.slice(0, 18) + '...' : pair.event_a}, NOT {pair.event_b.length > 18 ? pair.event_b.slice(0, 18) + '...' : pair.event_b}
+                                  </button>
+                                )}
+                                {pair.only_b_count > 0 && (
+                                  <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_b`, '_blank')}
+                                    className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
+                                    Download {pair.only_b_count.toLocaleString()} — went to {pair.event_b.length > 18 ? pair.event_b.slice(0, 18) + '...' : pair.event_b}, NOT {pair.event_a.length > 18 ? pair.event_a.slice(0, 18) + '...' : pair.event_a}
+                                  </button>
+                                )}
+                                <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=overlap`, '_blank')}
+                                  className="px-3 py-1.5 bg-gray-200 text-gray-700 text-xs rounded-lg font-medium hover:bg-gray-300">
+                                  Download {pair.overlap_count.toLocaleString()} shared
+                                </button>
+                              </div>
                             </div>
-                            <div className="flex gap-4 text-xs text-gray-500">
-                              <span>{pair.overlap_count.toLocaleString()} shared attendees</span>
-                              <span>{pair.pct_of_a}% of {pair.event_a}</span>
-                              <span>{pair.pct_of_b}% of {pair.event_b}</span>
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-xl font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
-                            <div className="text-xs text-gray-400">shared</div>
-                          </div>
-                          <div className="w-32">
-                            <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                              <div className="h-full rounded-full" style={{width: `${Math.max(pair.pct_of_a, pair.pct_of_b)}%`, backgroundColor: pair.same_event ? '#3b82f6' : '#7c3aed'}} />
-                            </div>
-                            <div className="text-xs text-gray-400 text-center mt-1">{Math.max(pair.pct_of_a, pair.pct_of_b)}%</div>
                           </div>
                         </div>
                       ))}
@@ -1115,21 +1171,82 @@ export default function CraftDashboard() {
                   </Card>
                 )}
 
-                {/* Global Top Cross-Type Pairs */}
-                {overlap.top_cross_type?.length > 0 && (
+                {/* RETENTION VIEW — year-over-year for same events */}
+                {overlapView === 'retention' && (
                   <Card className="p-0">
-                    <div className="p-4 border-b"><h3 className="font-bold text-lg">Top Cross-Type Overlaps (All Cities)</h3><p className="text-sm text-gray-500">Your best cross-sell audiences — attendees who go to different event types.</p></div>
-                    <div className="max-h-[40vh] overflow-auto">
-                      {overlap.top_cross_type.slice(0, 20).map((pair, idx) => (
-                        <div key={idx} className="p-3 border-b flex items-center gap-3 hover:bg-purple-50">
-                          <div className="text-lg font-bold text-gray-300 w-7">#{idx + 1}</div>
-                          <div className="flex-1">
-                            <div className="font-medium text-sm">{pair.event_a} & {pair.event_b}</div>
-                            <div className="text-xs text-gray-500">{pair.city} — {pair.overlap_count.toLocaleString()} shared ({pair.pct_of_a}% / {pair.pct_of_b}%)</div>
+                    <div className="p-4 border-b">
+                      <h3 className="font-bold text-lg">Year-Over-Year Retention</h3>
+                      <p className="text-sm text-gray-500">How many attendees came back the following year? Who churned? Who's new?</p>
+                    </div>
+                    <div className="max-h-[65vh] overflow-auto">
+                      {(!overlap.retention?.length) && (
+                        <div className="p-8 text-center text-gray-500">Need at least 2 years of data for the same event to show retention.</div>
+                      )}
+                      {(overlap.retention || []).filter(r => !overlapCity || r.city === overlapCity).map((r, idx) => (
+                        <div key={idx} className="p-4 border-b hover:bg-gray-50">
+                          <div className="flex items-center justify-between mb-3">
+                            <div>
+                              <span className="font-semibold">{r.event}</span>
+                              <span className="text-gray-400 ml-2">{r.city}</span>
+                              <span className="text-sm text-gray-500 ml-2">{r.prev_year} &rarr; {r.curr_year}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className={`text-lg font-bold ${r.retention_pct >= 40 ? 'text-green-600' : r.retention_pct >= 20 ? 'text-yellow-600' : 'text-red-600'}`}>
+                                {r.retention_pct}% retained
+                              </span>
+                              <span className={`text-sm font-medium ${r.growth_pct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                ({r.growth_pct >= 0 ? '+' : ''}{r.growth_pct}% growth)
+                              </span>
+                            </div>
                           </div>
-                          <div className="font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
+                          {/* Visual bar */}
+                          <div className="flex h-8 rounded-lg overflow-hidden mb-2">
+                            <div className="bg-green-500 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.curr_count > 0 ? (r.retained / r.curr_count * 100) : 0}%`}}>
+                              {r.retained > 0 ? `${r.retained} retained` : ''}
+                            </div>
+                            <div className="bg-blue-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.curr_count > 0 ? (r.new_attendees / r.curr_count * 100) : 0}%`}}>
+                              {r.new_attendees > 0 ? `${r.new_attendees} new` : ''}
+                            </div>
+                          </div>
+                          <div className="flex gap-6 text-xs text-gray-500">
+                            <span>{r.prev_count.toLocaleString()} in {r.prev_year}</span>
+                            <span>{r.curr_count.toLocaleString()} in {r.curr_year}</span>
+                            <span className="text-red-500">{r.churned.toLocaleString()} didn't return</span>
+                            <span className="text-blue-500">{r.new_attendees.toLocaleString()} first-timers</span>
+                          </div>
                         </div>
                       ))}
+                    </div>
+                  </Card>
+                )}
+
+                {/* Global Top Cross-Sell Opportunities */}
+                {overlap.top_cross_type?.length > 0 && overlapView !== 'retention' && (
+                  <Card className="p-0">
+                    <div className="p-4 border-b bg-purple-50">
+                      <h3 className="font-bold text-lg text-purple-900">Top Cross-Sell Targets (All Cities)</h3>
+                      <p className="text-sm text-purple-700">Your biggest untapped audiences across every market.</p>
+                    </div>
+                    <div className="max-h-[40vh] overflow-auto">
+                      {overlap.top_cross_type.slice(0, 20).map((pair, idx) => {
+                        const biggerGap = Math.max(pair.only_a_count || 0, pair.only_b_count || 0);
+                        const gapLabel = (pair.only_a_count || 0) >= (pair.only_b_count || 0)
+                          ? `${pair.only_a_count?.toLocaleString()} went to ${pair.event_a} but NOT ${pair.event_b}`
+                          : `${pair.only_b_count?.toLocaleString()} went to ${pair.event_b} but NOT ${pair.event_a}`;
+                        return (
+                          <div key={idx} className="p-3 border-b flex items-center gap-3 hover:bg-purple-50">
+                            <div className="text-lg font-bold text-gray-300 w-7">#{idx + 1}</div>
+                            <div className="flex-1">
+                              <div className="font-medium text-sm">{pair.event_a} &times; {pair.event_b}</div>
+                              <div className="text-xs text-gray-500">{pair.city} — {gapLabel}</div>
+                            </div>
+                            <div className="text-right">
+                              <div className="font-bold text-purple-700">{biggerGap.toLocaleString()}</div>
+                              <div className="text-xs text-gray-400">untapped</div>
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </Card>
                 )}
