@@ -319,6 +319,221 @@ const CustomerModal = ({ customer, orders, onClose }) => {
   );
 };
 
+// ==========================================
+// OVERLAP NETWORK VISUALIZATION
+// ==========================================
+const EVENT_COLORS = {
+  'beer': '#f59e0b', 'wine': '#7c3aed', 'coffee': '#92400e',
+  'cocktail': '#ec4899', 'whiskey': '#b45309', 'margarita': '#10b981',
+  'tasting': '#6366f1', 'tippler': '#0ea5e9', 'rumble': '#ef4444',
+  'distiller': '#8b5cf6', 'default': '#6b7280'
+};
+const getEventColor = (name) => {
+  const n = (name || '').toLowerCase();
+  for (const [key, color] of Object.entries(EVENT_COLORS)) {
+    if (n.includes(key)) return color;
+  }
+  return EVENT_COLORS.default;
+};
+
+const OverlapNetwork = ({ matrix, onCellClick, apiBase }) => {
+  const [hovered, setHovered] = React.useState(null);
+  const [selectedNode, setSelectedNode] = React.useState(null);
+
+  if (!matrix || !matrix.labels || matrix.labels.length < 2) return null;
+
+  const W = 700, H = 500;
+  const cx = W / 2, cy = H / 2;
+  const n = matrix.labels.length;
+  const maxCount = Math.max(...matrix.counts);
+  const maxOverlap = Math.max(...matrix.matrix.flat().filter((_, idx) => Math.floor(idx / n) !== idx % n), 1);
+
+  // Position nodes in a circle
+  const nodes = matrix.labels.map((label, i) => {
+    const angle = (2 * Math.PI * i) / n - Math.PI / 2;
+    const radius = Math.min(W, H) * 0.35;
+    const r = 18 + (matrix.counts[i] / maxCount) * 30;
+    return {
+      x: cx + Math.cos(angle) * radius,
+      y: cy + Math.sin(angle) * radius,
+      r, label, i,
+      count: matrix.counts[i],
+      type: matrix.types?.[i] || '',
+      color: getEventColor(label)
+    };
+  });
+
+  // Build edges
+  const edges = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const overlap = matrix.matrix[i][j];
+      if (overlap > 0) {
+        const pctI = matrix.counts[i] > 0 ? overlap / matrix.counts[i] : 0;
+        const pctJ = matrix.counts[j] > 0 ? overlap / matrix.counts[j] : 0;
+        const strength = overlap / maxOverlap;
+        edges.push({
+          from: i, to: j, overlap, strength,
+          pctI: Math.round(pctI * 100), pctJ: Math.round(pctJ * 100),
+          gapI: matrix.gap_matrix ? matrix.gap_matrix[i][j] : 0,
+          gapJ: matrix.gap_matrix ? matrix.gap_matrix[j][i] : 0,
+        });
+      }
+    }
+  }
+  edges.sort((a, b) => a.strength - b.strength);
+
+  const isConnected = (nodeIdx) => {
+    if (selectedNode === null) return true;
+    if (nodeIdx === selectedNode) return true;
+    return edges.some(e => (e.from === selectedNode && e.to === nodeIdx) || (e.to === selectedNode && e.from === nodeIdx));
+  };
+  const isEdgeActive = (e) => {
+    if (selectedNode === null) return true;
+    return e.from === selectedNode || e.to === selectedNode;
+  };
+
+  return (
+    <div className="relative">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '520px' }}>
+        <defs>
+          <filter id="glow"><feGaussianBlur stdDeviation="3" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+        </defs>
+        {/* Edges */}
+        {edges.map((e, idx) => {
+          const a = nodes[e.from], b = nodes[e.to];
+          const active = isEdgeActive(e);
+          const isHov = hovered && ((hovered.type === 'edge' && hovered.idx === idx) || (hovered.type === 'node' && (hovered.idx === e.from || hovered.idx === e.to)));
+          return (
+            <line key={`e${idx}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+              stroke={isHov ? '#7c3aed' : '#d8b4fe'}
+              strokeWidth={1 + e.strength * 8}
+              opacity={active ? (isHov ? 0.9 : 0.35 + e.strength * 0.4) : 0.06}
+              strokeLinecap="round"
+              onMouseEnter={() => setHovered({ type: 'edge', idx })}
+              onMouseLeave={() => setHovered(null)}
+              className="cursor-pointer"
+            />
+          );
+        })}
+        {/* Nodes */}
+        {nodes.map((node, i) => {
+          const active = isConnected(i);
+          const isHov = hovered?.type === 'node' && hovered.idx === i;
+          const isSel = selectedNode === i;
+          return (
+            <g key={`n${i}`}
+               onMouseEnter={() => setHovered({ type: 'node', idx: i })}
+               onMouseLeave={() => setHovered(null)}
+               onClick={() => setSelectedNode(selectedNode === i ? null : i)}
+               className="cursor-pointer">
+              <circle cx={node.x} cy={node.y} r={node.r + 3}
+                fill="none" stroke={isSel ? '#7c3aed' : 'transparent'} strokeWidth="3" />
+              <circle cx={node.x} cy={node.y} r={node.r}
+                fill={node.color} opacity={active ? (isHov ? 1 : 0.85) : 0.15}
+                filter={isHov ? 'url(#glow)' : undefined} />
+              <text x={node.x} y={node.y - node.r - 6} textAnchor="middle"
+                fill={active ? '#374151' : '#d1d5db'} fontSize="10" fontWeight="600">
+                {node.label.length > 22 ? node.label.slice(0, 22) + '...' : node.label}
+              </text>
+              <text x={node.x} y={node.y + 4} textAnchor="middle"
+                fill="#fff" fontSize="11" fontWeight="bold">
+                {node.count >= 1000 ? `${(node.count/1000).toFixed(1)}k` : node.count}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+
+      {/* Tooltip */}
+      {hovered?.type === 'edge' && (() => {
+        const e = edges[hovered.idx];
+        const a = nodes[e.from], b = nodes[e.to];
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        return (
+          <div className="absolute bg-white shadow-lg border rounded-lg p-3 text-sm pointer-events-none z-20" style={{ left: `${mx / W * 100}%`, top: `${my / H * 100}%`, transform: 'translate(-50%, -110%)' }}>
+            <div className="font-bold mb-1">{a.label} & {b.label}</div>
+            <div className="text-purple-700 font-semibold">{e.overlap.toLocaleString()} shared attendees</div>
+            <div className="text-xs text-gray-500">{e.pctI}% of {a.label} | {e.pctJ}% of {b.label}</div>
+            {e.gapI > 0 && <div className="text-xs text-orange-600 mt-1">{e.gapI.toLocaleString()} went to {a.label} only</div>}
+            {e.gapJ > 0 && <div className="text-xs text-orange-600">{e.gapJ.toLocaleString()} went to {b.label} only</div>}
+          </div>
+        );
+      })()}
+
+      {/* Selected node detail */}
+      {selectedNode !== null && (() => {
+        const node = nodes[selectedNode];
+        const connEdges = edges.filter(e => e.from === selectedNode || e.to === selectedNode).sort((a, b) => b.overlap - a.overlap);
+        return (
+          <div className="mt-2 bg-white border rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <span className="font-bold text-lg">{node.label}</span>
+                <span className="ml-2 text-gray-500">{node.count.toLocaleString()} attendees</span>
+              </div>
+              <button onClick={() => setSelectedNode(null)} className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+            </div>
+            <div className="space-y-2">
+              {connEdges.map((e, idx) => {
+                const otherIdx = e.from === selectedNode ? e.to : e.from;
+                const other = nodes[otherIdx];
+                const gapFromSelected = e.from === selectedNode ? e.gapI : e.gapJ;
+                const gapFromOther = e.from === selectedNode ? e.gapJ : e.gapI;
+                return (
+                  <div key={idx} className="flex items-center gap-3 p-2 rounded hover:bg-purple-50">
+                    <div className="w-3 h-3 rounded-full" style={{ backgroundColor: other.color }} />
+                    <div className="flex-1">
+                      <span className="font-medium text-sm">{other.label}</span>
+                      <span className="text-xs text-gray-400 ml-2">{e.overlap.toLocaleString()} shared</span>
+                    </div>
+                    {gapFromSelected > 0 && (
+                      <button onClick={() => onCellClick && onCellClick(selectedNode, otherIdx)}
+                        className="px-2 py-1 bg-purple-600 text-white text-xs rounded font-medium hover:bg-purple-700">
+                        {gapFromSelected.toLocaleString()} untapped
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+};
+
+const VennPair = ({ pair, apiBase }) => {
+  const total = (pair.only_a_count || 0) + (pair.overlap_count || 0) + (pair.only_b_count || 0);
+  if (total === 0) return null;
+  const pctA = ((pair.only_a_count + pair.overlap_count) / total) * 100;
+  const pctB = ((pair.only_b_count + pair.overlap_count) / total) * 100;
+  const pctOverlap = (pair.overlap_count / total) * 100;
+  const rA = 35 + pctA * 0.3, rB = 35 + pctB * 0.3;
+  const separation = Math.max(rA + rB - pctOverlap * 1.2, 20);
+  const W = 220, H = 120;
+  const cxA = W/2 - separation/2, cxB = W/2 + separation/2, cY = H/2 + 5;
+
+  return (
+    <div className="text-center">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: '220px', margin: '0 auto' }}>
+        <circle cx={cxA} cy={cY} r={rA} fill={getEventColor(pair.event_a)} opacity="0.3" stroke={getEventColor(pair.event_a)} strokeWidth="2" />
+        <circle cx={cxB} cy={cY} r={rB} fill={getEventColor(pair.event_b)} opacity="0.3" stroke={getEventColor(pair.event_b)} strokeWidth="2" />
+        <text x={cxA - rA * 0.3} y={cY} textAnchor="middle" fontSize="11" fontWeight="bold" fill="#374151">{pair.only_a_count >= 1000 ? `${(pair.only_a_count/1000).toFixed(1)}k` : pair.only_a_count}</text>
+        <text x={W/2} y={cY} textAnchor="middle" fontSize="10" fontWeight="bold" fill="#7c3aed">{pair.overlap_count >= 1000 ? `${(pair.overlap_count/1000).toFixed(1)}k` : pair.overlap_count}</text>
+        <text x={cxB + rB * 0.3} y={cY} textAnchor="middle" fontSize="11" fontWeight="bold" fill="#374151">{pair.only_b_count >= 1000 ? `${(pair.only_b_count/1000).toFixed(1)}k` : pair.only_b_count}</text>
+      </svg>
+      <div className="text-xs mt-1">
+        <span style={{ color: getEventColor(pair.event_a) }} className="font-semibold">{pair.event_a.length > 18 ? pair.event_a.slice(0,18)+'...' : pair.event_a}</span>
+        <span className="text-gray-400 mx-1">&</span>
+        <span style={{ color: getEventColor(pair.event_b) }} className="font-semibold">{pair.event_b.length > 18 ? pair.event_b.slice(0,18)+'...' : pair.event_b}</span>
+      </div>
+      <div className="text-xs text-gray-500">{pair.city}</div>
+    </div>
+  );
+};
+
 export default function CraftDashboard() {
   const [tab, setTab] = useState('events');
   const [dashboard, setDashboard] = useState(null);
@@ -996,58 +1211,28 @@ export default function CraftDashboard() {
             {overlap && !overlapLoading && (
               <div className="space-y-6">
 
-                {/* ===== TOP SECTION: Cross-Sell Opportunity Chart (always visible) ===== */}
-                {overlap.top_cross_type?.length > 0 && (() => {
-                  const chartData = overlap.top_cross_type.slice(0, 12).map(p => {
-                    const gapA = p.only_a_count || 0;
-                    const gapB = p.only_b_count || 0;
-                    const short = (s) => s.length > 22 ? s.slice(0, 22) + '...' : s;
-                    return {
-                      name: `${short(p.event_a)} × ${short(p.event_b)}`,
-                      city: p.city,
-                      gap_a: gapA,
-                      gap_b: gapB,
-                      overlap: p.overlap_count,
-                      label_a: `${short(p.event_a)} only`,
-                      label_b: `${short(p.event_b)} only`,
-                      pair: p
-                    };
-                  });
-                  return (
-                    <Card className="p-0">
-                      <div className="p-4 border-b">
-                        <h3 className="font-bold text-lg">Untapped Cross-Sell Audiences</h3>
-                        <p className="text-sm text-gray-500">People who went to one event but NOT the other. These are your ready-to-convert target lists.</p>
-                      </div>
-                      <div className="p-4">
-                        <ResponsiveContainer width="100%" height={Math.max(360, chartData.length * 52)}>
-                          <BarChart data={chartData} layout="vertical" margin={{ left: 10, right: 30, top: 5, bottom: 5 }}>
-                            <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                            <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
-                            <YAxis type="category" dataKey="name" width={280} tick={{ fontSize: 11 }} />
-                            <Tooltip
-                              formatter={(value, name) => [value.toLocaleString(), name === 'gap_a' ? 'Only Event A' : name === 'gap_b' ? 'Only Event B' : 'Both']}
-                              labelFormatter={(label) => { const item = chartData.find(d => d.name === label); return item ? `${label} (${item.city})` : label; }}
-                            />
-                            <Bar dataKey="gap_a" stackId="a" fill="#7c3aed" name="Only Event A" radius={[0, 0, 0, 0]} />
-                            <Bar dataKey="overlap" stackId="a" fill="#c4b5fd" name="Go to Both" radius={[0, 0, 0, 0]} />
-                            <Bar dataKey="gap_b" stackId="a" fill="#a855f7" name="Only Event B" radius={[0, 4, 4, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div className="px-4 pb-3 flex gap-4 text-xs">
-                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#7c3aed'}}></span> Only Event A (target for Event B)</span>
-                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#c4b5fd'}}></span> Already go to both</span>
-                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#a855f7'}}></span> Only Event B (target for Event A)</span>
-                      </div>
-                    </Card>
-                  );
-                })()}
+                {/* ===== TOP: Venn pairs for top cross-sell opportunities ===== */}
+                {overlap.top_cross_type?.length > 0 && (
+                  <Card className="p-0">
+                    <div className="p-4 border-b">
+                      <h3 className="font-bold text-lg">Top Cross-Sell Opportunities</h3>
+                      <p className="text-sm text-gray-500">Your biggest untapped audiences. The numbers outside the overlap = people who ONLY went to one event.</p>
+                    </div>
+                    <div className="p-4 grid grid-cols-4 gap-4">
+                      {overlap.top_cross_type.slice(0, 8).map((pair, idx) => (
+                        <div key={idx} className="cursor-pointer hover:bg-purple-50 rounded-lg p-2 transition-colors"
+                             onClick={() => { setOverlapCity(pair.city); setOverlapView('pairs'); }}>
+                          <VennPair pair={pair} apiBase={API_BASE} />
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
 
                 {/* ===== CITY SELECTOR + VIEW TOGGLE ===== */}
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2 flex-wrap">
-                    {(overlapView === 'retention' || overlapView === 'heatmap') && (
+                    {overlapView === 'retention' && (
                       <button onClick={() => setOverlapCity('')} className={`px-4 py-2 rounded-lg text-sm font-medium ${!overlapCity ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>All Cities</button>
                     )}
                     {overlap.cities?.map(c => (
@@ -1055,130 +1240,31 @@ export default function CraftDashboard() {
                     ))}
                   </div>
                   <div className="flex bg-gray-100 rounded-lg p-1">
-                    <button onClick={() => { setOverlapView('heatmap'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'heatmap' ? 'bg-white shadow' : 'text-gray-600'}`}>Heatmap</button>
+                    <button onClick={() => { setOverlapView('network'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'network' ? 'bg-white shadow' : 'text-gray-600'}`}>Network</button>
                     <button onClick={() => { setOverlapView('pairs'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Action List</button>
                     <button onClick={() => { setOverlapView('retention'); setOverlapCity(''); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'retention' ? 'bg-white shadow' : 'text-gray-600'}`}>Retention ({overlap.retention?.length || 0})</button>
                   </div>
                 </div>
 
-                {/* ===== HEATMAP VIEW — visual bubble chart + downloadable matrix ===== */}
-                {overlapView === 'heatmap' && overlap.matrices?.[overlapCity] && (() => {
-                  const m = overlap.matrices[overlapCity];
+                {/* ===== NETWORK VIEW — interactive constellation ===== */}
+                {overlapView === 'network' && overlap.matrices?.[overlapCity] && (
+                  <Card className="p-0">
+                    <div className="p-4 border-b">
+                      <h3 className="font-bold text-lg">{overlapCity} — Audience Network</h3>
+                      <p className="text-sm text-gray-500">Circle size = attendance. Line thickness = shared attendees. Click any event to see connections and download gap audiences. Color = event type.</p>
+                    </div>
+                    <div className="p-2">
+                      <OverlapNetwork
+                        matrix={overlap.matrices[overlapCity]}
+                        apiBase={API_BASE}
+                        onCellClick={(i, j) => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}
+                      />
+                    </div>
+                  </Card>
+                )}
 
-                  // Build scatter data for bubble chart: each bubble = an event pair
-                  const bubbleData = [];
-                  for (let i = 0; i < m.labels.length; i++) {
-                    for (let j = i + 1; j < m.labels.length; j++) {
-                      const overlapVal = m.matrix[i][j];
-                      if (overlapVal > 0) {
-                        const pctI = m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0;
-                        const pctJ = m.counts[j] > 0 ? Math.round(overlapVal / m.counts[j] * 100) : 0;
-                        bubbleData.push({
-                          x: i, y: j,
-                          z: overlapVal,
-                          name_a: m.labels[i],
-                          name_b: m.labels[j],
-                          overlap: overlapVal,
-                          pct_a: pctI,
-                          pct_b: pctJ,
-                          gap: m.gap_matrix ? m.gap_matrix[i][j] + m.gap_matrix[j][i] : 0
-                        });
-                      }
-                    }
-                  }
-
-                  // Per-event overlap bar chart: for each event, show how much of its audience overlaps with each other event
-                  const eventOverlapBars = m.labels.map((label, i) => {
-                    const entry = { name: label.length > 25 ? label.slice(0, 25) + '...' : label, total: m.counts[i] };
-                    let usedOverlap = 0;
-                    m.labels.forEach((_, j) => {
-                      if (i !== j) {
-                        entry[`overlap_${j}`] = m.matrix[i][j];
-                        usedOverlap += m.matrix[i][j];
-                      }
-                    });
-                    entry.unique = Math.max(0, m.counts[i] - Math.max(...m.matrix[i].filter((_, j) => j !== i)));
-                    return entry;
-                  });
-
-                  const maxGap = Math.max(...(m.gap_matrix || m.matrix).flat().filter(v => v > 0), 1);
-                  const COLORS = ['#7c3aed', '#a855f7', '#c084fc', '#d8b4fe', '#8b5cf6', '#6d28d9', '#4c1d95', '#9333ea', '#7e22ce'];
-
-                  return (
-                    <>
-                      {/* Overlap % per event — stacked bars */}
-                      <Card className="p-0">
-                        <div className="p-4 border-b">
-                          <h3 className="font-bold text-lg">{overlapCity} — Audience Overlap by Event</h3>
-                          <p className="text-sm text-gray-500">For each event, what % of its audience also went to other events? Higher overlap = bigger cross-sell pool.</p>
-                        </div>
-                        <div className="p-4">
-                          <ResponsiveContainer width="100%" height={Math.max(250, m.labels.length * 50)}>
-                            <BarChart data={eventOverlapBars} layout="vertical" margin={{ left: 10, right: 30 }}>
-                              <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                              <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
-                              <YAxis type="category" dataKey="name" width={200} tick={{ fontSize: 11 }} />
-                              <Tooltip formatter={(v) => v.toLocaleString()} />
-                              {m.labels.map((label, j) => (
-                                <Bar key={j} dataKey={`overlap_${j}`} stackId="stack" fill={COLORS[j % COLORS.length]}
-                                     name={label.length > 20 ? label.slice(0, 20) + '...' : label} />
-                              ))}
-                            </BarChart>
-                          </ResponsiveContainer>
-                        </div>
-                      </Card>
-
-                      {/* Downloadable gap matrix */}
-                      <Card className="p-0 overflow-auto">
-                        <div className="p-4 border-b">
-                          <h3 className="font-bold text-lg">{overlapCity} — Download Gap Audiences</h3>
-                          <p className="text-sm text-gray-500">Each cell = people who went to ROW but NOT COLUMN. <strong>Click any cell to download the CSV.</strong></p>
-                        </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm">
-                            <thead>
-                              <tr>
-                                <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[200px]"><span className="text-xs text-gray-400">Went to ROW... not COLUMN</span></th>
-                                {m.labels.map((label, i) => (
-                                  <th key={i} className="p-2 text-center bg-gray-50 min-w-[100px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '140px'}}>
-                                    <span className="text-xs font-medium">{label.length > 25 ? label.slice(0, 25) + '...' : label}</span>
-                                  </th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {m.labels.map((rowLabel, i) => (
-                                <tr key={i} className="border-t">
-                                  <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">{rowLabel}<span className="block text-gray-400">{m.counts[i].toLocaleString()}</span></td>
-                                  {m.matrix[i].map((overlapVal, j) => {
-                                    const isDiag = i === j;
-                                    const gapVal = isDiag ? m.counts[i] : (m.gap_matrix ? m.gap_matrix[i][j] : m.counts[i] - overlapVal);
-                                    const intensity = isDiag ? 0 : Math.min(gapVal / maxGap, 1);
-                                    const bg = isDiag ? '#f3f4f6' : gapVal === 0 ? '#f0fdf4' : `rgba(124, 58, 237, ${0.06 + intensity * 0.5})`;
-                                    const tc = isDiag ? '#374151' : intensity > 0.5 ? '#fff' : '#374151';
-                                    return (
-                                      <td key={j} className="p-2 text-center border-l cursor-pointer hover:ring-2 hover:ring-purple-400"
-                                          style={{backgroundColor: bg, color: tc}}
-                                          title={isDiag ? `${m.counts[i]} total attendees` : `${gapVal.toLocaleString()} went to ${rowLabel} but NOT ${m.labels[j]}`}
-                                          onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}>
-                                        <div className="font-bold text-sm">{gapVal > 0 ? gapVal.toLocaleString() : '-'}</div>
-                                        {!isDiag && gapVal > 0 && <div className="text-xs opacity-70">{m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0}% overlap</div>}
-                                      </td>
-                                    );
-                                  })}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                        <div className="p-3 bg-purple-50 border-t text-xs text-purple-700 text-center font-medium">Click any purple cell to download that gap audience as a CSV</div>
-                      </Card>
-                    </>
-                  );
-                })()}
-
-                {overlapView === 'heatmap' && !overlap.matrices?.[overlapCity] && (
-                  <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} to build charts (need at least 2 unique events).</Card>
+                {overlapView === 'network' && !overlap.matrices?.[overlapCity] && (
+                  <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} for a network (need at least 2).</Card>
                 )}
 
                 {/* ===== ACTION LIST — ranked pairs with download buttons ===== */}
