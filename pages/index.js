@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Treemap, ScatterChart, Scatter, ZAxis, Legend } from 'recharts';
 
 const API_BASE = 'https://craft-dominant-production.up.railway.app';
 
@@ -995,30 +995,59 @@ export default function CraftDashboard() {
             {overlapLoading && <div className="text-center py-12 text-gray-500">Analyzing attendee overlap across all events...</div>}
             {overlap && !overlapLoading && (
               <div className="space-y-6">
-                {/* Summary Banner */}
-                <div className="grid grid-cols-5 gap-4">
-                  <Card className="p-4"><Stat label="Events" value={overlap.summary?.total_events || 0} /></Card>
-                  <Card className="p-4"><Stat label="Overlap Pairs" value={overlap.summary?.total_pairs || 0} /></Card>
-                  <Card className="p-4"><Stat label="Cross-Sell Pairs" value={overlap.summary?.cross_type_pairs || 0} /></Card>
-                  <Card className="p-4"><Stat label="Cross-Sell Opps" value={(overlap.summary?.total_cross_sell_opportunities || 0).toLocaleString()} /></Card>
-                  <Card className="p-4"><Stat label="Cities" value={overlap.summary?.cities_analyzed || 0} /></Card>
-                </div>
 
-                {/* Top Actionable Insight */}
-                {overlap.summary?.highest_cross_type && (
-                  <Card className="p-5 border-l-4 border-green-500 bg-green-50">
-                    <div className="text-sm font-bold text-green-800 mb-1">BIGGEST UNTAPPED AUDIENCE</div>
-                    <div className="text-lg font-bold text-gray-900 mb-1">
-                      {overlap.summary.highest_cross_type.only_a_count?.toLocaleString()} people went to {overlap.summary.highest_cross_type.event_a} but NEVER {overlap.summary.highest_cross_type.event_b}
-                    </div>
-                    <div className="text-sm text-green-700">{overlap.summary.highest_cross_type.city} — {overlap.summary.highest_cross_type.overlap_count.toLocaleString()} already go to both. The gap is your target list.</div>
-                  </Card>
-                )}
+                {/* ===== TOP SECTION: Cross-Sell Opportunity Chart (always visible) ===== */}
+                {overlap.top_cross_type?.length > 0 && (() => {
+                  const chartData = overlap.top_cross_type.slice(0, 12).map(p => {
+                    const gapA = p.only_a_count || 0;
+                    const gapB = p.only_b_count || 0;
+                    const short = (s) => s.length > 22 ? s.slice(0, 22) + '...' : s;
+                    return {
+                      name: `${short(p.event_a)} × ${short(p.event_b)}`,
+                      city: p.city,
+                      gap_a: gapA,
+                      gap_b: gapB,
+                      overlap: p.overlap_count,
+                      label_a: `${short(p.event_a)} only`,
+                      label_b: `${short(p.event_b)} only`,
+                      pair: p
+                    };
+                  });
+                  return (
+                    <Card className="p-0">
+                      <div className="p-4 border-b">
+                        <h3 className="font-bold text-lg">Untapped Cross-Sell Audiences</h3>
+                        <p className="text-sm text-gray-500">People who went to one event but NOT the other. These are your ready-to-convert target lists.</p>
+                      </div>
+                      <div className="p-4">
+                        <ResponsiveContainer width="100%" height={Math.max(360, chartData.length * 52)}>
+                          <BarChart data={chartData} layout="vertical" margin={{ left: 10, right: 30, top: 5, bottom: 5 }}>
+                            <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                            <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                            <YAxis type="category" dataKey="name" width={280} tick={{ fontSize: 11 }} />
+                            <Tooltip
+                              formatter={(value, name) => [value.toLocaleString(), name === 'gap_a' ? 'Only Event A' : name === 'gap_b' ? 'Only Event B' : 'Both']}
+                              labelFormatter={(label) => { const item = chartData.find(d => d.name === label); return item ? `${label} (${item.city})` : label; }}
+                            />
+                            <Bar dataKey="gap_a" stackId="a" fill="#7c3aed" name="Only Event A" radius={[0, 0, 0, 0]} />
+                            <Bar dataKey="overlap" stackId="a" fill="#c4b5fd" name="Go to Both" radius={[0, 0, 0, 0]} />
+                            <Bar dataKey="gap_b" stackId="a" fill="#a855f7" name="Only Event B" radius={[0, 4, 4, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div className="px-4 pb-3 flex gap-4 text-xs">
+                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#7c3aed'}}></span> Only Event A (target for Event B)</span>
+                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#c4b5fd'}}></span> Already go to both</span>
+                        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{backgroundColor:'#a855f7'}}></span> Only Event B (target for Event A)</span>
+                      </div>
+                    </Card>
+                  );
+                })()}
 
-                {/* City selector + view toggle */}
+                {/* ===== CITY SELECTOR + VIEW TOGGLE ===== */}
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2 flex-wrap">
-                    {overlapView === 'retention' && (
+                    {(overlapView === 'retention' || overlapView === 'heatmap') && (
                       <button onClick={() => setOverlapCity('')} className={`px-4 py-2 rounded-lg text-sm font-medium ${!overlapCity ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>All Cities</button>
                     )}
                     {overlap.cities?.map(c => (
@@ -1026,211 +1055,212 @@ export default function CraftDashboard() {
                     ))}
                   </div>
                   <div className="flex bg-gray-100 rounded-lg p-1">
-                    <button onClick={() => { setOverlapView('matrix'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Gap Matrix</button>
+                    <button onClick={() => { setOverlapView('heatmap'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'heatmap' ? 'bg-white shadow' : 'text-gray-600'}`}>Heatmap</button>
                     <button onClick={() => { setOverlapView('pairs'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Action List</button>
                     <button onClick={() => { setOverlapView('retention'); setOverlapCity(''); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'retention' ? 'bg-white shadow' : 'text-gray-600'}`}>Retention ({overlap.retention?.length || 0})</button>
                   </div>
                 </div>
 
-                {/* GAP MATRIX — the money view */}
-                {overlapView === 'matrix' && overlap.matrices?.[overlapCity] && (() => {
+                {/* ===== HEATMAP VIEW — visual bubble chart + downloadable matrix ===== */}
+                {overlapView === 'heatmap' && overlap.matrices?.[overlapCity] && (() => {
                   const m = overlap.matrices[overlapCity];
-                  const maxGap = Math.max(...(m.gap_matrix || m.matrix).flat().filter(v => v > 0), 1);
-                  const maxOverlap = Math.max(...m.matrix.flat().filter((_, idx) => Math.floor(idx / m.labels.length) !== idx % m.labels.length), 1);
-                  return (
-                    <Card className="p-0 overflow-auto">
-                      <div className="p-4 border-b">
-                        <h3 className="font-bold text-lg">{overlapCity} — Gap Matrix</h3>
-                        <p className="text-sm text-gray-500">Each cell = people who went to the ROW event but NOT the COLUMN event. <strong>These are your target lists.</strong> Click any cell to download the CSV.</p>
-                      </div>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-sm">
-                          <thead>
-                            <tr>
-                              <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[200px]"><span className="text-xs text-gray-400">ROW went to... but NOT COLUMN</span></th>
-                              {m.labels.map((label, i) => (
-                                <th key={i} className="p-2 text-center bg-gray-50 min-w-[110px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '160px'}}>
-                                  <span className="text-xs font-medium">{label.length > 28 ? label.slice(0, 28) + '...' : label}</span>
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {m.labels.map((rowLabel, i) => (
-                              <tr key={i} className="border-t">
-                                <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">
-                                  {rowLabel}
-                                  <span className="block text-gray-400">{m.counts[i].toLocaleString()} total</span>
-                                </td>
-                                {m.matrix[i].map((overlapVal, j) => {
-                                  const isDiag = i === j;
-                                  const gapVal = m.gap_matrix ? m.gap_matrix[i][j] : (m.counts[i] - overlapVal);
-                                  const gapIntensity = isDiag ? 0 : Math.min(gapVal / maxGap, 1);
-                                  const overlapPct = isDiag ? 100 : m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0;
 
-                                  if (isDiag) {
+                  // Build scatter data for bubble chart: each bubble = an event pair
+                  const bubbleData = [];
+                  for (let i = 0; i < m.labels.length; i++) {
+                    for (let j = i + 1; j < m.labels.length; j++) {
+                      const overlapVal = m.matrix[i][j];
+                      if (overlapVal > 0) {
+                        const pctI = m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0;
+                        const pctJ = m.counts[j] > 0 ? Math.round(overlapVal / m.counts[j] * 100) : 0;
+                        bubbleData.push({
+                          x: i, y: j,
+                          z: overlapVal,
+                          name_a: m.labels[i],
+                          name_b: m.labels[j],
+                          overlap: overlapVal,
+                          pct_a: pctI,
+                          pct_b: pctJ,
+                          gap: m.gap_matrix ? m.gap_matrix[i][j] + m.gap_matrix[j][i] : 0
+                        });
+                      }
+                    }
+                  }
+
+                  // Per-event overlap bar chart: for each event, show how much of its audience overlaps with each other event
+                  const eventOverlapBars = m.labels.map((label, i) => {
+                    const entry = { name: label.length > 25 ? label.slice(0, 25) + '...' : label, total: m.counts[i] };
+                    let usedOverlap = 0;
+                    m.labels.forEach((_, j) => {
+                      if (i !== j) {
+                        entry[`overlap_${j}`] = m.matrix[i][j];
+                        usedOverlap += m.matrix[i][j];
+                      }
+                    });
+                    entry.unique = Math.max(0, m.counts[i] - Math.max(...m.matrix[i].filter((_, j) => j !== i)));
+                    return entry;
+                  });
+
+                  const maxGap = Math.max(...(m.gap_matrix || m.matrix).flat().filter(v => v > 0), 1);
+                  const COLORS = ['#7c3aed', '#a855f7', '#c084fc', '#d8b4fe', '#8b5cf6', '#6d28d9', '#4c1d95', '#9333ea', '#7e22ce'];
+
+                  return (
+                    <>
+                      {/* Overlap % per event — stacked bars */}
+                      <Card className="p-0">
+                        <div className="p-4 border-b">
+                          <h3 className="font-bold text-lg">{overlapCity} — Audience Overlap by Event</h3>
+                          <p className="text-sm text-gray-500">For each event, what % of its audience also went to other events? Higher overlap = bigger cross-sell pool.</p>
+                        </div>
+                        <div className="p-4">
+                          <ResponsiveContainer width="100%" height={Math.max(250, m.labels.length * 50)}>
+                            <BarChart data={eventOverlapBars} layout="vertical" margin={{ left: 10, right: 30 }}>
+                              <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                              <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                              <YAxis type="category" dataKey="name" width={200} tick={{ fontSize: 11 }} />
+                              <Tooltip formatter={(v) => v.toLocaleString()} />
+                              {m.labels.map((label, j) => (
+                                <Bar key={j} dataKey={`overlap_${j}`} stackId="stack" fill={COLORS[j % COLORS.length]}
+                                     name={label.length > 20 ? label.slice(0, 20) + '...' : label} />
+                              ))}
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </Card>
+
+                      {/* Downloadable gap matrix */}
+                      <Card className="p-0 overflow-auto">
+                        <div className="p-4 border-b">
+                          <h3 className="font-bold text-lg">{overlapCity} — Download Gap Audiences</h3>
+                          <p className="text-sm text-gray-500">Each cell = people who went to ROW but NOT COLUMN. <strong>Click any cell to download the CSV.</strong></p>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr>
+                                <th className="p-2 text-left bg-gray-50 sticky left-0 z-10 min-w-[200px]"><span className="text-xs text-gray-400">Went to ROW... not COLUMN</span></th>
+                                {m.labels.map((label, i) => (
+                                  <th key={i} className="p-2 text-center bg-gray-50 min-w-[100px]" style={{writingMode: 'vertical-lr', transform: 'rotate(180deg)', height: '140px'}}>
+                                    <span className="text-xs font-medium">{label.length > 25 ? label.slice(0, 25) + '...' : label}</span>
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {m.labels.map((rowLabel, i) => (
+                                <tr key={i} className="border-t">
+                                  <td className="p-2 font-medium bg-gray-50 sticky left-0 z-10 text-xs">{rowLabel}<span className="block text-gray-400">{m.counts[i].toLocaleString()}</span></td>
+                                  {m.matrix[i].map((overlapVal, j) => {
+                                    const isDiag = i === j;
+                                    const gapVal = isDiag ? m.counts[i] : (m.gap_matrix ? m.gap_matrix[i][j] : m.counts[i] - overlapVal);
+                                    const intensity = isDiag ? 0 : Math.min(gapVal / maxGap, 1);
+                                    const bg = isDiag ? '#f3f4f6' : gapVal === 0 ? '#f0fdf4' : `rgba(124, 58, 237, ${0.06 + intensity * 0.5})`;
+                                    const tc = isDiag ? '#374151' : intensity > 0.5 ? '#fff' : '#374151';
                                     return (
-                                      <td key={j} className="p-2 text-center border-l bg-gray-100 cursor-pointer hover:bg-gray-200"
+                                      <td key={j} className="p-2 text-center border-l cursor-pointer hover:ring-2 hover:ring-purple-400"
+                                          style={{backgroundColor: bg, color: tc}}
+                                          title={isDiag ? `${m.counts[i]} total attendees` : `${gapVal.toLocaleString()} went to ${rowLabel} but NOT ${m.labels[j]}`}
                                           onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}>
-                                        <div className="font-bold text-sm text-gray-600">{m.counts[i].toLocaleString()}</div>
-                                        <div className="text-xs text-gray-400">all</div>
+                                        <div className="font-bold text-sm">{gapVal > 0 ? gapVal.toLocaleString() : '-'}</div>
+                                        {!isDiag && gapVal > 0 && <div className="text-xs opacity-70">{m.counts[i] > 0 ? Math.round(overlapVal / m.counts[i] * 100) : 0}% overlap</div>}
                                       </td>
                                     );
-                                  }
-
-                                  const bg = gapVal === 0 ? '#f0fdf4' : `rgba(124, 58, 237, ${0.06 + gapIntensity * 0.5})`;
-                                  const textColor = gapIntensity > 0.5 ? '#fff' : '#374151';
-
-                                  return (
-                                    <td key={j} className="p-2 text-center border-l cursor-pointer hover:ring-2 hover:ring-purple-400 hover:z-10 relative"
-                                        style={{backgroundColor: bg, color: textColor}}
-                                        title={`${gapVal.toLocaleString()} people went to ${rowLabel} but NOT ${m.labels[j]}. Click to download CSV.`}
-                                        onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}>
-                                      <div className="font-bold text-sm">{gapVal > 0 ? gapVal.toLocaleString() : '-'}</div>
-                                      {gapVal > 0 && <div className="text-xs opacity-75">{overlapPct}% overlap</div>}
-                                    </td>
-                                  );
-                                })}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                      <div className="p-3 bg-purple-50 border-t text-xs text-purple-700 text-center">Click any cell to download that audience as a CSV. Darker purple = bigger untapped audience.</div>
-                    </Card>
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="p-3 bg-purple-50 border-t text-xs text-purple-700 text-center font-medium">Click any purple cell to download that gap audience as a CSV</div>
+                      </Card>
+                    </>
                   );
                 })()}
 
-                {overlapView === 'matrix' && !overlap.matrices?.[overlapCity] && (
-                  <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} to build a matrix (need at least 2 unique events).</Card>
+                {overlapView === 'heatmap' && !overlap.matrices?.[overlapCity] && (
+                  <Card className="p-8 text-center text-gray-500">Not enough events in {overlapCity} to build charts (need at least 2 unique events).</Card>
                 )}
 
-                {/* ACTION LIST — ranked pairs with download buttons */}
-                {overlapView === 'pairs' && (
-                  <Card className="p-0">
-                    <div className="p-4 border-b">
-                      <h3 className="font-bold text-lg">{overlapCity} — Cross-Sell Action List</h3>
-                      <p className="text-sm text-gray-500">Every event pair ranked by gap size. Download the audience that went to one but not the other.</p>
-                    </div>
-                    <div className="max-h-[65vh] overflow-auto">
-                      {(overlap.pairs_by_city?.[overlapCity] || []).length === 0 && (
-                        <div className="p-8 text-center text-gray-500">No overlap pairs found for {overlapCity}.</div>
-                      )}
-                      {(overlap.pairs_by_city?.[overlapCity] || []).map((pair, idx) => (
-                        <div key={idx} className={`p-4 border-b ${!pair.same_event ? 'hover:bg-purple-50' : 'hover:bg-blue-50'}`}>
-                          <div className="flex items-start gap-4">
-                            <div className="text-xl font-bold text-gray-300 w-7 pt-1">#{idx + 1}</div>
-                            <div className="flex-1">
-                              <div className="flex items-center gap-2 mb-2">
-                                <span className="font-semibold">{pair.event_a}</span>
-                                <span className="text-gray-400">&times;</span>
-                                <span className="font-semibold">{pair.event_b}</span>
-                                {!pair.same_event && <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full font-medium">Cross-Sell</span>}
-                                {pair.same_event && <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full font-medium">Retention</span>}
-                              </div>
-                              {/* Action recommendation */}
-                              <div className="text-sm text-gray-700 mb-3 bg-yellow-50 border border-yellow-200 rounded p-2">
-                                {pair.action}
-                              </div>
-                              {/* Stats row */}
-                              <div className="flex gap-6 text-sm mb-3">
-                                <div className="text-center">
-                                  <div className="font-bold text-purple-700">{pair.overlap_count.toLocaleString()}</div>
-                                  <div className="text-xs text-gray-400">shared</div>
-                                </div>
-                                <div className="text-center">
-                                  <div className="font-bold text-orange-600">{pair.only_a_count.toLocaleString()}</div>
-                                  <div className="text-xs text-gray-400">only {pair.event_a.length > 20 ? pair.event_a.slice(0, 20) + '...' : pair.event_a}</div>
-                                </div>
-                                <div className="text-center">
-                                  <div className="font-bold text-orange-600">{pair.only_b_count.toLocaleString()}</div>
-                                  <div className="text-xs text-gray-400">only {pair.event_b.length > 20 ? pair.event_b.slice(0, 20) + '...' : pair.event_b}</div>
-                                </div>
-                              </div>
-                              {/* Download buttons */}
-                              <div className="flex gap-2 flex-wrap">
-                                {pair.only_a_count > 0 && (
-                                  <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_a`, '_blank')}
-                                    className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
-                                    Download {pair.only_a_count.toLocaleString()} — went to {pair.event_a.length > 18 ? pair.event_a.slice(0, 18) + '...' : pair.event_a}, NOT {pair.event_b.length > 18 ? pair.event_b.slice(0, 18) + '...' : pair.event_b}
-                                  </button>
-                                )}
-                                {pair.only_b_count > 0 && (
-                                  <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_b`, '_blank')}
-                                    className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
-                                    Download {pair.only_b_count.toLocaleString()} — went to {pair.event_b.length > 18 ? pair.event_b.slice(0, 18) + '...' : pair.event_b}, NOT {pair.event_a.length > 18 ? pair.event_a.slice(0, 18) + '...' : pair.event_a}
-                                  </button>
-                                )}
-                                <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=overlap`, '_blank')}
-                                  className="px-3 py-1.5 bg-gray-200 text-gray-700 text-xs rounded-lg font-medium hover:bg-gray-300">
-                                  Download {pair.overlap_count.toLocaleString()} shared
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </Card>
-                )}
-
-                {/* RETENTION VIEW — year-over-year for same events */}
-                {overlapView === 'retention' && (() => {
-                  const filteredRetention = (overlap.retention || []).filter(r => !overlapCity || r.city === overlapCity);
-                  const totalChurned = filteredRetention.reduce((sum, r) => sum + r.churned, 0);
-                  const avgRetention = filteredRetention.length > 0 ? Math.round(filteredRetention.reduce((sum, r) => sum + r.retention_pct, 0) / filteredRetention.length) : 0;
+                {/* ===== ACTION LIST — ranked pairs with download buttons ===== */}
+                {overlapView === 'pairs' && (() => {
+                  const pairs = overlap.pairs_by_city?.[overlapCity] || [];
+                  const crossSellPairs = pairs.filter(p => !p.same_event);
+                  // Build chart data for this city's cross-sell gaps
+                  const cityGapChart = crossSellPairs.slice(0, 8).map(p => ({
+                    name: `${(p.event_a.length > 15 ? p.event_a.slice(0,15)+'...' : p.event_a)} × ${(p.event_b.length > 15 ? p.event_b.slice(0,15)+'...' : p.event_b)}`,
+                    'Event A only': p.only_a_count,
+                    'Shared': p.overlap_count,
+                    'Event B only': p.only_b_count,
+                    pair: p
+                  }));
                   return (
                     <>
-                      {/* Retention summary */}
-                      <div className="grid grid-cols-3 gap-4">
-                        <Card className="p-4"><Stat label="Retention Pairs" value={filteredRetention.length} /></Card>
-                        <Card className="p-4"><Stat label="Avg Retention" value={`${avgRetention}%`} /></Card>
-                        <Card className="p-4 border-l-4 border-red-400"><Stat label="Total Churned" value={totalChurned.toLocaleString()} /></Card>
-                      </div>
+                      {cityGapChart.length > 0 && (
+                        <Card className="p-0">
+                          <div className="p-4 border-b">
+                            <h3 className="font-bold text-lg">{overlapCity} — Cross-Sell Gaps</h3>
+                            <p className="text-sm text-gray-500">Purple = people who ONLY went to one event. These are your target audiences.</p>
+                          </div>
+                          <div className="p-4">
+                            <ResponsiveContainer width="100%" height={Math.max(200, cityGapChart.length * 48)}>
+                              <BarChart data={cityGapChart} layout="vertical" margin={{ left: 10, right: 30 }}>
+                                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                                <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                                <YAxis type="category" dataKey="name" width={250} tick={{ fontSize: 11 }} />
+                                <Tooltip formatter={(v) => v.toLocaleString()} />
+                                <Bar dataKey="Event A only" stackId="a" fill="#7c3aed" />
+                                <Bar dataKey="Shared" stackId="a" fill="#e9d5ff" />
+                                <Bar dataKey="Event B only" stackId="a" fill="#a855f7" />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </Card>
+                      )}
                       <Card className="p-0">
                         <div className="p-4 border-b">
-                          <h3 className="font-bold text-lg">Year-Over-Year Retention — {overlapCity || 'All Cities'}</h3>
-                          <p className="text-sm text-gray-500">Sorted by churned count (biggest re-engagement opportunities first). Who left and didn't come back?</p>
+                          <h3 className="font-bold text-lg">{overlapCity} — Download Audiences</h3>
+                          <p className="text-sm text-gray-500">{pairs.length} pairs. Download the gap audience for any pair.</p>
                         </div>
-                        <div className="max-h-[65vh] overflow-auto">
-                          {filteredRetention.length === 0 && (
-                            <div className="p-8 text-center text-gray-500">Need at least 2 years of data for the same event to show retention.</div>
-                          )}
-                          {filteredRetention.map((r, idx) => (
-                            <div key={idx} className="p-4 border-b hover:bg-gray-50">
-                              <div className="flex items-center justify-between mb-3">
-                                <div>
-                                  <span className="font-semibold">{r.event}</span>
-                                  <span className="text-gray-400 ml-2">{r.city}</span>
-                                  <span className="text-sm text-gray-500 ml-2">{r.prev_year} &rarr; {r.curr_year}</span>
+                        <div className="max-h-[55vh] overflow-auto">
+                          {pairs.length === 0 && <div className="p-8 text-center text-gray-500">No overlap pairs for {overlapCity}.</div>}
+                          {pairs.map((pair, idx) => (
+                            <div key={idx} className={`p-4 border-b ${!pair.same_event ? 'hover:bg-purple-50' : 'hover:bg-blue-50'}`}>
+                              <div className="flex items-start gap-3">
+                                <div className="text-lg font-bold text-gray-300 w-7 pt-1">#{idx + 1}</div>
+                                <div className="flex-1">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <span className="font-semibold text-sm">{pair.event_a}</span>
+                                    <span className="text-gray-400">&times;</span>
+                                    <span className="font-semibold text-sm">{pair.event_b}</span>
+                                    {!pair.same_event && <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full">Cross-Sell</span>}
+                                    {pair.same_event && <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">Retention</span>}
+                                  </div>
+                                  <div className="text-sm mb-2 bg-yellow-50 border border-yellow-200 rounded p-2">{pair.action}</div>
+                                  {/* Inline visual: stacked bar showing the split */}
+                                  <div className="flex h-6 rounded overflow-hidden mb-2">
+                                    {pair.only_a_count > 0 && <div className="bg-purple-600 flex items-center justify-center text-white text-xs font-medium" style={{width: `${pair.only_a_count / (pair.only_a_count + pair.overlap_count + pair.only_b_count) * 100}%`, minWidth: '30px'}}>{pair.only_a_count.toLocaleString()}</div>}
+                                    {pair.overlap_count > 0 && <div className="bg-purple-200 flex items-center justify-center text-purple-800 text-xs font-medium" style={{width: `${pair.overlap_count / (pair.only_a_count + pair.overlap_count + pair.only_b_count) * 100}%`, minWidth: '30px'}}>{pair.overlap_count.toLocaleString()}</div>}
+                                    {pair.only_b_count > 0 && <div className="bg-purple-500 flex items-center justify-center text-white text-xs font-medium" style={{width: `${pair.only_b_count / (pair.only_a_count + pair.overlap_count + pair.only_b_count) * 100}%`, minWidth: '30px'}}>{pair.only_b_count.toLocaleString()}</div>}
+                                  </div>
+                                  <div className="flex gap-2 flex-wrap">
+                                    {pair.only_a_count > 0 && (
+                                      <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_a`, '_blank')}
+                                        className="px-3 py-1 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
+                                        {pair.only_a_count.toLocaleString()} — {pair.event_a.length > 20 ? pair.event_a.slice(0,20)+'...' : pair.event_a} only
+                                      </button>
+                                    )}
+                                    {pair.only_b_count > 0 && (
+                                      <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_b`, '_blank')}
+                                        className="px-3 py-1 bg-purple-500 text-white text-xs rounded-lg font-medium hover:bg-purple-600">
+                                        {pair.only_b_count.toLocaleString()} — {pair.event_b.length > 20 ? pair.event_b.slice(0,20)+'...' : pair.event_b} only
+                                      </button>
+                                    )}
+                                    <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=overlap`, '_blank')}
+                                      className="px-3 py-1 bg-gray-200 text-gray-700 text-xs rounded-lg font-medium hover:bg-gray-300">
+                                      {pair.overlap_count.toLocaleString()} shared
+                                    </button>
+                                  </div>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                  <span className={`text-lg font-bold ${r.retention_pct >= 40 ? 'text-green-600' : r.retention_pct >= 20 ? 'text-yellow-600' : 'text-red-600'}`}>
-                                    {r.retention_pct}% retained
-                                  </span>
-                                  <span className={`text-sm font-medium ${r.growth_pct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                    ({r.growth_pct >= 0 ? '+' : ''}{r.growth_pct}% growth)
-                                  </span>
-                                </div>
-                              </div>
-                              {/* Visual bar: retained | new | churned */}
-                              <div className="flex h-8 rounded-lg overflow-hidden mb-2">
-                                {r.retained > 0 && <div className="bg-green-500 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.retained / r.prev_count * 100) : 0}%`, minWidth: r.retained > 0 ? '40px' : '0'}}>
-                                  {r.retained.toLocaleString()} retained
-                                </div>}
-                                {r.new_attendees > 0 && <div className="bg-blue-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.new_attendees / r.prev_count * 100) : 0}%`, minWidth: r.new_attendees > 0 ? '40px' : '0'}}>
-                                  {r.new_attendees.toLocaleString()} new
-                                </div>}
-                                {r.churned > 0 && <div className="bg-red-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.churned / r.prev_count * 100) : 0}%`, minWidth: r.churned > 0 ? '40px' : '0'}}>
-                                  {r.churned.toLocaleString()} lost
-                                </div>}
-                              </div>
-                              <div className="flex gap-6 text-xs text-gray-500">
-                                <span>{r.prev_count.toLocaleString()} in {r.prev_year}</span>
-                                <span>{r.curr_count.toLocaleString()} in {r.curr_year}</span>
-                                <span className="text-green-600 font-medium">{r.retained.toLocaleString()} came back</span>
-                                <span className="text-red-500 font-medium">{r.churned.toLocaleString()} didn't return</span>
-                                <span className="text-blue-500">{r.new_attendees.toLocaleString()} first-timers</span>
                               </div>
                             </div>
                           ))}
@@ -1240,36 +1270,88 @@ export default function CraftDashboard() {
                   );
                 })()}
 
-                {/* Global Top Cross-Sell Opportunities */}
-                {overlap.top_cross_type?.length > 0 && overlapView !== 'retention' && (
-                  <Card className="p-0">
-                    <div className="p-4 border-b bg-purple-50">
-                      <h3 className="font-bold text-lg text-purple-900">Top Cross-Sell Targets (All Cities)</h3>
-                      <p className="text-sm text-purple-700">Your biggest untapped audiences across every market.</p>
-                    </div>
-                    <div className="max-h-[40vh] overflow-auto">
-                      {overlap.top_cross_type.slice(0, 20).map((pair, idx) => {
-                        const biggerGap = Math.max(pair.only_a_count || 0, pair.only_b_count || 0);
-                        const gapLabel = (pair.only_a_count || 0) >= (pair.only_b_count || 0)
-                          ? `${pair.only_a_count?.toLocaleString()} went to ${pair.event_a} but NOT ${pair.event_b}`
-                          : `${pair.only_b_count?.toLocaleString()} went to ${pair.event_b} but NOT ${pair.event_a}`;
-                        return (
-                          <div key={idx} className="p-3 border-b flex items-center gap-3 hover:bg-purple-50">
-                            <div className="text-lg font-bold text-gray-300 w-7">#{idx + 1}</div>
-                            <div className="flex-1">
-                              <div className="font-medium text-sm">{pair.event_a} &times; {pair.event_b}</div>
-                              <div className="text-xs text-gray-500">{pair.city} — {gapLabel}</div>
-                            </div>
-                            <div className="text-right">
-                              <div className="font-bold text-purple-700">{biggerGap.toLocaleString()}</div>
-                              <div className="text-xs text-gray-400">untapped</div>
-                            </div>
+                {/* ===== RETENTION VIEW ===== */}
+                {overlapView === 'retention' && (() => {
+                  const filteredRetention = (overlap.retention || []).filter(r => !overlapCity || r.city === overlapCity);
+                  const totalChurned = filteredRetention.reduce((sum, r) => sum + r.churned, 0);
+                  const avgRetention = filteredRetention.length > 0 ? Math.round(filteredRetention.reduce((sum, r) => sum + r.retention_pct, 0) / filteredRetention.length) : 0;
+
+                  // Retention bar chart
+                  const retChartData = filteredRetention.slice(0, 15).map(r => ({
+                    name: `${r.event.length > 20 ? r.event.slice(0,20)+'...' : r.event} ${r.prev_year}-${r.curr_year.slice(2)}`,
+                    Retained: r.retained,
+                    New: r.new_attendees,
+                    Churned: r.churned,
+                    retention_pct: r.retention_pct
+                  }));
+
+                  return (
+                    <>
+                      <div className="grid grid-cols-3 gap-4">
+                        <Card className="p-4"><Stat label="Retention Pairs" value={filteredRetention.length} /></Card>
+                        <Card className="p-4"><Stat label="Avg Retention" value={`${avgRetention}%`} /></Card>
+                        <Card className="p-4 border-l-4 border-red-400"><Stat label="Total Churned" value={totalChurned.toLocaleString()} /></Card>
+                      </div>
+
+                      {retChartData.length > 0 && (
+                        <Card className="p-0">
+                          <div className="p-4 border-b">
+                            <h3 className="font-bold text-lg">Retention Breakdown — {overlapCity || 'All Cities'}</h3>
+                            <p className="text-sm text-gray-500">Green = came back. Blue = new. Red = didn't return (your re-engagement target).</p>
                           </div>
-                        );
-                      })}
-                    </div>
-                  </Card>
-                )}
+                          <div className="p-4">
+                            <ResponsiveContainer width="100%" height={Math.max(300, retChartData.length * 40)}>
+                              <BarChart data={retChartData} layout="vertical" margin={{ left: 10, right: 30 }}>
+                                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                                <XAxis type="number" tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                                <YAxis type="category" dataKey="name" width={220} tick={{ fontSize: 11 }} />
+                                <Tooltip formatter={(v) => v.toLocaleString()} />
+                                <Bar dataKey="Retained" stackId="a" fill="#22c55e" />
+                                <Bar dataKey="New" stackId="a" fill="#60a5fa" />
+                                <Bar dataKey="Churned" stackId="a" fill="#f87171" />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </Card>
+                      )}
+
+                      <Card className="p-0">
+                        <div className="p-4 border-b">
+                          <h3 className="font-bold text-lg">Detail — {overlapCity || 'All Cities'}</h3>
+                          <p className="text-sm text-gray-500">Sorted by churned count. Biggest re-engagement opportunities first.</p>
+                        </div>
+                        <div className="max-h-[50vh] overflow-auto">
+                          {filteredRetention.length === 0 && <div className="p-8 text-center text-gray-500">Need 2+ years for retention data.</div>}
+                          {filteredRetention.map((r, idx) => (
+                            <div key={idx} className="p-4 border-b hover:bg-gray-50">
+                              <div className="flex items-center justify-between mb-2">
+                                <div>
+                                  <span className="font-semibold">{r.event}</span>
+                                  <span className="text-gray-400 ml-2">{r.city}</span>
+                                  <span className="text-sm text-gray-500 ml-2">{r.prev_year} &rarr; {r.curr_year}</span>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                  <span className={`text-lg font-bold ${r.retention_pct >= 40 ? 'text-green-600' : r.retention_pct >= 20 ? 'text-yellow-600' : 'text-red-600'}`}>{r.retention_pct}%</span>
+                                  <span className={`text-sm font-medium ${r.growth_pct >= 0 ? 'text-green-600' : 'text-red-600'}`}>({r.growth_pct >= 0 ? '+' : ''}{r.growth_pct}%)</span>
+                                </div>
+                              </div>
+                              <div className="flex h-7 rounded overflow-hidden mb-2">
+                                {r.retained > 0 && <div className="bg-green-500 flex items-center justify-center text-white text-xs font-bold" style={{width: `${(r.retained / (r.retained + r.new_attendees + r.churned)) * 100}%`, minWidth: '35px'}}>{r.retained}</div>}
+                                {r.new_attendees > 0 && <div className="bg-blue-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${(r.new_attendees / (r.retained + r.new_attendees + r.churned)) * 100}%`, minWidth: '35px'}}>{r.new_attendees}</div>}
+                                {r.churned > 0 && <div className="bg-red-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${(r.churned / (r.retained + r.new_attendees + r.churned)) * 100}%`, minWidth: '35px'}}>{r.churned}</div>}
+                              </div>
+                              <div className="flex gap-4 text-xs text-gray-500">
+                                <span className="text-green-600">{r.retained.toLocaleString()} retained</span>
+                                <span className="text-blue-500">{r.new_attendees.toLocaleString()} new</span>
+                                <span className="text-red-500 font-medium">{r.churned.toLocaleString()} didn't return</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </Card>
+                    </>
+                  );
+                })()}
               </div>
             )}
           </div>
