@@ -3523,20 +3523,33 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
 
         # Year-over-year retention for same events
         retention = []
-        for city, city_editions_raw in defaultdict(list, {ed['city'] or 'Unknown': [] for ed in edition_list}).items():
-            pass
-        # Re-group edition_list by pattern+city for retention calc
+        # Group edition_list by pattern+city for retention calc
         ret_groups = defaultdict(list)
         for ed in edition_list:
             pattern = _normalize_event_pattern(ed['name'], include_season=True)
             ret_groups[(ed['city'], pattern)].append(ed)
         for (city, pattern), eds in ret_groups.items():
-            if len(eds) < 2:
+            # Need at least 2 editions with DIFFERENT years
+            unique_years = set(e['year'] for e in eds)
+            if len(unique_years) < 2:
                 continue
-            eds_sorted = sorted(eds, key=lambda e: e['year'])
-            for k in range(len(eds_sorted) - 1):
-                prev = eds_sorted[k]
-                curr = eds_sorted[k + 1]
+            # Merge editions that share the same year (multi-day events)
+            by_year = defaultdict(lambda: {'emails': set(), 'name': '', 'year': '', 'event_ids': []})
+            for e in eds:
+                yr = by_year[e['year']]
+                yr['emails'] |= e['emails']
+                yr['year'] = e['year']
+                yr['event_ids'].extend(e.get('event_ids', []))
+                if not yr['name'] or len(e['name']) < len(yr['name']):
+                    yr['name'] = e['name']
+            years_sorted = sorted(by_year.values(), key=lambda y: y['year'])
+            for k in range(len(years_sorted) - 1):
+                prev = years_sorted[k]
+                curr = years_sorted[k + 1]
+                prev_count = len(prev['emails'])
+                curr_count = len(curr['emails'])
+                if prev_count < 5 or curr_count < 5:
+                    continue
                 retained = prev['emails'] & curr['emails']
                 churned = prev['emails'] - curr['emails']
                 new_attendees = curr['emails'] - prev['emails']
@@ -3545,15 +3558,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                     'city': city,
                     'prev_year': prev['year'],
                     'curr_year': curr['year'],
-                    'prev_count': prev['attendee_count'],
-                    'curr_count': curr['attendee_count'],
+                    'prev_count': prev_count,
+                    'curr_count': curr_count,
                     'retained': len(retained),
                     'churned': len(churned),
                     'new_attendees': len(new_attendees),
-                    'retention_pct': round(len(retained) / prev['attendee_count'] * 100, 1) if prev['attendee_count'] > 0 else 0,
-                    'growth_pct': round((curr['attendee_count'] - prev['attendee_count']) / prev['attendee_count'] * 100, 1) if prev['attendee_count'] > 0 else 0
+                    'retention_pct': round(len(retained) / prev_count * 100, 1) if prev_count > 0 else 0,
+                    'growth_pct': round((curr_count - prev_count) / prev_count * 100, 1) if prev_count > 0 else 0
                 })
-        retention.sort(key=lambda r: r['retention_pct'], reverse=True)
+        retention.sort(key=lambda r: r['churned'], reverse=True)
 
         # Build heatmap matrix per city (all-time unique events)
         city_matrices = {}

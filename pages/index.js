@@ -1018,14 +1018,17 @@ export default function CraftDashboard() {
                 {/* City selector + view toggle */}
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2 flex-wrap">
+                    {overlapView === 'retention' && (
+                      <button onClick={() => setOverlapCity('')} className={`px-4 py-2 rounded-lg text-sm font-medium ${!overlapCity ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>All Cities</button>
+                    )}
                     {overlap.cities?.map(c => (
                       <button key={c} onClick={() => setOverlapCity(c)} className={`px-4 py-2 rounded-lg text-sm font-medium ${overlapCity === c ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 border hover:bg-gray-50'}`}>{c}</button>
                     ))}
                   </div>
                   <div className="flex bg-gray-100 rounded-lg p-1">
-                    <button onClick={() => setOverlapView('matrix')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Gap Matrix</button>
-                    <button onClick={() => setOverlapView('pairs')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Action List</button>
-                    <button onClick={() => setOverlapView('retention')} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'retention' ? 'bg-white shadow' : 'text-gray-600'}`}>Retention</button>
+                    <button onClick={() => { setOverlapView('matrix'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'matrix' ? 'bg-white shadow' : 'text-gray-600'}`}>Gap Matrix</button>
+                    <button onClick={() => { setOverlapView('pairs'); if (!overlapCity && overlap?.cities?.length) setOverlapCity(overlap.cities[0]); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'pairs' ? 'bg-white shadow' : 'text-gray-600'}`}>Action List</button>
+                    <button onClick={() => { setOverlapView('retention'); setOverlapCity(''); }} className={`px-3 py-1 rounded text-sm font-medium ${overlapView === 'retention' ? 'bg-white shadow' : 'text-gray-600'}`}>Retention ({overlap.retention?.length || 0})</button>
                   </div>
                 </div>
 
@@ -1172,53 +1175,70 @@ export default function CraftDashboard() {
                 )}
 
                 {/* RETENTION VIEW — year-over-year for same events */}
-                {overlapView === 'retention' && (
-                  <Card className="p-0">
-                    <div className="p-4 border-b">
-                      <h3 className="font-bold text-lg">Year-Over-Year Retention</h3>
-                      <p className="text-sm text-gray-500">How many attendees came back the following year? Who churned? Who's new?</p>
-                    </div>
-                    <div className="max-h-[65vh] overflow-auto">
-                      {(!overlap.retention?.length) && (
-                        <div className="p-8 text-center text-gray-500">Need at least 2 years of data for the same event to show retention.</div>
-                      )}
-                      {(overlap.retention || []).filter(r => !overlapCity || r.city === overlapCity).map((r, idx) => (
-                        <div key={idx} className="p-4 border-b hover:bg-gray-50">
-                          <div className="flex items-center justify-between mb-3">
-                            <div>
-                              <span className="font-semibold">{r.event}</span>
-                              <span className="text-gray-400 ml-2">{r.city}</span>
-                              <span className="text-sm text-gray-500 ml-2">{r.prev_year} &rarr; {r.curr_year}</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <span className={`text-lg font-bold ${r.retention_pct >= 40 ? 'text-green-600' : r.retention_pct >= 20 ? 'text-yellow-600' : 'text-red-600'}`}>
-                                {r.retention_pct}% retained
-                              </span>
-                              <span className={`text-sm font-medium ${r.growth_pct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                ({r.growth_pct >= 0 ? '+' : ''}{r.growth_pct}% growth)
-                              </span>
-                            </div>
-                          </div>
-                          {/* Visual bar */}
-                          <div className="flex h-8 rounded-lg overflow-hidden mb-2">
-                            <div className="bg-green-500 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.curr_count > 0 ? (r.retained / r.curr_count * 100) : 0}%`}}>
-                              {r.retained > 0 ? `${r.retained} retained` : ''}
-                            </div>
-                            <div className="bg-blue-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.curr_count > 0 ? (r.new_attendees / r.curr_count * 100) : 0}%`}}>
-                              {r.new_attendees > 0 ? `${r.new_attendees} new` : ''}
-                            </div>
-                          </div>
-                          <div className="flex gap-6 text-xs text-gray-500">
-                            <span>{r.prev_count.toLocaleString()} in {r.prev_year}</span>
-                            <span>{r.curr_count.toLocaleString()} in {r.curr_year}</span>
-                            <span className="text-red-500">{r.churned.toLocaleString()} didn't return</span>
-                            <span className="text-blue-500">{r.new_attendees.toLocaleString()} first-timers</span>
-                          </div>
+                {overlapView === 'retention' && (() => {
+                  const filteredRetention = (overlap.retention || []).filter(r => !overlapCity || r.city === overlapCity);
+                  const totalChurned = filteredRetention.reduce((sum, r) => sum + r.churned, 0);
+                  const avgRetention = filteredRetention.length > 0 ? Math.round(filteredRetention.reduce((sum, r) => sum + r.retention_pct, 0) / filteredRetention.length) : 0;
+                  return (
+                    <>
+                      {/* Retention summary */}
+                      <div className="grid grid-cols-3 gap-4">
+                        <Card className="p-4"><Stat label="Retention Pairs" value={filteredRetention.length} /></Card>
+                        <Card className="p-4"><Stat label="Avg Retention" value={`${avgRetention}%`} /></Card>
+                        <Card className="p-4 border-l-4 border-red-400"><Stat label="Total Churned" value={totalChurned.toLocaleString()} /></Card>
+                      </div>
+                      <Card className="p-0">
+                        <div className="p-4 border-b">
+                          <h3 className="font-bold text-lg">Year-Over-Year Retention — {overlapCity || 'All Cities'}</h3>
+                          <p className="text-sm text-gray-500">Sorted by churned count (biggest re-engagement opportunities first). Who left and didn't come back?</p>
                         </div>
-                      ))}
-                    </div>
-                  </Card>
-                )}
+                        <div className="max-h-[65vh] overflow-auto">
+                          {filteredRetention.length === 0 && (
+                            <div className="p-8 text-center text-gray-500">Need at least 2 years of data for the same event to show retention.</div>
+                          )}
+                          {filteredRetention.map((r, idx) => (
+                            <div key={idx} className="p-4 border-b hover:bg-gray-50">
+                              <div className="flex items-center justify-between mb-3">
+                                <div>
+                                  <span className="font-semibold">{r.event}</span>
+                                  <span className="text-gray-400 ml-2">{r.city}</span>
+                                  <span className="text-sm text-gray-500 ml-2">{r.prev_year} &rarr; {r.curr_year}</span>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                  <span className={`text-lg font-bold ${r.retention_pct >= 40 ? 'text-green-600' : r.retention_pct >= 20 ? 'text-yellow-600' : 'text-red-600'}`}>
+                                    {r.retention_pct}% retained
+                                  </span>
+                                  <span className={`text-sm font-medium ${r.growth_pct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                    ({r.growth_pct >= 0 ? '+' : ''}{r.growth_pct}% growth)
+                                  </span>
+                                </div>
+                              </div>
+                              {/* Visual bar: retained | new | churned */}
+                              <div className="flex h-8 rounded-lg overflow-hidden mb-2">
+                                {r.retained > 0 && <div className="bg-green-500 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.retained / r.prev_count * 100) : 0}%`, minWidth: r.retained > 0 ? '40px' : '0'}}>
+                                  {r.retained.toLocaleString()} retained
+                                </div>}
+                                {r.new_attendees > 0 && <div className="bg-blue-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.new_attendees / r.prev_count * 100) : 0}%`, minWidth: r.new_attendees > 0 ? '40px' : '0'}}>
+                                  {r.new_attendees.toLocaleString()} new
+                                </div>}
+                                {r.churned > 0 && <div className="bg-red-400 flex items-center justify-center text-white text-xs font-bold" style={{width: `${r.prev_count > 0 ? (r.churned / r.prev_count * 100) : 0}%`, minWidth: r.churned > 0 ? '40px' : '0'}}>
+                                  {r.churned.toLocaleString()} lost
+                                </div>}
+                              </div>
+                              <div className="flex gap-6 text-xs text-gray-500">
+                                <span>{r.prev_count.toLocaleString()} in {r.prev_year}</span>
+                                <span>{r.curr_count.toLocaleString()} in {r.curr_year}</span>
+                                <span className="text-green-600 font-medium">{r.retained.toLocaleString()} came back</span>
+                                <span className="text-red-500 font-medium">{r.churned.toLocaleString()} didn't return</span>
+                                <span className="text-blue-500">{r.new_attendees.toLocaleString()} first-timers</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </Card>
+                    </>
+                  );
+                })()}
 
                 {/* Global Top Cross-Sell Opportunities */}
                 {overlap.top_cross_type?.length > 0 && overlapView !== 'retention' && (
