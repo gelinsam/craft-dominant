@@ -77,9 +77,9 @@ const EventCard = ({ event, selected, onSelect }) => {
         </div>
         <div className="h-2 bg-gray-100 rounded-full"><div className="h-full rounded-full" style={{ width: `${Math.min(100, event.sell_through || 0)}%`, backgroundColor: cfg.color }} /></div>
       </div>
-      {event.pace_vs_historical !== 0 && (
+      {event.historical_median_at_point > 0 && (
         <div className={`text-xs ${event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-          {event.pace_vs_historical >= 0 ? '+' : ''}{event.pace_vs_historical?.toFixed(0)}% vs historical
+          {event.pace_vs_historical === 0 ? 'On pace' : `${event.pace_vs_historical >= 0 ? '+' : ''}${event.pace_vs_historical?.toFixed(0)}% vs median (${event.historical_median_at_point?.toFixed(0)}%)`}
         </div>
       )}
     </Card>
@@ -154,8 +154,18 @@ const EventDetail = ({ event }) => {
               </tr>
             </tbody>
           </table>
-          {event.pace_vs_historical !== 0 && event.historical_median_at_point > 0 && (
-            <div className="mt-3 text-sm">Pace vs median: <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>{event.pace_vs_historical >= 0 ? '+' : ''}{event.pace_vs_historical?.toFixed(0)}%</strong></div>
+          {event.historical_median_at_point > 0 && (
+            <div className="mt-3 text-sm">
+              Pace vs median ({event.historical_median_at_point?.toFixed(1)}% sell-through at {event.days_until}d): <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>
+                {event.pace_vs_historical === 0 ? 'On pace' : `${event.pace_vs_historical >= 0 ? '+' : ''}${event.pace_vs_historical?.toFixed(0)}%`}
+              </strong>
+              {event.historical_range && event.historical_range[0] !== event.historical_range[1] && (
+                <span className="text-gray-400 ml-2">(range: {event.historical_range[0]?.toFixed(0)}% – {event.historical_range[1]?.toFixed(0)}%)</span>
+              )}
+            </div>
+          )}
+          {!event.historical_median_at_point && event.historical_comparisons?.length > 0 && (
+            <div className="mt-3 text-sm text-amber-600">No snapshot data at {event.days_until} days out for past editions — pace unavailable</div>
           )}
         </div>
       )}

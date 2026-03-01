@@ -1847,7 +1847,9 @@ class DecisionEngine:
         eid = hashlib.md5(f"{logical_name}_{first_date}".encode()).hexdigest()
         total_tickets = sum(a.tickets_sold for a in day_analyses)
         total_revenue = sum(a.revenue for a in day_analyses)
-        max_capacity = max(a.capacity for a in day_analyses) if day_analyses else 0
+        # Sum capacities across sessions (not max) - each timed slot is separate capacity
+        total_capacity = sum(a.capacity for a in day_analyses) if day_analyses else 0
+        max_capacity = total_capacity  # keep variable name for downstream compat
         total_spend = sum(a.ad_spend for a in day_analyses)
         sell_through = (total_tickets / max_capacity * 100) if max_capacity > 0 else 0
         cac_val = (total_spend / total_tickets) if total_tickets > 0 else 0
@@ -1912,7 +1914,7 @@ class DecisionEngine:
                 sp = self.db.get_event_spend(pe['event_id'])
                 date_tickets += t
                 date_revenue += r
-                date_capacity = max(date_capacity, c)
+                date_capacity += c  # Sum capacities across sessions (not max)
                 date_spend += sp
             date_sell = (date_tickets / date_capacity * 100) if date_capacity > 0 else 0
             snap_tickets = 0
@@ -3762,6 +3764,34 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         except Exception as e:
             log.error(f"Overlap CSV export error: {e}")
             return jsonify({'error': str(e)}), 500
+
+    # === Pacing Debug ===
+    @app.route('/api/pace-debug')
+    def pace_debug():
+        """Debug pace vs median calculation for all events."""
+        analyses = engine.analyze_portfolio()
+        debug = []
+        for a in analyses:
+            entry = {
+                'event': a.event_name,
+                'date': a.event_date[:10],
+                'days_until': a.days_until,
+                'tickets': a.tickets_sold,
+                'capacity': a.capacity,
+                'sell_through': round(a.sell_through, 2),
+                'hist_median': round(a.historical_median_at_point, 2),
+                'hist_range': [round(a.historical_range[0], 2), round(a.historical_range[1], 2)],
+                'pace_vs_hist': round(a.pace_vs_historical, 2),
+                'comparison_events': a.comparison_events[:5] if a.comparison_events else [],
+                'comparison_years': a.comparison_years[:5] if a.comparison_years else [],
+                'projected_final': a.projected_final,
+                'projected_range': list(a.projected_range),
+                'confidence': a.confidence,
+                'constituent_ids': getattr(a, 'constituent_event_ids', None),
+                'historical_comparisons': a.historical_comparisons if a.historical_comparisons else [],
+            }
+            debug.append(entry)
+        return jsonify(debug)
 
     # === Pacing ===
     @app.route('/api/curves')
