@@ -1758,13 +1758,74 @@ class DecisionEngine:
     def _decide(self, tickets: int, capacity: int, sell_through: float,
                 pace: float, cac: float, days_until: int, hist_median: float,
                 comparison_events: List[str]) -> Tuple[Decision, int, str, List[str]]:
-        """Make decision based on historical pacing."""
+        """Make decision based on historical pacing AND absolute sell-through.
+
+        Uses two signals:
+        1. Historical pace (% ahead/behind median at this days-out point)
+        2. Absolute sell-through trajectory (where are we relative to where we need to be)
+
+        The absolute signal catches cases where historical data is missing/wrong
+        but the event is clearly on track or clearly behind.
+        """
         target_cac = 12.00
         cac_ok = cac <= target_cac * 1.5 or cac == 0
-        context = f" vs historical median {hist_median:.1f}%" if hist_median > 0 else ""
-        basis = f"Based on {len(comparison_events)} past events" if comparison_events else "No historical data"
-        # PIVOT: Way behind
-        if pace < -35:
+        has_history = hist_median > 0 and len(comparison_events) > 0
+        context = f" vs historical median {hist_median:.1f}%" if has_history else ""
+        basis = f"Based on {len(comparison_events)} past editions" if comparison_events else "No historical data"
+
+        # Calculate expected sell-through trajectory (linear: should be ~100% by day 0)
+        # At 60 days out, ~40% is healthy. At 30 days out, ~60%. At 7 days, ~85%.
+        if days_until <= 0:
+            expected_sell = 95
+        elif days_until >= 90:
+            expected_sell = 20
+        else:
+            # Roughly: expected = 95 - (days_until / 90) * 75
+            expected_sell = max(15, 95 - (days_until * 0.85))
+
+        # Absolute trajectory signal
+        abs_ahead = sell_through - expected_sell  # positive = ahead of trajectory
+
+        # --- COAST: Clearly ahead ---
+        # Historical pace way ahead, OR absolute sell-through well above trajectory
+        if has_history and pace > 25 and sell_through > 30:
+            cut = min(40, pace / 2)
+            return (
+                Decision.COAST, 3,
+                f"Sales {pace:.0f}% ahead of historical{context}. {basis}.",
+                [
+                    f"Reduce ad budget by {cut:.0f}%",
+                    "Reallocate budget to struggling events",
+                    "Focus on VIP upsells",
+                    "Maintain organic only"
+                ]
+            )
+        # No historical data but sell-through is way ahead of expected trajectory
+        if not has_history and abs_ahead > 20 and sell_through > 40:
+            return (
+                Decision.COAST, 3,
+                f"Sell-through {sell_through:.0f}% is well ahead of expected ~{expected_sell:.0f}% at {days_until}d out. {basis}.",
+                [
+                    "Reduce ad budget — already ahead",
+                    "Reallocate budget to struggling events",
+                    "Focus on VIP upsells",
+                    "Maintain organic only"
+                ]
+            )
+        # Has history, pace is mildly ahead, but absolute sell-through is very strong
+        if has_history and pace > -5 and sell_through > 70 and days_until > 14:
+            return (
+                Decision.COAST, 3,
+                f"Sell-through {sell_through:.0f}% strong at {days_until}d out (historical median {hist_median:.0f}%). {basis}.",
+                [
+                    "Reduce ad spend — high sell-through",
+                    "Reallocate to underperforming events",
+                    "Focus on VIP upsells"
+                ]
+            )
+
+        # --- PIVOT: Way behind ---
+        if has_history and pace < -35:
             urgency = 9 if days_until < 30 else 7
             return (
                 Decision.PIVOT, urgency,
@@ -1777,13 +1838,26 @@ class DecisionEngine:
                     "Consider influencer partnership"
                 ]
             )
-        # PUSH: Behind but CAC ok
-        if pace < -15 and cac_ok and days_until > 7:
+        # No historical but absolute trajectory is terrible
+        if not has_history and abs_ahead < -30 and sell_through < 15 and days_until < 45:
+            return (
+                Decision.PIVOT, 8,
+                f"Only {sell_through:.0f}% sold at {days_until}d out (expected ~{expected_sell:.0f}%). {basis}.",
+                [
+                    "PAUSE underperforming ad campaigns",
+                    "Audit and refresh all creative",
+                    "Test flash sale / promo offer",
+                    "Try completely different audience"
+                ]
+            )
+
+        # --- PUSH: Behind but recoverable ---
+        if has_history and pace < -15 and cac_ok and days_until > 7:
             urgency = 7 if days_until < 30 else 5
             bump = min(50, abs(pace))
             return (
                 Decision.PUSH, urgency,
-                f"Sales {abs(pace):.0f}% behind but CAC ${cac:.2f} acceptable{context}. {basis}.",
+                f"Sales {abs(pace):.0f}% behind historical pace{context}. CAC ${cac:.2f} acceptable. {basis}.",
                 [
                     f"Increase ad budget by {bump:.0f}%",
                     "Expand lookalike audiences",
@@ -1792,23 +1866,24 @@ class DecisionEngine:
                     "Increase retargeting frequency"
                 ]
             )
-        # COAST: Way ahead
-        if pace > 25 and sell_through > 30:
-            cut = min(40, pace / 2)
+        # No historical but behind trajectory and CAC ok
+        if not has_history and abs_ahead < -15 and cac_ok and days_until > 7:
+            bump = min(50, abs(abs_ahead))
             return (
-                Decision.COAST, 3,
-                f"Sales {pace:.0f}% ahead of historical{context}. {basis}.",
+                Decision.PUSH, 6,
+                f"Sell-through {sell_through:.0f}% behind expected ~{expected_sell:.0f}% at {days_until}d out. CAC ${cac:.2f} acceptable. {basis}.",
                 [
-                    f"Reduce ad budget by {cut:.0f}%",
-                    "Reallocate budget to struggling events",
-                    "Focus on VIP upsells",
-                    "Maintain organic only"
+                    f"Increase ad budget by {bump:.0f}%",
+                    "Expand lookalike audiences",
+                    "Add urgency messaging",
+                    "Email high-value past attendees"
                 ]
             )
-        # MAINTAIN
+
+        # --- MAINTAIN: On track ---
         return (
             Decision.MAINTAIN, 5 if days_until < 30 else 3,
-            f"Tracking within historical norms{context}. {basis}.",
+            f"{'Tracking within historical norms' if has_history else f'Sell-through {sell_through:.0f}% near expected ~{expected_sell:.0f}%'}{context}. {basis}.",
             [
                 "Maintain current spend",
                 "Continue daily monitoring",
@@ -3772,23 +3847,48 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         analyses = engine.analyze_portfolio()
         debug = []
         for a in analyses:
+            days_until = a.days_until
+            sell_through = a.sell_through
+            # Reproduce the expected trajectory calc from _decide
+            if days_until <= 0:
+                expected_sell = 95
+            elif days_until >= 90:
+                expected_sell = 20
+            else:
+                expected_sell = max(15, 95 - (days_until * 0.85))
+            abs_ahead = sell_through - expected_sell
             entry = {
                 'event': a.event_name,
+                'pattern': engine._get_pattern(a.event_name),
                 'date': a.event_date[:10],
-                'days_until': a.days_until,
+                'days_until': days_until,
                 'tickets': a.tickets_sold,
                 'capacity': a.capacity,
-                'sell_through': round(a.sell_through, 2),
+                'sell_through': round(sell_through, 2),
+                'expected_sell_through': round(expected_sell, 2),
+                'abs_ahead_of_trajectory': round(abs_ahead, 2),
                 'hist_median': round(a.historical_median_at_point, 2),
                 'hist_range': [round(a.historical_range[0], 2), round(a.historical_range[1], 2)],
                 'pace_vs_hist': round(a.pace_vs_historical, 2),
-                'comparison_events': a.comparison_events[:5] if a.comparison_events else [],
+                'decision': a.decision.value,
+                'urgency': a.urgency,
+                'rationale': a.rationale,
+                'comparison_count': len(a.comparison_events) if a.comparison_events else 0,
                 'comparison_years': a.comparison_years[:5] if a.comparison_years else [],
                 'projected_final': a.projected_final,
                 'projected_range': list(a.projected_range),
                 'confidence': a.confidence,
                 'constituent_ids': getattr(a, 'constituent_event_ids', None),
-                'historical_comparisons': a.historical_comparisons if a.historical_comparisons else [],
+                'cac': round(a.cac, 2),
+                'ad_spend': round(a.ad_spend, 2),
+                'historical_comparisons': [
+                    {
+                        'year': h['year'],
+                        'at_days_out': h.get('at_days_out'),
+                        'final_sell_through': h.get('final_sell_through'),
+                        'capacity': h.get('capacity'),
+                    } for h in (a.historical_comparisons or [])
+                ],
             }
             debug.append(entry)
         return jsonify(debug)
