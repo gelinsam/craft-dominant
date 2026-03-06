@@ -1618,73 +1618,42 @@ class DecisionEngine:
         """Extract pattern from event name."""
         return _normalize_event_pattern(name, include_season=True)
     def analyze_event(self, event_id: str) -> Optional[EventPacing]:
-        """Full analysis for an event."""
+        """Ticket-count based analysis. Compares raw tickets sold at N days out
+        against historical ticket counts at the same days-out for past editions."""
         event = self.db.get_event(event_id)
         if not event:
             return None
-        # Basic info
         event_date = datetime.fromisoformat(event['event_date']).date()
         days_until = (event_date - date.today()).days
         tickets = self.db.get_event_tickets(event_id)
         revenue = self.db.get_event_revenue(event_id)
         spend = self.db.get_event_spend(event_id)
-        capacity = event.get('capacity', 500)
+        capacity = event.get('capacity', 0)
         sell_through = (tickets / capacity * 100) if capacity > 0 else 0
         cac = spend / tickets if tickets > 0 else 0
-        # Historical comparison
+        # --- Find all past editions of this event pattern ---
         pattern = self._get_pattern(event['name'])
-        curve = self._curves.get(pattern)
-        hist_median = 0
-        hist_range = (0, 0)
-        pace = 0
+        all_events = self.db.get_events(upcoming_only=False)
+        historical_comparisons = []
+        hist_tickets_at_point = []
         comparison_events = []
         comparison_years = []
-        projected_final = tickets
-        projected_range = (tickets, capacity)
-        confidence = 0.5
-        if curve and curve['curve_data']:
-            # Find closest day in curve for pace calculation
-            available_days = sorted(curve['curve_data'].keys(), reverse=True)
-            closest_day = None
-            for d in available_days:
-                if d >= days_until:
-                    closest_day = d
-                elif closest_day is None:
-                    closest_day = d
-                    break
-            if closest_day is not None and closest_day in curve['curve_data']:
-                point = curve['curve_data'][closest_day]
-                hist_median = point['median']
-                hist_range = (point.get('p25', hist_median), point.get('p75', hist_median))
-                if hist_median > 0:
-                    pace = ((sell_through - hist_median) / hist_median) * 100
-                comparison_events = curve['source_events']
-                comparison_years = [int(re.search(r'20\d{2}', e).group())
-                                   for e in curve['source_events']
-                                   if re.search(r'20\d{2}', e)]
-        # Decision
-        decision, urgency, rationale, actions = self._decide(
-            tickets, capacity, sell_through, pace, cac, days_until, hist_median, comparison_events
-        )
-        # Get targeting counts
-        high_value = len(self.db.get_high_value_customers(
-            event_type=event.get('event_type'), city=event.get('city'), min_ltv=50, limit=1000
-        ))
-        at_risk = len(self.db.get_at_risk_customers(min_orders=2, min_days_inactive=180))
-        # Historical year-by-year comparison
-        historical_comparisons = []
-        all_events = self.db.get_events()
         for pe in all_events:
             if pe['event_id'] == event_id:
                 continue
             if self._get_pattern(pe['name']) != pattern:
                 continue
             pe_date = datetime.fromisoformat(pe['event_date']).date()
+            if pe_date > date.today():
+                continue
             pe_tickets = self.db.get_event_tickets(pe['event_id'])
             pe_revenue = self.db.get_event_revenue(pe['event_id'])
             pe_capacity = pe.get('capacity', 0)
-            pe_sell_through = (pe_tickets / pe_capacity * 100) if pe_capacity > 0 else 0
             pe_spend_total = self.db.get_event_spend(pe['event_id'])
+            comparison_events.append(pe['name'])
+            comparison_years.append(pe_date.year)
+            snap = self.db.get_snapshot_at_days(pe['event_id'], days_until)
+            snap_tickets = snap['tickets_cumulative'] if snap else None
             comp = {
                 'event_name': pe['name'],
                 'event_date': pe['event_date'],
@@ -1692,135 +1661,105 @@ class DecisionEngine:
                 'final_tickets': pe_tickets,
                 'final_revenue': pe_revenue,
                 'capacity': pe_capacity,
-                'final_sell_through': round(pe_sell_through, 1),
+                'final_sell_through': round(pe_tickets / pe_capacity * 100, 1) if pe_capacity > 0 else 0,
                 'ad_spend_total': round(pe_spend_total, 2),
             }
-            snapshot = self.db.get_snapshot_at_days(pe['event_id'], days_until)
-            if snapshot:
-                spend_at_point = snapshot.get('ad_spend_cumulative', 0) or 0
+            if snap_tickets is not None:
+                spend_at_point = snap.get('ad_spend_cumulative', 0) or 0
                 comp['at_days_out'] = {
-                    'days': snapshot['days_before_event'],
-                    'tickets': snapshot['tickets_cumulative'],
-                    'revenue': snapshot['revenue_cumulative'],
-                    'sell_through': snapshot['sell_through_pct'],
+                    'days': snap['days_before_event'],
+                    'tickets': snap_tickets,
+                    'revenue': snap['revenue_cumulative'],
+                    'sell_through': snap['sell_through_pct'],
                     'ad_spend': round(float(spend_at_point), 2),
                 }
+                hist_tickets_at_point.append(snap_tickets)
             else:
                 comp['at_days_out'] = None
             historical_comparisons.append(comp)
         historical_comparisons.sort(key=lambda x: x['year'])
-        # YOY Projection: this_year_tickets / last_year_tickets_at_point * last_year_final
+        # --- Pace: current tickets vs median historical tickets at this point ---
+        hist_median = 0
+        hist_lo = 0
+        hist_hi = 0
+        pace = 0
+        if hist_tickets_at_point:
+            sorted_tix = sorted(hist_tickets_at_point)
+            n = len(sorted_tix)
+            hist_median = sorted_tix[n // 2]
+            hist_lo = sorted_tix[0]
+            hist_hi = sorted_tix[-1]
+            if hist_median > 0:
+                pace = round(((tickets - hist_median) / hist_median) * 100, 1)
+        # --- Projection from ticket ratios ---
+        projected_final = tickets
+        projected_range = (tickets, tickets)
+        confidence = 0.5
         comps_with_data = [c for c in historical_comparisons
                            if c.get('at_days_out') and c['at_days_out']['tickets'] > 0
                            and c['final_tickets'] > 0]
         if comps_with_data and tickets > 0:
-            # Use most recent year for primary projection
-            last_year = comps_with_data[-1]
-            last_at_point = last_year['at_days_out']['tickets']
-            last_final = last_year['final_tickets']
-            projected_final = int(tickets / last_at_point * last_final)
-            projected_final = max(tickets, projected_final)
-            # Range from all available years
-            all_projections = []
+            projections = []
             for c in comps_with_data:
-                at_point = c['at_days_out']['tickets']
-                proj = int(tickets / at_point * c['final_tickets'])
-                all_projections.append(max(tickets, proj))
-            projected_range = (min(all_projections), max(all_projections))
-            confidence = 0.9 if len(comps_with_data) >= 3 else 0.75 if len(comps_with_data) >= 2 else 0.6
+                ratio = c['final_tickets'] / c['at_days_out']['tickets']
+                proj = int(tickets * ratio)
+                projections.append(max(tickets, proj))
+            projected_final = int(statistics.median(projections))
+            projected_range = (min(projections), max(projections))
+            confidence = 0.9 if len(projections) >= 3 else 0.75 if len(projections) >= 2 else 0.6
+        # --- Decision ---
+        decision, urgency, rationale, actions = self._decide(
+            tickets, pace, cac, days_until, hist_median, comparison_events
+        )
+        # Targeting
+        high_value = len(self.db.get_high_value_customers(
+            event_type=event.get('event_type'), city=event.get('city'), min_ltv=50, limit=1000
+        ))
+        at_risk = len(self.db.get_at_risk_customers(min_orders=2, min_days_inactive=180))
         return EventPacing(
-            event_id=event_id,
-            event_name=event['name'],
-            event_date=event['event_date'],
-            days_until=days_until,
-            tickets_sold=tickets,
-            capacity=capacity,
-            revenue=revenue,
-            ad_spend=spend,
-            sell_through=sell_through,
-            cac=cac,
+            event_id=event_id, event_name=event['name'],
+            event_date=event['event_date'], days_until=days_until,
+            tickets_sold=tickets, capacity=capacity,
+            revenue=revenue, ad_spend=spend,
+            sell_through=sell_through, cac=cac,
             historical_median_at_point=hist_median,
-            historical_range=hist_range,
+            historical_range=(hist_lo, hist_hi),
             pace_vs_historical=pace,
             comparison_events=comparison_events,
             comparison_years=comparison_years,
             projected_final=projected_final,
             projected_range=projected_range,
             confidence=confidence,
-            decision=decision,
-            urgency=urgency,
-            rationale=rationale,
-            actions=actions,
+            decision=decision, urgency=urgency,
+            rationale=rationale, actions=actions,
             high_value_targets=high_value,
             reactivation_targets=at_risk,
             historical_comparisons=historical_comparisons
         )
-    def _decide(self, tickets: int, capacity: int, sell_through: float,
-                pace: float, cac: float, days_until: int, hist_median: float,
-                comparison_events: List[str]) -> Tuple[Decision, int, str, List[str]]:
-        """Make decision based on historical pacing AND absolute sell-through.
+    def _decide(self, tickets: int, pace: float, cac: float, days_until: int,
+                hist_median: float, comparison_events: List[str]) -> Tuple[Decision, int, str, List[str]]:
+        """Make decision based on ticket-count pace vs historical median.
 
-        Uses two signals:
-        1. Historical pace (% ahead/behind median at this days-out point)
-        2. Absolute sell-through trajectory (where are we relative to where we need to be)
-
-        The absolute signal catches cases where historical data is missing/wrong
-        but the event is clearly on track or clearly behind.
+        pace = ((current_tickets - median_historical_tickets) / median_historical_tickets) * 100
+        hist_median = median ticket count at this days-out point across past editions
         """
         target_cac = 12.00
         cac_ok = cac <= target_cac * 1.5 or cac == 0
         has_history = hist_median > 0 and len(comparison_events) > 0
-        context = f" vs historical median {hist_median:.1f}%" if has_history else ""
+        context = f" vs median {int(hist_median)} tickets at this point" if has_history else ""
         basis = f"Based on {len(comparison_events)} past editions" if comparison_events else "No historical data"
 
-        # Calculate expected sell-through trajectory (linear: should be ~100% by day 0)
-        # At 60 days out, ~40% is healthy. At 30 days out, ~60%. At 7 days, ~85%.
-        if days_until <= 0:
-            expected_sell = 95
-        elif days_until >= 90:
-            expected_sell = 20
-        else:
-            # Roughly: expected = 95 - (days_until / 90) * 75
-            expected_sell = max(15, 95 - (days_until * 0.85))
-
-        # Absolute trajectory signal
-        abs_ahead = sell_through - expected_sell  # positive = ahead of trajectory
-
         # --- COAST: Clearly ahead ---
-        # Historical pace way ahead, OR absolute sell-through well above trajectory
-        if has_history and pace > 25 and sell_through > 30:
+        if has_history and pace > 25:
             cut = min(40, pace / 2)
             return (
                 Decision.COAST, 3,
-                f"Sales {pace:.0f}% ahead of historical{context}. {basis}.",
+                f"{tickets} tickets — {pace:.0f}% ahead of historical{context}. {basis}.",
                 [
                     f"Reduce ad budget by {cut:.0f}%",
                     "Reallocate budget to struggling events",
                     "Focus on VIP upsells",
                     "Maintain organic only"
-                ]
-            )
-        # No historical data but sell-through is way ahead of expected trajectory
-        if not has_history and abs_ahead > 20 and sell_through > 40:
-            return (
-                Decision.COAST, 3,
-                f"Sell-through {sell_through:.0f}% is well ahead of expected ~{expected_sell:.0f}% at {days_until}d out. {basis}.",
-                [
-                    "Reduce ad budget — already ahead",
-                    "Reallocate budget to struggling events",
-                    "Focus on VIP upsells",
-                    "Maintain organic only"
-                ]
-            )
-        # Has history, pace is mildly ahead, but absolute sell-through is very strong
-        if has_history and pace > -5 and sell_through > 70 and days_until > 14:
-            return (
-                Decision.COAST, 3,
-                f"Sell-through {sell_through:.0f}% strong at {days_until}d out (historical median {hist_median:.0f}%). {basis}.",
-                [
-                    "Reduce ad spend — high sell-through",
-                    "Reallocate to underperforming events",
-                    "Focus on VIP upsells"
                 ]
             )
 
@@ -1829,25 +1768,13 @@ class DecisionEngine:
             urgency = 9 if days_until < 30 else 7
             return (
                 Decision.PIVOT, urgency,
-                f"Sales {abs(pace):.0f}% behind historical pace{context}. {basis}.",
+                f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. {basis}.",
                 [
                     "PAUSE underperforming ad campaigns",
                     "Audit and refresh all creative",
                     "Test flash sale / promo offer",
                     "Try completely different audience",
                     "Consider influencer partnership"
-                ]
-            )
-        # No historical but absolute trajectory is terrible
-        if not has_history and abs_ahead < -30 and sell_through < 15 and days_until < 45:
-            return (
-                Decision.PIVOT, 8,
-                f"Only {sell_through:.0f}% sold at {days_until}d out (expected ~{expected_sell:.0f}%). {basis}.",
-                [
-                    "PAUSE underperforming ad campaigns",
-                    "Audit and refresh all creative",
-                    "Test flash sale / promo offer",
-                    "Try completely different audience"
                 ]
             )
 
@@ -1857,7 +1784,7 @@ class DecisionEngine:
             bump = min(50, abs(pace))
             return (
                 Decision.PUSH, urgency,
-                f"Sales {abs(pace):.0f}% behind historical pace{context}. CAC ${cac:.2f} acceptable. {basis}.",
+                f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. CAC ${cac:.2f} acceptable. {basis}.",
                 [
                     f"Increase ad budget by {bump:.0f}%",
                     "Expand lookalike audiences",
@@ -1866,24 +1793,23 @@ class DecisionEngine:
                     "Increase retargeting frequency"
                 ]
             )
-        # No historical but behind trajectory and CAC ok
-        if not has_history and abs_ahead < -15 and cac_ok and days_until > 7:
-            bump = min(50, abs(abs_ahead))
+
+        # --- No historical data: default to MAINTAIN ---
+        if not has_history:
             return (
-                Decision.PUSH, 6,
-                f"Sell-through {sell_through:.0f}% behind expected ~{expected_sell:.0f}% at {days_until}d out. CAC ${cac:.2f} acceptable. {basis}.",
+                Decision.MAINTAIN, 5 if days_until < 30 else 3,
+                f"{tickets} tickets at {days_until}d out. {basis} — monitor manually.",
                 [
-                    f"Increase ad budget by {bump:.0f}%",
-                    "Expand lookalike audiences",
-                    "Add urgency messaging",
-                    "Email high-value past attendees"
+                    "Maintain current spend",
+                    "Continue daily monitoring",
+                    "Prepare final push for last 2 weeks"
                 ]
             )
 
-        # --- MAINTAIN: On track ---
+        # --- MAINTAIN: On track (has history, pace between -15 and +25) ---
         return (
             Decision.MAINTAIN, 5 if days_until < 30 else 3,
-            f"{'Tracking within historical norms' if has_history else f'Sell-through {sell_through:.0f}% near expected ~{expected_sell:.0f}%'}{context}. {basis}.",
+            f"{tickets} tickets — tracking within historical norms{context}. {basis}.",
             [
                 "Maintain current spend",
                 "Continue daily monitoring",
@@ -2041,24 +1967,24 @@ class DecisionEngine:
                 all_projections.append(max(total_tickets, proj))
             grouped_proj_range = (min(all_projections), max(all_projections))
             grouped_confidence = 0.9 if len(comps_with_data) >= 3 else 0.75 if len(comps_with_data) >= 2 else 0.6
-        # Calculate grouped historical median from comparisons at this days-out point
+        # Calculate grouped historical median from ticket counts at this days-out point
         grouped_hist_median = 0
         grouped_hist_lo = 0
         grouped_hist_hi = 0
         comps_with_snap = [c for c in historical_comparisons if c.get('at_days_out')]
         if comps_with_snap:
-            snap_sells = sorted([c['at_days_out']['sell_through'] for c in comps_with_snap])
-            n = len(snap_sells)
-            grouped_hist_median = snap_sells[n // 2]
-            grouped_hist_lo = snap_sells[0]
-            grouped_hist_hi = snap_sells[-1]
-        # Calculate actual pace for grouped event (not hardcoded 0!)
+            snap_tix = sorted([c['at_days_out']['tickets'] for c in comps_with_snap])
+            n = len(snap_tix)
+            grouped_hist_median = snap_tix[n // 2]
+            grouped_hist_lo = snap_tix[0]
+            grouped_hist_hi = snap_tix[-1]
+        # Calculate actual pace for grouped event based on ticket counts
         grouped_pace = 0
         if grouped_hist_median > 0:
-            grouped_pace = ((sell_through - grouped_hist_median) / grouped_hist_median) * 100
+            grouped_pace = round(((total_tickets - grouped_hist_median) / grouped_hist_median) * 100, 1)
         # Re-decide based on grouped data (don't inherit from individual slots)
         grouped_decision, grouped_urgency, grouped_rationale, grouped_actions = self._decide(
-            total_tickets, max_capacity, sell_through, grouped_pace,
+            total_tickets, grouped_pace,
             cac_val, days_until, grouped_hist_median,
             [c['event_name'] for c in historical_comparisons]
         )

@@ -79,7 +79,7 @@ const EventCard = ({ event, selected, onSelect }) => {
       </div>
       {event.historical_median_at_point > 0 && (
         <div className={`text-xs ${event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-          {event.pace_vs_historical === 0 ? 'On pace' : `${event.pace_vs_historical >= 0 ? '+' : ''}${event.pace_vs_historical?.toFixed(0)}% vs median (${event.historical_median_at_point?.toFixed(0)}%)`}
+          {event.pace_vs_historical === 0 ? 'On pace' : `${event.pace_vs_historical >= 0 ? '+' : ''}${event.pace_vs_historical?.toFixed(0)}% vs median (${Math.round(event.historical_median_at_point).toLocaleString()} tix)`}
         </div>
       )}
     </Card>
@@ -156,11 +156,11 @@ const EventDetail = ({ event }) => {
           </table>
           {event.historical_median_at_point > 0 && (
             <div className="mt-3 text-sm">
-              Pace vs median ({event.historical_median_at_point?.toFixed(1)}% sell-through at {event.days_until}d): <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>
+              Pace vs median ({Math.round(event.historical_median_at_point).toLocaleString()} tickets at {event.days_until}d): <strong className={event.pace_vs_historical >= 0 ? 'text-green-600' : 'text-red-600'}>
                 {event.pace_vs_historical === 0 ? 'On pace' : `${event.pace_vs_historical >= 0 ? '+' : ''}${event.pace_vs_historical?.toFixed(0)}%`}
               </strong>
               {event.historical_range && event.historical_range[0] !== event.historical_range[1] && (
-                <span className="text-gray-400 ml-2">(range: {event.historical_range[0]?.toFixed(0)}% – {event.historical_range[1]?.toFixed(0)}%)</span>
+                <span className="text-gray-400 ml-2">(range: {Math.round(event.historical_range[0]).toLocaleString()} – {Math.round(event.historical_range[1]).toLocaleString()} tix)</span>
               )}
             </div>
           )}
