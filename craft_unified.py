@@ -1609,14 +1609,27 @@ class DecisionEngine:
         self.db = db
         self._curves = {}
         self._load_curves()
+        self._all_events_cache = None
+        self._pattern_cache = {}
     def _load_curves(self):
         curves = self.db.get_all_curves()
         for c in curves:
             if c:
                 self._curves[c['pattern']] = c
     def _get_pattern(self, name: str) -> str:
-        """Extract pattern from event name."""
-        return _normalize_event_pattern(name, include_season=True)
+        """Extract pattern from event name (cached)."""
+        if name not in self._pattern_cache:
+            self._pattern_cache[name] = _normalize_event_pattern(name, include_season=True)
+        return self._pattern_cache[name]
+    def _get_all_events(self) -> list:
+        """Get all events (cached per portfolio run)."""
+        if self._all_events_cache is None:
+            self._all_events_cache = self.db.get_events(upcoming_only=False)
+        return self._all_events_cache
+    def _invalidate_cache(self):
+        """Clear caches at start of portfolio analysis."""
+        self._all_events_cache = None
+        self._pattern_cache = {}
     def analyze_event(self, event_id: str) -> Optional[EventPacing]:
         """Ticket-count based analysis. Compares raw tickets sold at N days out
         against historical ticket counts at the same days-out for past editions."""
@@ -1633,7 +1646,7 @@ class DecisionEngine:
         cac = spend / tickets if tickets > 0 else 0
         # --- Find all past editions of this event pattern ---
         pattern = self._get_pattern(event['name'])
-        all_events = self.db.get_events(upcoming_only=False)
+        all_events = self._get_all_events()
         historical_comparisons = []
         hist_tickets_at_point = []
         comparison_events = []
@@ -1874,7 +1887,7 @@ class DecisionEngine:
         total_current_days = len(all_current_dates)
 
         historical_comparisons = []
-        all_events = self.db.get_events()
+        all_events = self._get_all_events()
         # Group ALL past events by (year) first, then by sorted date within that year
         past_by_year = defaultdict(list)
         for pe in all_events:
@@ -2011,6 +2024,7 @@ class DecisionEngine:
         )
     def analyze_portfolio(self) -> List[EventPacing]:
         """Analyze all upcoming events, grouping timed-entry events by day."""
+        self._invalidate_cache()
         events = self.db.get_events(upcoming_only=True)
         analyses = []
         for event in events:
