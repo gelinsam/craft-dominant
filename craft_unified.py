@@ -628,6 +628,7 @@ class Database:
                            momentum: str = None,
                            group_size: str = None,
                            min_social_influence: float = None,
+                           timing_segment: str = None,
                            limit: int = 5000) -> List[dict]:
         """Query customer_event_profiles scoped to a specific event type + city.
         This is the primary CRM query — every audience comes through here."""
@@ -663,6 +664,9 @@ class Database:
         if min_social_influence is not None:
             query += " AND cep.social_influence_score >= ?"
             params.append(min_social_influence)
+        if timing_segment:
+            query += " AND cep.timing_segment = ?"
+            params.append(timing_segment)
         query += " ORDER BY cep.ltv_score DESC LIMIT ?"
         params.append(limit)
         rows = self.conn.execute(query, params).fetchall()
@@ -1485,7 +1489,7 @@ class EventbriteSync:
         keyfunc = lambda r: (r['email'], r['event_type'], r['city'])
         groups = defaultdict(list)
         for r in rows:
-            groups[(r['email'], r['event_type'], r['city'])].append(r)
+            groups[(r['email'], r['event_type'], r['city'])].append(dict(r))
         # Per-scope RFM: collect stats for quintile calculation
         scope_stats = []  # (email, event_type, city, days_since, order_count, total_spent)
         for (email, etype, city), orders in groups.items():
