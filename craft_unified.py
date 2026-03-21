@@ -242,6 +242,37 @@ CREATE TABLE IF NOT EXISTS ad_spend (
     clicks INTEGER DEFAULT 0,
     UNIQUE(event_id, spend_date, campaign_id)
 );
+-- Customer event profiles: per-(event_type, city) scoped metrics
+-- This is the SOURCE OF TRUTH for retargeting — every query scopes through this table
+CREATE TABLE IF NOT EXISTS customer_event_profiles (
+    email TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    city TEXT NOT NULL,
+    orders_in_scope INTEGER DEFAULT 0,
+    tickets_in_scope INTEGER DEFAULT 0,
+    spent_in_scope REAL DEFAULT 0,
+    events_in_scope INTEGER DEFAULT 0,
+    first_order_date TEXT,
+    last_order_date TEXT,
+    days_since_last INTEGER DEFAULT 0,
+    avg_order_value REAL DEFAULT 0,
+    avg_tickets_per_order REAL DEFAULT 0,
+    avg_days_between_orders REAL DEFAULT 0,
+    avg_days_before_event REAL DEFAULT 0,
+    timing_segment TEXT,
+    rfm_r INTEGER DEFAULT 0,
+    rfm_f INTEGER DEFAULT 0,
+    rfm_m INTEGER DEFAULT 0,
+    rfm_segment TEXT,
+    ltv_score REAL DEFAULT 0,
+    is_superspreader INTEGER DEFAULT 0,
+    is_vip INTEGER DEFAULT 0,
+    churn_risk_level TEXT,  -- critical, urgent, watch, healthy, NULL
+    days_until_churn INTEGER,
+    gap_ratio REAL DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (email, event_type, city)
+);
 -- Analysis cache
 CREATE TABLE IF NOT EXISTS analysis_cache (
     event_id TEXT PRIMARY KEY,
@@ -257,6 +288,11 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_days ON daily_snapshots(days_before_eve
 CREATE INDEX IF NOT EXISTS idx_customers_segment ON customers(rfm_segment);
 CREATE INDEX IF NOT EXISTS idx_customers_ltv ON customers(ltv_score DESC);
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);
+CREATE INDEX IF NOT EXISTS idx_cep_type_city ON customer_event_profiles(event_type, city);
+CREATE INDEX IF NOT EXISTS idx_cep_segment ON customer_event_profiles(rfm_segment);
+CREATE INDEX IF NOT EXISTS idx_cep_superspreader ON customer_event_profiles(is_superspreader);
+CREATE INDEX IF NOT EXISTS idx_cep_vip ON customer_event_profiles(is_vip);
+CREATE INDEX IF NOT EXISTS idx_cep_churn ON customer_event_profiles(churn_risk_level);
 """
 class Database:
     """Unified database for all Craft data."""
@@ -490,6 +526,115 @@ class Database:
             ORDER BY favorite_event_type
         """).fetchall()
         return [r['favorite_event_type'] for r in rows]
+    # === Event-Scoped Customer Profiles ===
+    def upsert_event_profile(self, profile: dict):
+        """Insert or update a customer_event_profiles row."""
+        self.conn.execute("""
+            INSERT INTO customer_event_profiles
+                (email, event_type, city, orders_in_scope, tickets_in_scope, spent_in_scope,
+                 events_in_scope, first_order_date, last_order_date, days_since_last,
+                 avg_order_value, avg_tickets_per_order, avg_days_between_orders,
+                 avg_days_before_event, timing_segment, rfm_r, rfm_f, rfm_m, rfm_segment,
+                 ltv_score, is_superspreader, is_vip, churn_risk_level, days_until_churn,
+                 gap_ratio, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(email, event_type, city) DO UPDATE SET
+                orders_in_scope=excluded.orders_in_scope,
+                tickets_in_scope=excluded.tickets_in_scope,
+                spent_in_scope=excluded.spent_in_scope,
+                events_in_scope=excluded.events_in_scope,
+                first_order_date=excluded.first_order_date,
+                last_order_date=excluded.last_order_date,
+                days_since_last=excluded.days_since_last,
+                avg_order_value=excluded.avg_order_value,
+                avg_tickets_per_order=excluded.avg_tickets_per_order,
+                avg_days_between_orders=excluded.avg_days_between_orders,
+                avg_days_before_event=excluded.avg_days_before_event,
+                timing_segment=excluded.timing_segment,
+                rfm_r=excluded.rfm_r, rfm_f=excluded.rfm_f, rfm_m=excluded.rfm_m,
+                rfm_segment=excluded.rfm_segment,
+                ltv_score=excluded.ltv_score,
+                is_superspreader=excluded.is_superspreader,
+                is_vip=excluded.is_vip,
+                churn_risk_level=excluded.churn_risk_level,
+                days_until_churn=excluded.days_until_churn,
+                gap_ratio=excluded.gap_ratio,
+                updated_at=excluded.updated_at
+        """, (
+            profile['email'], profile['event_type'], profile['city'],
+            profile['orders_in_scope'], profile['tickets_in_scope'], profile['spent_in_scope'],
+            profile['events_in_scope'], profile['first_order_date'], profile['last_order_date'],
+            profile['days_since_last'], profile['avg_order_value'], profile['avg_tickets_per_order'],
+            profile['avg_days_between_orders'], profile['avg_days_before_event'],
+            profile['timing_segment'], profile['rfm_r'], profile['rfm_f'], profile['rfm_m'],
+            profile['rfm_segment'], profile['ltv_score'],
+            profile['is_superspreader'], profile['is_vip'],
+            profile['churn_risk_level'], profile['days_until_churn'], profile['gap_ratio'],
+            datetime.now().isoformat()
+        ))
+        self.conn.commit()
+
+    def get_event_profiles(self, event_type: str, city: str,
+                           segment: str = None, min_ltv: float = None,
+                           superspreaders_only: bool = False,
+                           vips_only: bool = False,
+                           churn_levels: list = None,
+                           limit: int = 5000) -> List[dict]:
+        """Query customer_event_profiles scoped to a specific event type + city.
+        This is the primary CRM query — every audience comes through here."""
+        query = """
+            SELECT cep.*, c.total_orders as global_orders, c.total_spent as global_spent,
+                   c.total_events as global_events, c.favorite_event_type, c.favorite_city,
+                   c.event_types, c.cities, c.events_attended
+            FROM customer_event_profiles cep
+            JOIN customers c ON cep.email = c.email
+            WHERE cep.event_type = ? AND cep.city = ?
+        """
+        params: list = [event_type, city]
+        if segment:
+            query += " AND cep.rfm_segment = ?"
+            params.append(segment)
+        if min_ltv is not None:
+            query += " AND cep.ltv_score >= ?"
+            params.append(min_ltv)
+        if superspreaders_only:
+            query += " AND cep.is_superspreader = 1"
+        if vips_only:
+            query += " AND cep.is_vip = 1"
+        if churn_levels:
+            ph = ','.join(['?' for _ in churn_levels])
+            query += f" AND cep.churn_risk_level IN ({ph})"
+            params.extend(churn_levels)
+        query += " ORDER BY cep.ltv_score DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_event_profile_segment_counts(self, event_type: str, city: str) -> Dict[str, int]:
+        """Segment counts scoped to a specific event type + city."""
+        rows = self.conn.execute("""
+            SELECT rfm_segment, COUNT(*) as cnt
+            FROM customer_event_profiles
+            WHERE event_type = ? AND city = ? AND rfm_segment IS NOT NULL
+            GROUP BY rfm_segment
+        """, (event_type, city)).fetchall()
+        return {r['rfm_segment']: r['cnt'] for r in rows}
+
+    def get_event_profile_stats(self, event_type: str, city: str) -> dict:
+        """Summary stats for an event type + city audience."""
+        row = self.conn.execute("""
+            SELECT COUNT(*) as total_customers,
+                   SUM(CASE WHEN is_superspreader = 1 THEN 1 ELSE 0 END) as superspreaders,
+                   SUM(CASE WHEN is_vip = 1 THEN 1 ELSE 0 END) as vips,
+                   SUM(CASE WHEN churn_risk_level IN ('critical', 'urgent') THEN 1 ELSE 0 END) as churn_risk,
+                   AVG(ltv_score) as avg_ltv,
+                   SUM(spent_in_scope) as total_spent,
+                   AVG(avg_tickets_per_order) as avg_tickets
+            FROM customer_event_profiles
+            WHERE event_type = ? AND city = ?
+        """, (event_type, city)).fetchone()
+        return dict(row) if row else {}
+
     def get_segment_counts(self, event_type: str = None, city: str = None) -> Dict[str, int]:
         """Get segment counts, optionally scoped to an event type/city."""
         query = """
@@ -1248,7 +1393,168 @@ class EventbriteSync:
             if customer:
                 self.db.upsert_customer(customer)
                 count += 1
+        # After building global profiles, build event-scoped profiles
+        self._build_event_profiles()
         return count
+
+    def _build_event_profiles(self):
+        """Build per-(event_type, city) customer profiles from orders.
+        This is the heart of the CRM — every segment label is scoped to a specific
+        event type + city combination so retargeting never commingles data."""
+        log.info("Building event-scoped customer profiles...")
+        # Fetch all orders joined with event metadata in one query
+        rows = self.db.conn.execute("""
+            SELECT o.email, o.order_timestamp, o.ticket_count, o.gross_amount,
+                   o.days_before_event, e.event_type, e.city, e.name as event_name,
+                   e.event_id
+            FROM orders o
+            JOIN events e ON o.event_id = e.event_id
+            WHERE e.event_type IS NOT NULL AND e.event_type != ''
+              AND e.city IS NOT NULL AND e.city != ''
+            ORDER BY o.email, e.event_type, e.city, o.order_timestamp
+        """).fetchall()
+        if not rows:
+            log.info("No orders with event_type/city metadata — skipping event profiles")
+            return
+        # Group by (email, event_type, city)
+        from itertools import groupby
+        keyfunc = lambda r: (r['email'], r['event_type'], r['city'])
+        groups = defaultdict(list)
+        for r in rows:
+            groups[(r['email'], r['event_type'], r['city'])].append(r)
+        # Per-scope RFM: collect stats for quintile calculation
+        scope_stats = []  # (email, event_type, city, days_since, order_count, total_spent)
+        for (email, etype, city), orders in groups.items():
+            total_spent = sum(o['gross_amount'] or 0 for o in orders)
+            last_date = max(o['order_timestamp'] for o in orders)
+            try:
+                days_since = (datetime.now() - datetime.fromisoformat(last_date)).days
+            except:
+                days_since = 999
+            scope_stats.append({
+                'key': (email, etype, city),
+                'days_since': days_since,
+                'order_count': len(orders),
+                'total_spent': total_spent,
+            })
+        # Calculate per-scope RFM quintiles (across all customers in ALL scopes together)
+        recency_vals = sorted([s['days_since'] for s in scope_stats])
+        frequency_vals = sorted([s['order_count'] for s in scope_stats])
+        monetary_vals = sorted([s['total_spent'] for s in scope_stats])
+        def _quintile(value, sorted_list, reverse=False):
+            n = len(sorted_list)
+            if n == 0:
+                return 3
+            # Binary search for position
+            lo, hi = 0, n - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if sorted_list[mid] < value:
+                    lo = mid + 1
+                elif sorted_list[mid] > value:
+                    hi = mid - 1
+                else:
+                    lo = mid
+                    break
+            pct = lo / n
+            if reverse:
+                pct = 1 - pct
+            if pct >= 0.8: return 5
+            elif pct >= 0.6: return 4
+            elif pct >= 0.4: return 3
+            elif pct >= 0.2: return 2
+            return 1
+        # Build quintile lookup
+        quintile_map = {}
+        for s in scope_stats:
+            k = s['key']
+            quintile_map[k] = {
+                'rfm_r': _quintile(s['days_since'], recency_vals, reverse=True),
+                'rfm_f': _quintile(s['order_count'], frequency_vals),
+                'rfm_m': _quintile(s['total_spent'], monetary_vals),
+            }
+        # Build and upsert each profile
+        count = 0
+        for (email, etype, city), orders in groups.items():
+            n_orders = len(orders)
+            total_tickets = sum(o['ticket_count'] or 1 for o in orders)
+            total_spent = sum(o['gross_amount'] or 0 for o in orders)
+            event_ids = set(o['event_id'] for o in orders)
+            timestamps = [o['order_timestamp'] for o in orders]
+            first_date = min(timestamps)
+            last_date = max(timestamps)
+            try:
+                days_since = (datetime.now() - datetime.fromisoformat(last_date)).days
+            except:
+                days_since = 0
+            avg_order = total_spent / n_orders if n_orders > 0 else 0
+            avg_tickets = total_tickets / n_orders if n_orders > 0 else 0
+            # Days between orders (scoped)
+            avg_gap = 0
+            if n_orders > 1:
+                try:
+                    sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
+                    gaps = [(sorted_dates[i+1] - sorted_dates[i]).days for i in range(len(sorted_dates)-1)]
+                    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                except:
+                    avg_gap = 0
+            # Avg days before event (scoped)
+            dbefore = [o['days_before_event'] for o in orders if o['days_before_event'] is not None]
+            avg_days_before = sum(dbefore) / len(dbefore) if dbefore else 0
+            # Timing segment
+            if avg_days_before >= 45: timing = 'super_early_bird'
+            elif avg_days_before >= 28: timing = 'early_bird'
+            elif avg_days_before >= 14: timing = 'planner'
+            elif avg_days_before >= 7: timing = 'spontaneous'
+            else: timing = 'last_minute'
+            # Scoped RFM
+            q = quintile_map.get((email, etype, city), {'rfm_r': 3, 'rfm_f': 3, 'rfm_m': 3})
+            rfm_r, rfm_f, rfm_m = q['rfm_r'], q['rfm_f'], q['rfm_m']
+            if rfm_r >= 4 and rfm_f >= 4 and rfm_m >= 4: segment = 'champion'
+            elif rfm_r >= 3 and rfm_f >= 3: segment = 'loyal'
+            elif rfm_r >= 3 and rfm_f <= 2: segment = 'potential'
+            elif rfm_r <= 2 and rfm_f >= 3 and rfm_m >= 3: segment = 'at_risk'
+            elif rfm_r <= 2 and rfm_f <= 2: segment = 'hibernating'
+            else: segment = 'other'
+            # Scoped LTV
+            ltv_score = ((rfm_r * 15) + (rfm_f * 10) + (rfm_m * 15) + min(25, n_orders * 5)) / 2.25
+            ltv_score = min(100, max(0, ltv_score))
+            # Superspreader flag (avg 1.5+ tickets per order, 2+ orders in scope)
+            is_superspreader = 1 if avg_tickets >= 1.5 and n_orders >= 2 else 0
+            # VIP flag (3+ events in scope, $200+ spent in scope)
+            is_vip = 1 if len(event_ids) >= 3 and total_spent >= 200 else 0
+            # Churn risk (scoped)
+            churn_risk_level = None
+            days_until_churn = None
+            gap_ratio = 0.0
+            if n_orders >= 2 and avg_gap > 0 and days_since >= (avg_gap * 0.7):
+                gap_ratio = days_since / avg_gap
+                churn_threshold = avg_gap * 2.0
+                days_until_churn = max(0, int(churn_threshold - days_since))
+                if days_until_churn < 14: churn_risk_level = 'critical'
+                elif days_until_churn < 30: churn_risk_level = 'urgent'
+                elif days_until_churn < 60: churn_risk_level = 'watch'
+                else: churn_risk_level = 'healthy'
+            self.db.upsert_event_profile({
+                'email': email, 'event_type': etype, 'city': city,
+                'orders_in_scope': n_orders, 'tickets_in_scope': total_tickets,
+                'spent_in_scope': total_spent, 'events_in_scope': len(event_ids),
+                'first_order_date': first_date, 'last_order_date': last_date,
+                'days_since_last': days_since, 'avg_order_value': round(avg_order, 2),
+                'avg_tickets_per_order': round(avg_tickets, 2),
+                'avg_days_between_orders': round(avg_gap, 1),
+                'avg_days_before_event': round(avg_days_before, 1),
+                'timing_segment': timing,
+                'rfm_r': rfm_r, 'rfm_f': rfm_f, 'rfm_m': rfm_m,
+                'rfm_segment': segment, 'ltv_score': round(ltv_score, 1),
+                'is_superspreader': is_superspreader, 'is_vip': is_vip,
+                'churn_risk_level': churn_risk_level,
+                'days_until_churn': days_until_churn,
+                'gap_ratio': round(gap_ratio, 2),
+            })
+            count += 1
+        log.info(f"Built {count} event-scoped customer profiles across {len(set((e,c) for (_, e, c) in groups.keys()))} scopes")
+
     def _build_customer_profile(self, email: str, orders: List[dict],
                                  rfm_r: int, rfm_f: int, rfm_m: int) -> Optional[Customer]:
         if not orders:
@@ -2636,27 +2942,24 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 event['event_type'], city=event.get('city', ''), exclude_emails=all_exclude, limit=1000
             )
         type_value = sum(c.get('total_spent', 0) for c in type_prospects)
-        # 4. At-risk with affinity — require BOTH city AND event type match
-        #    Someone who went to "DC Comedy Show" is not a win-back for "DC Beer Fest"
+        # 4. At-risk with affinity — use event_profiles for scoped churn data
+        #    Only people who actually attended THIS event type in THIS city
         all_already_listed = {c['email'] for c in past_attendees}
         all_already_listed.update({c['email'] for c in city_prospects})
         all_already_listed.update({c['email'] for c in type_prospects})
         all_already_listed.update(current_buyers)
-        at_risk = db.get_at_risk_customers(min_orders=2, min_days_inactive=180)
         at_risk_for_event = []
-        for c in at_risk:
-            if c['email'] in all_already_listed:
-                continue
-            ecities = c.get('cities', '{}')
-            etypes = c.get('event_types', '{}')
-            city_match = _json_key_match(ecities, event.get('city'))
-            type_match = _json_key_match(etypes, event.get('event_type'))
-            # Must match BOTH city and event type — no random event-goers
-            if not (city_match and type_match):
-                continue
-            at_risk_for_event.append(c)
-        at_risk_for_event.sort(key=lambda x: -(x.get('total_spent', 0) or 0))
-        at_risk_value = sum(c.get('total_spent', 0) for c in at_risk_for_event)
+        _et = event.get('event_type', '')
+        _ec = event.get('city', '')
+        if _et and _ec:
+            at_risk_profiles = db.get_event_profiles(
+                _et, _ec, churn_levels=['critical', 'urgent', 'watch']
+            )
+            for c in at_risk_profiles:
+                if c['email'] not in all_already_listed:
+                    at_risk_for_event.append(c)
+        at_risk_for_event.sort(key=lambda x: -(x.get('spent_in_scope', 0) or 0))
+        at_risk_value = sum(c.get('spent_in_scope', 0) for c in at_risk_for_event)
         # ---- QUICK WIN CALCULATION ----
         # Estimate: if we email top-priority past attendees, how many tickets at historical rebuy rate?
         historical_rebuy_rate = repeat_rate / 100 if repeat_rate > 0 else 0.10  # default 10%
@@ -3007,20 +3310,19 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             }
 
         # ---- 5. SUPER-SPREADERS (+1 GOLD MINE) ----
-        # Filter at DB level — only spreaders relevant to this event's city/type
-        spreaders = db.get_multi_ticket_buyers(
-            min_avg_tickets=1.5,
-            event_type=event.get('event_type'),
-            city=event.get('city')
-        )
+        # Query from event_profiles — scoped to this event's type+city, no commingling
+        _et = event.get('event_type', '')
+        _ec = event.get('city', '')
         relevant_spreaders = []
         total_plus_ones = 0
-        for s in spreaders:
-            est_plus_ones = round((s.get('avg_tickets_per_order', 1) - 1) * s.get('total_orders', 1), 0)
-            s['estimated_plus_ones'] = int(est_plus_ones)
-            total_plus_ones += int(est_plus_ones)
-            relevant_spreaders.append(s)
-        relevant_spreaders.sort(key=lambda x: -(x.get('avg_tickets_per_order', 0)))
+        if _et and _ec:
+            spreader_profiles = db.get_event_profiles(_et, _ec, superspreaders_only=True)
+            for s in spreader_profiles:
+                est_plus_ones = round((s.get('avg_tickets_per_order', 1) - 1) * s.get('orders_in_scope', 1), 0)
+                s['estimated_plus_ones'] = int(est_plus_ones)
+                total_plus_ones += int(est_plus_ones)
+                relevant_spreaders.append(s)
+            relevant_spreaders.sort(key=lambda x: -(x.get('avg_tickets_per_order', 0)))
         spreader_intel = {
             'total_spreaders': len(relevant_spreaders),
             'total_estimated_plus_ones': total_plus_ones,
@@ -3056,16 +3358,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 })
 
         # ---- 7. CHURN PREDICTION WITH SAVE WINDOWS ----
-        # Filter at DB level — only churn risks relevant to this event's city/type
-        event_churn = db.get_churn_risk_customers(
-            event_type=event.get('event_type'),
-            city=event.get('city')
-        )
+        # Query from event_profiles — scoped churn risk per event type+city
         churn_by_window = {'critical': [], 'urgent': [], 'watch': []}
-        for c in event_churn:
-            window = c.get('save_window', 'watch')
-            if window in churn_by_window:
-                churn_by_window[window].append(c)
+        event_churn = []
+        if _et and _ec:
+            event_churn = db.get_event_profiles(_et, _ec, churn_levels=['critical', 'urgent', 'watch'])
+            for c in event_churn:
+                window = c.get('churn_risk_level', 'watch')
+                if window in churn_by_window:
+                    churn_by_window[window].append(c)
         churn_intel = {
             'total_at_risk': len(event_churn),
             'critical': len(churn_by_window['critical']),
@@ -3073,24 +3374,22 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'watch': len(churn_by_window['watch']),
             'critical_customers': churn_by_window['critical'][:20],
             'urgent_customers': churn_by_window['urgent'][:20],
-            'total_value_at_risk': round(sum(c.get('total_spent', 0) for c in event_churn), 2),
+            'total_value_at_risk': round(sum(c.get('spent_in_scope', 0) for c in event_churn), 2),
             'recommendation': f'Email {len(churn_by_window["critical"])} critical-window customers THIS WEEK or lose them. {len(churn_by_window["urgent"])} more in the next 30 days.' if churn_by_window['critical'] else f'{len(churn_by_window["urgent"])} customers in urgent save window.',
         }
 
         # ---- 8. VIP IDENTIFICATION ----
-        # Filter at DB level — only VIPs relevant to this event's city/type
-        relevant_vips = db.get_vip_customers(
-            min_events=3, min_spent=200, limit=50,
-            event_type=event.get('event_type'),
-            city=event.get('city')
-        )
-        for v in relevant_vips:
-            v['already_bought'] = v['email'] in current_buyers
+        # Query from event_profiles — scoped VIPs per event type+city
+        relevant_vips = []
+        if _et and _ec:
+            relevant_vips = db.get_event_profiles(_et, _ec, vips_only=True)
+            for v in relevant_vips:
+                v['already_bought'] = v['email'] in current_buyers
         vip_not_bought = [v for v in relevant_vips if not v.get('already_bought')]
         vip_intel = {
             'total_vips': len(relevant_vips),
             'vips_not_bought': len(vip_not_bought),
-            'vip_total_value': round(sum(v.get('total_spent', 0) for v in relevant_vips), 2),
+            'vip_total_value': round(sum(v.get('spent_in_scope', 0) for v in relevant_vips), 2),
             'top_vips': relevant_vips[:20],
             'unbought_vips': vip_not_bought[:20],
             'recommendation': f'{len(vip_not_bought)} VIPs haven\'t bought yet — white-glove outreach, personal invite.' if vip_not_bought else 'All relevant VIPs have purchased!',
@@ -3253,25 +3552,23 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 event.get('event_type', ''), event.get('city', ''),
                 exclude_emails=current_buyers, limit=5000)
         elif audience == 'super_spreaders':
-            customers_list = db.get_multi_ticket_buyers(
-                min_avg_tickets=1.5,
-                event_type=event.get('event_type'),
-                city=event.get('city')
-            )
+            _et = event.get('event_type', '')
+            _ec = event.get('city', '')
+            if _et and _ec:
+                customers_list = db.get_event_profiles(_et, _ec, superspreaders_only=True)
         elif audience == 'vips':
-            vips = db.get_vip_customers(
-                min_events=3, min_spent=200, limit=200,
-                event_type=event.get('event_type'),
-                city=event.get('city')
-            )
-            customers_list = [v for v in vips if v['email'] not in current_buyers]
+            _et = event.get('event_type', '')
+            _ec = event.get('city', '')
+            if _et and _ec:
+                vips = db.get_event_profiles(_et, _ec, vips_only=True)
+                customers_list = [v for v in vips if v['email'] not in current_buyers]
         elif audience == 'churn_critical':
-            churn = db.get_churn_risk_customers(
-                event_type=event.get('event_type'),
-                city=event.get('city')
-            )
-            customers_list = [c for c in churn
-                              if c.get('save_window') in ('critical', 'urgent')]
+            _et = event.get('event_type', '')
+            _ec = event.get('city', '')
+            if _et and _ec:
+                customers_list = db.get_event_profiles(
+                    _et, _ec, churn_levels=['critical', 'urgent']
+                )
         # Build CSV
         output = io.StringIO()
         fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
