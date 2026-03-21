@@ -131,7 +131,7 @@ const EventDetail = ({ event }) => {
                 const spendDelta = prevSpend > 0 ? ((currSpend - prevSpend) / prevSpend * 100) : null;
                 return (
                 <tr key={i} className="border-b border-gray-100">
-                  <td className="py-2"><div className="font-medium">{h.year}</div><div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}</div></td>
+                  <td className="py-2"><div className="font-medium">{h.year}</div><div className="text-xs text-gray-400">{h.event_date?.slice(0, 10)}{h.day_of_week ? ` \u2022 ${h.day_of_week.slice(0,3)}` : ''}</div></td>
                   <td className="text-right py-2 font-medium">{h.at_days_out ? `${h.at_days_out.tickets.toLocaleString()} (${h.at_days_out.sell_through?.toFixed(1)}%)` : '\u2014'}</td>
                   <td className="text-right py-2">
                     {currSpend > 0 ? <span className="font-medium">${currSpend.toLocaleString()}</span> : '\u2014'}
