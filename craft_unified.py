@@ -490,13 +490,25 @@ class Database:
             ORDER BY favorite_event_type
         """).fetchall()
         return [r['favorite_event_type'] for r in rows]
-    def get_segment_counts(self) -> Dict[str, int]:
-        rows = self.conn.execute("""
+    def get_segment_counts(self, event_type: str = None, city: str = None) -> Dict[str, int]:
+        """Get segment counts, optionally scoped to an event type/city."""
+        query = """
             SELECT rfm_segment, COUNT(*) as cnt
             FROM customers
             WHERE rfm_segment IS NOT NULL AND rfm_segment != ''
-            GROUP BY rfm_segment
-        """).fetchall()
+        """
+        params: list = []
+        if event_type and city:
+            query += " AND (event_types LIKE ? OR cities LIKE ?)"
+            params.extend([f'%"{event_type}"%', f'%"{city}"%'])
+        elif event_type:
+            query += " AND event_types LIKE ?"
+            params.append(f'%"{event_type}"%')
+        elif city:
+            query += " AND cities LIKE ?"
+            params.append(f'%"{city}"%')
+        query += " GROUP BY rfm_segment"
+        rows = self.conn.execute(query, params).fetchall()
         return {r['rfm_segment']: r['cnt'] for r in rows}
     def get_high_value_customers(self, event_type: str = None, city: str = None,
                                  min_ltv: float = 50, limit: int = 500) -> List[dict]:
@@ -513,13 +525,26 @@ class Database:
         params.append(limit)
         rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
-    def get_at_risk_customers(self, min_orders: int = 2, min_days_inactive: int = 180) -> List[dict]:
-        """Get customers who used to be active but haven't purchased recently."""
-        rows = self.conn.execute("""
+    def get_at_risk_customers(self, min_orders: int = 2, min_days_inactive: int = 180,
+                               event_type: str = None, city: str = None) -> List[dict]:
+        """Get customers who used to be active but haven't purchased recently.
+        Optionally filter to customers relevant to a specific event type/city."""
+        query = """
             SELECT * FROM customers
             WHERE total_orders >= ? AND days_since_last >= ?
-            ORDER BY total_spent DESC
-        """, (min_orders, min_days_inactive)).fetchall()
+        """
+        params: list = [min_orders, min_days_inactive]
+        if event_type and city:
+            query += " AND (event_types LIKE ? OR cities LIKE ?)"
+            params.extend([f'%"{event_type}"%', f'%"{city}"%'])
+        elif event_type:
+            query += " AND event_types LIKE ?"
+            params.append(f'%"{event_type}"%')
+        elif city:
+            query += " AND cities LIKE ?"
+            params.append(f'%"{city}"%')
+        query += " ORDER BY total_spent DESC"
+        rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
     # === Intelligence Queries ===
     def get_cross_sell_candidates(self, event_type: str, city: str,
@@ -564,13 +589,26 @@ class Database:
         results.sort(key=lambda x: -(x.get('ltv_score', 0) or 0))
         return results
 
-    def get_multi_ticket_buyers(self, min_avg_tickets: float = 1.5) -> List[dict]:
-        """Find super-spreaders: customers who consistently buy 2+ tickets (bringing friends)."""
-        rows = self.conn.execute("""
+    def get_multi_ticket_buyers(self, min_avg_tickets: float = 1.5,
+                                event_type: str = None, city: str = None) -> List[dict]:
+        """Find super-spreaders who match a specific event's city/type.
+        Filters at SQL level to avoid returning irrelevant global data."""
+        query = """
             SELECT * FROM customers
             WHERE avg_tickets_per_order >= ? AND total_orders >= 2
-            ORDER BY avg_tickets_per_order DESC, total_spent DESC
-        """, (min_avg_tickets,)).fetchall()
+        """
+        params: list = [min_avg_tickets]
+        if event_type and city:
+            query += " AND (event_types LIKE ? OR cities LIKE ?)"
+            params.extend([f'%"{event_type}"%', f'%"{city}"%'])
+        elif event_type:
+            query += " AND event_types LIKE ?"
+            params.append(f'%"{event_type}"%')
+        elif city:
+            query += " AND cities LIKE ?"
+            params.append(f'%"{city}"%')
+        query += " ORDER BY avg_tickets_per_order DESC, total_spent DESC"
+        rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_promo_code_stats(self, event_id: str = None) -> List[dict]:
@@ -613,10 +651,12 @@ class Database:
         """, (event_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    def get_churn_risk_customers(self, lookback_window: int = 90) -> List[dict]:
+    def get_churn_risk_customers(self, lookback_window: int = 90,
+                                 event_type: str = None, city: str = None) -> List[dict]:
         """Find customers approaching their churn point based on purchase gap patterns.
-        If avg_days_between_orders is 120 and they're at 100 days since last, they're at risk."""
-        rows = self.conn.execute("""
+        If avg_days_between_orders is 120 and they're at 100 days since last, they're at risk.
+        Optionally filter to customers relevant to a specific event type/city."""
+        query = """
             SELECT *,
                    CASE WHEN avg_days_between_orders > 0
                         THEN CAST(days_since_last AS REAL) / avg_days_between_orders
@@ -625,8 +665,19 @@ class Database:
             WHERE total_orders >= 2
               AND avg_days_between_orders > 0
               AND days_since_last >= (avg_days_between_orders * 0.7)
-            ORDER BY gap_ratio DESC
-        """).fetchall()
+        """
+        params: list = []
+        if event_type and city:
+            query += " AND (event_types LIKE ? OR cities LIKE ?)"
+            params.extend([f'%"{event_type}"%', f'%"{city}"%'])
+        elif event_type:
+            query += " AND event_types LIKE ?"
+            params.append(f'%"{event_type}"%')
+        elif city:
+            query += " AND cities LIKE ?"
+            params.append(f'%"{city}"%')
+        query += " ORDER BY gap_ratio DESC"
+        rows = self.conn.execute(query, params).fetchall()
         results = []
         for r in rows:
             d = dict(r)
@@ -643,14 +694,27 @@ class Database:
         return results
 
     def get_vip_customers(self, min_events: int = 3, min_spent: float = 200,
-                           limit: int = 100) -> List[dict]:
-        """Identify VIP customers — top spenders with high attendance."""
-        rows = self.conn.execute("""
+                           limit: int = 100,
+                           event_type: str = None, city: str = None) -> List[dict]:
+        """Identify VIP customers — top spenders with high attendance.
+        Optionally filter to customers relevant to a specific event type/city."""
+        query = """
             SELECT * FROM customers
             WHERE total_events >= ? AND total_spent >= ?
-            ORDER BY total_spent DESC
-            LIMIT ?
-        """, (min_events, min_spent, limit)).fetchall()
+        """
+        params: list = [min_events, min_spent]
+        if event_type and city:
+            query += " AND (event_types LIKE ? OR cities LIKE ?)"
+            params.extend([f'%"{event_type}"%', f'%"{city}"%'])
+        elif event_type:
+            query += " AND event_types LIKE ?"
+            params.append(f'%"{event_type}"%')
+        elif city:
+            query += " AND cities LIKE ?"
+            params.append(f'%"{city}"%')
+        query += " ORDER BY total_spent DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_event_ticket_types(self, event_id: str) -> List[dict]:
@@ -2354,19 +2418,36 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         return jsonify(db.get_distinct_event_types())
     @app.route('/api/customers/high-value')
     def high_value_customers():
-        """High value customers for targeting."""
+        """High value customers for targeting — scoped to event context when event_id provided."""
+        event_id = request.args.get('event_id')
         event_type = request.args.get('event_type')
         city = request.args.get('city')
+        # If event_id provided, resolve city/type from event
+        if event_id and (not event_type or not city):
+            event = db.get_event(event_id)
+            if event:
+                event_type = event_type or event.get('event_type')
+                city = city or event.get('city')
         min_ltv = request.args.get('min_ltv', 50, type=float)
         limit = request.args.get('limit', 500, type=int)
         customers = db.get_high_value_customers(event_type, city, min_ltv, limit)
         return jsonify({'customers': customers, 'count': len(customers)})
     @app.route('/api/customers/at-risk')
     def at_risk_customers():
-        """At-risk customers for reactivation."""
+        """At-risk customers for reactivation — scoped to event context when event_id provided."""
+        event_id = request.args.get('event_id')
+        event_type = request.args.get('event_type')
+        city = request.args.get('city')
+        # If event_id provided, resolve city/type from event
+        if event_id and (not event_type or not city):
+            event = db.get_event(event_id)
+            if event:
+                event_type = event_type or event.get('event_type')
+                city = city or event.get('city')
         min_orders = request.args.get('min_orders', 2, type=int)
         min_inactive = request.args.get('min_inactive', 180, type=int)
-        customers = db.get_at_risk_customers(min_orders, min_inactive)
+        customers = db.get_at_risk_customers(min_orders, min_inactive,
+                                              event_type=event_type, city=city)
         total_value = sum(c['total_spent'] for c in customers)
         return jsonify({
             'customers': customers,
@@ -2926,18 +3007,19 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             }
 
         # ---- 5. SUPER-SPREADERS (+1 GOLD MINE) ----
-        spreaders = db.get_multi_ticket_buyers(min_avg_tickets=1.5)
-        # Filter to those relevant to this event (city or type match)
+        # Filter at DB level — only spreaders relevant to this event's city/type
+        spreaders = db.get_multi_ticket_buyers(
+            min_avg_tickets=1.5,
+            event_type=event.get('event_type'),
+            city=event.get('city')
+        )
         relevant_spreaders = []
         total_plus_ones = 0
         for s in spreaders:
-            city_match = _json_key_match(s.get('cities', '{}'), event.get('city'))
-            type_match = _json_key_match(s.get('event_types', '{}'), event.get('event_type'))
-            if city_match or type_match:
-                est_plus_ones = round((s.get('avg_tickets_per_order', 1) - 1) * s.get('total_orders', 1), 0)
-                s['estimated_plus_ones'] = int(est_plus_ones)
-                total_plus_ones += int(est_plus_ones)
-                relevant_spreaders.append(s)
+            est_plus_ones = round((s.get('avg_tickets_per_order', 1) - 1) * s.get('total_orders', 1), 0)
+            s['estimated_plus_ones'] = int(est_plus_ones)
+            total_plus_ones += int(est_plus_ones)
+            relevant_spreaders.append(s)
         relevant_spreaders.sort(key=lambda x: -(x.get('avg_tickets_per_order', 0)))
         spreader_intel = {
             'total_spreaders': len(relevant_spreaders),
@@ -2974,14 +3056,11 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 })
 
         # ---- 7. CHURN PREDICTION WITH SAVE WINDOWS ----
-        churn_risks = db.get_churn_risk_customers()
-        # Filter to event-relevant customers
-        event_churn = []
-        for c in churn_risks:
-            city_match = _json_key_match(c.get('cities', '{}'), event.get('city'))
-            type_match = _json_key_match(c.get('event_types', '{}'), event.get('event_type'))
-            if city_match or type_match:
-                event_churn.append(c)
+        # Filter at DB level — only churn risks relevant to this event's city/type
+        event_churn = db.get_churn_risk_customers(
+            event_type=event.get('event_type'),
+            city=event.get('city')
+        )
         churn_by_window = {'critical': [], 'urgent': [], 'watch': []}
         for c in event_churn:
             window = c.get('save_window', 'watch')
@@ -2999,16 +3078,14 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         }
 
         # ---- 8. VIP IDENTIFICATION ----
-        vips = db.get_vip_customers(min_events=3, min_spent=200, limit=50)
-        # Filter to event-relevant
-        relevant_vips = []
-        for v in vips:
-            city_match = _json_key_match(v.get('cities', '{}'), event.get('city'))
-            type_match = _json_key_match(v.get('event_types', '{}'), event.get('event_type'))
-            if city_match or type_match:
-                already_bought = v['email'] in current_buyers
-                v['already_bought'] = already_bought
-                relevant_vips.append(v)
+        # Filter at DB level — only VIPs relevant to this event's city/type
+        relevant_vips = db.get_vip_customers(
+            min_events=3, min_spent=200, limit=50,
+            event_type=event.get('event_type'),
+            city=event.get('city')
+        )
+        for v in relevant_vips:
+            v['already_bought'] = v['email'] in current_buyers
         vip_not_bought = [v for v in relevant_vips if not v.get('already_bought')]
         vip_intel = {
             'total_vips': len(relevant_vips),
@@ -3176,27 +3253,25 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 event.get('event_type', ''), event.get('city', ''),
                 exclude_emails=current_buyers, limit=5000)
         elif audience == 'super_spreaders':
-            spreaders = db.get_multi_ticket_buyers(min_avg_tickets=1.5)
-            for s in spreaders:
-                city_match = _json_key_match(s.get('cities', '{}'), event.get('city'))
-                type_match = _json_key_match(s.get('event_types', '{}'), event.get('event_type'))
-                if city_match or type_match:
-                    customers_list.append(s)
+            customers_list = db.get_multi_ticket_buyers(
+                min_avg_tickets=1.5,
+                event_type=event.get('event_type'),
+                city=event.get('city')
+            )
         elif audience == 'vips':
-            vips = db.get_vip_customers(min_events=3, min_spent=200, limit=200)
-            for v in vips:
-                city_match = _json_key_match(v.get('cities', '{}'), event.get('city'))
-                type_match = _json_key_match(v.get('event_types', '{}'), event.get('event_type'))
-                if (city_match or type_match) and v['email'] not in current_buyers:
-                    customers_list.append(v)
+            vips = db.get_vip_customers(
+                min_events=3, min_spent=200, limit=200,
+                event_type=event.get('event_type'),
+                city=event.get('city')
+            )
+            customers_list = [v for v in vips if v['email'] not in current_buyers]
         elif audience == 'churn_critical':
-            churn = db.get_churn_risk_customers()
-            for c in churn:
-                if c.get('save_window') in ('critical', 'urgent'):
-                    city_match = _json_key_match(c.get('cities', '{}'), event.get('city'))
-                    type_match = _json_key_match(c.get('event_types', '{}'), event.get('event_type'))
-                    if city_match or type_match:
-                        customers_list.append(c)
+            churn = db.get_churn_risk_customers(
+                event_type=event.get('event_type'),
+                city=event.get('city')
+            )
+            customers_list = [c for c in churn
+                              if c.get('save_window') in ('critical', 'urgent')]
         # Build CSV
         output = io.StringIO()
         fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
