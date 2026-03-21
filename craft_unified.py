@@ -267,9 +267,17 @@ CREATE TABLE IF NOT EXISTS customer_event_profiles (
     ltv_score REAL DEFAULT 0,
     is_superspreader INTEGER DEFAULT 0,
     is_vip INTEGER DEFAULT 0,
-    churn_risk_level TEXT,  -- critical, urgent, watch, healthy, NULL
+    churn_risk_level TEXT,
     days_until_churn INTEGER,
     gap_ratio REAL DEFAULT 0,
+    price_sensitivity REAL DEFAULT 0,
+    social_influence_score REAL DEFAULT 0,
+    cross_event_affinity REAL DEFAULT 0,
+    buying_momentum TEXT,
+    purchase_velocity REAL DEFAULT 0,
+    upgrade_likelihood REAL DEFAULT 0,
+    daypart_preference TEXT,
+    group_size_segment TEXT,
     updated_at TEXT,
     PRIMARY KEY (email, event_type, city)
 );
@@ -278,6 +286,27 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
     event_id TEXT PRIMARY KEY,
     analysis_json TEXT,
     updated_at TEXT
+);
+-- Auto-exports: milestone-triggered exports
+CREATE TABLE IF NOT EXISTS auto_exports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    milestone TEXT NOT NULL,
+    export_type TEXT NOT NULL,
+    audience_count INTEGER DEFAULT 0,
+    audience_emails TEXT,
+    created_at TEXT,
+    sent_notified INTEGER DEFAULT 0,
+    UNIQUE(event_id, milestone, export_type)
+);
+-- Alert log: tracking sent alerts
+CREATE TABLE IF NOT EXISTS alert_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_type TEXT NOT NULL,
+    event_id TEXT,
+    message TEXT,
+    sent_at TEXT,
+    sent_to TEXT
 );
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_orders_event ON orders(event_id);
@@ -293,6 +322,9 @@ CREATE INDEX IF NOT EXISTS idx_cep_segment ON customer_event_profiles(rfm_segmen
 CREATE INDEX IF NOT EXISTS idx_cep_superspreader ON customer_event_profiles(is_superspreader);
 CREATE INDEX IF NOT EXISTS idx_cep_vip ON customer_event_profiles(is_vip);
 CREATE INDEX IF NOT EXISTS idx_cep_churn ON customer_event_profiles(churn_risk_level);
+CREATE INDEX IF NOT EXISTS idx_cep_momentum ON customer_event_profiles(buying_momentum);
+CREATE INDEX IF NOT EXISTS idx_cep_group ON customer_event_profiles(group_size_segment);
+CREATE INDEX IF NOT EXISTS idx_cep_price_sens ON customer_event_profiles(price_sensitivity);
 """
 class Database:
     """Unified database for all Craft data."""
@@ -536,8 +568,10 @@ class Database:
                  avg_order_value, avg_tickets_per_order, avg_days_between_orders,
                  avg_days_before_event, timing_segment, rfm_r, rfm_f, rfm_m, rfm_segment,
                  ltv_score, is_superspreader, is_vip, churn_risk_level, days_until_churn,
-                 gap_ratio, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 gap_ratio, price_sensitivity, social_influence_score, cross_event_affinity,
+                 buying_momentum, purchase_velocity, upgrade_likelihood, daypart_preference,
+                 group_size_segment, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(email, event_type, city) DO UPDATE SET
                 orders_in_scope=excluded.orders_in_scope,
                 tickets_in_scope=excluded.tickets_in_scope,
@@ -559,6 +593,14 @@ class Database:
                 churn_risk_level=excluded.churn_risk_level,
                 days_until_churn=excluded.days_until_churn,
                 gap_ratio=excluded.gap_ratio,
+                price_sensitivity=excluded.price_sensitivity,
+                social_influence_score=excluded.social_influence_score,
+                cross_event_affinity=excluded.cross_event_affinity,
+                buying_momentum=excluded.buying_momentum,
+                purchase_velocity=excluded.purchase_velocity,
+                upgrade_likelihood=excluded.upgrade_likelihood,
+                daypart_preference=excluded.daypart_preference,
+                group_size_segment=excluded.group_size_segment,
                 updated_at=excluded.updated_at
         """, (
             profile['email'], profile['event_type'], profile['city'],
@@ -570,6 +612,10 @@ class Database:
             profile['rfm_segment'], profile['ltv_score'],
             profile['is_superspreader'], profile['is_vip'],
             profile['churn_risk_level'], profile['days_until_churn'], profile['gap_ratio'],
+            profile.get('price_sensitivity', 0), profile.get('social_influence_score', 0),
+            profile.get('cross_event_affinity', 0), profile.get('buying_momentum'),
+            profile.get('purchase_velocity', 0), profile.get('upgrade_likelihood', 0),
+            profile.get('daypart_preference'), profile.get('group_size_segment'),
             datetime.now().isoformat()
         ))
         self.conn.commit()
@@ -579,6 +625,9 @@ class Database:
                            superspreaders_only: bool = False,
                            vips_only: bool = False,
                            churn_levels: list = None,
+                           momentum: str = None,
+                           group_size: str = None,
+                           min_social_influence: float = None,
                            limit: int = 5000) -> List[dict]:
         """Query customer_event_profiles scoped to a specific event type + city.
         This is the primary CRM query — every audience comes through here."""
@@ -605,6 +654,15 @@ class Database:
             ph = ','.join(['?' for _ in churn_levels])
             query += f" AND cep.churn_risk_level IN ({ph})"
             params.extend(churn_levels)
+        if momentum:
+            query += " AND cep.buying_momentum = ?"
+            params.append(momentum)
+        if group_size:
+            query += " AND cep.group_size_segment = ?"
+            params.append(group_size)
+        if min_social_influence is not None:
+            query += " AND cep.social_influence_score >= ?"
+            params.append(min_social_influence)
         query += " ORDER BY cep.ltv_score DESC LIMIT ?"
         params.append(limit)
         rows = self.conn.execute(query, params).fetchall()
@@ -629,7 +687,13 @@ class Database:
                    SUM(CASE WHEN churn_risk_level IN ('critical', 'urgent') THEN 1 ELSE 0 END) as churn_risk,
                    AVG(ltv_score) as avg_ltv,
                    SUM(spent_in_scope) as total_spent,
-                   AVG(avg_tickets_per_order) as avg_tickets
+                   AVG(avg_tickets_per_order) as avg_tickets,
+                   AVG(price_sensitivity) as avg_price_sensitivity,
+                   AVG(social_influence_score) as avg_social_influence,
+                   AVG(purchase_velocity) as avg_purchase_velocity,
+                   SUM(CASE WHEN buying_momentum = 'accelerating' THEN 1 ELSE 0 END) as accelerating_count,
+                   SUM(CASE WHEN buying_momentum = 'decelerating' THEN 1 ELSE 0 END) as decelerating_count,
+                   SUM(CASE WHEN buying_momentum = 'dormant' THEN 1 ELSE 0 END) as dormant_count
             FROM customer_event_profiles
             WHERE event_type = ? AND city = ?
         """, (event_type, city)).fetchone()
@@ -1535,6 +1599,74 @@ class EventbriteSync:
                 elif days_until_churn < 30: churn_risk_level = 'urgent'
                 elif days_until_churn < 60: churn_risk_level = 'watch'
                 else: churn_risk_level = 'healthy'
+
+            # ---- BEHAVIORAL MICRO-SEGMENTS ----
+            # 1. Price sensitivity: check for promo usage
+            price_sensitivity = 0.0
+            promo_orders = sum(1 for o in orders if o.get('promo_code'))
+            if n_orders > 0:
+                price_sensitivity = min(1.0, promo_orders / n_orders)
+
+            # 2. Social influence score: based on group size, frequency, and recency
+            social_influence_score = min(100, (avg_tickets * n_orders * max(1, 5 - rfm_r)) * 2)
+
+            # 3. Cross-event affinity: distinct event types in this city
+            cross_event_affinity = 0.0
+            if etype and city:
+                customer_events = self.db.conn.execute("""
+                    SELECT DISTINCT e.event_type FROM orders o
+                    JOIN events e ON o.event_id = e.event_id
+                    WHERE LOWER(o.email) = LOWER(?) AND e.city = ?
+                """, (email, city)).fetchall()
+                event_types_in_city = self.db.conn.execute("""
+                    SELECT DISTINCT event_type FROM events WHERE city = ?
+                """, (city,)).fetchall()
+                if event_types_in_city:
+                    cross_event_affinity = len(customer_events) / len(event_types_in_city)
+
+            # 4. Buying momentum: compare order gaps
+            buying_momentum = 'new'
+            if n_orders >= 2 and avg_gap > 0:
+                try:
+                    sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
+                    if len(sorted_dates) >= 2:
+                        last_gap = (sorted_dates[-1] - sorted_dates[-2]).days
+                        if last_gap < avg_gap * 0.7:
+                            buying_momentum = 'accelerating'
+                        elif last_gap <= avg_gap * 1.3:
+                            buying_momentum = 'stable'
+                        elif last_gap > avg_gap * 1.3:
+                            buying_momentum = 'decelerating'
+                        elif days_since > avg_gap * 2:
+                            buying_momentum = 'dormant'
+                except:
+                    pass
+            elif n_orders == 1:
+                buying_momentum = 'new'
+            elif days_since > avg_gap * 2 if avg_gap > 0 else False:
+                buying_momentum = 'dormant'
+
+            # 5. Purchase velocity: orders per year
+            tenure_days = (datetime.now() - datetime.fromisoformat(first_date)).days if first_date else 1
+            purchase_velocity = min(12, (n_orders / (tenure_days / 365)) if tenure_days > 0 else 0)
+
+            # 6. Upgrade likelihood: based on last order vs average
+            upgrade_likelihood = 0.0
+            if n_orders > 0 and avg_order > 0:
+                last_order_amount = max(o['gross_amount'] or 0 for o in orders)
+                upgrade_likelihood = min(1.0, (last_order_amount / avg_order - 1) if avg_order > 0 else 0)
+
+            # 7. Daypart preference: from event times (if available)
+            daypart_preference = None
+            # This requires event start time data; if not available, set to NULL
+
+            # 8. Group size segment
+            group_size_segment = 'solo'
+            if avg_tickets < 1.5: group_size_segment = 'solo'
+            elif avg_tickets < 2.5: group_size_segment = 'duo'
+            elif avg_tickets < 5.5: group_size_segment = 'small_group'
+            else: group_size_segment = 'large_group'
+
             self.db.upsert_event_profile({
                 'email': email, 'event_type': etype, 'city': city,
                 'orders_in_scope': n_orders, 'tickets_in_scope': total_tickets,
@@ -1551,6 +1683,14 @@ class EventbriteSync:
                 'churn_risk_level': churn_risk_level,
                 'days_until_churn': days_until_churn,
                 'gap_ratio': round(gap_ratio, 2),
+                'price_sensitivity': round(price_sensitivity, 2),
+                'social_influence_score': round(social_influence_score, 1),
+                'cross_event_affinity': round(cross_event_affinity, 2),
+                'buying_momentum': buying_momentum,
+                'purchase_velocity': round(purchase_velocity, 2),
+                'upgrade_likelihood': round(upgrade_likelihood, 2),
+                'daypart_preference': daypart_preference,
+                'group_size_segment': group_size_segment,
             })
             count += 1
         log.info(f"Built {count} event-scoped customer profiles across {len(set((e,c) for (_, e, c) in groups.keys()))} scopes")
@@ -2477,15 +2617,150 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                     log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
                 except Exception as me:
                     log.error(f"Meta sync error: {me}")
+            # Check for milestones and generate auto-exports
+            _check_milestones_and_export()
+            # Check and send alerts
+            _check_and_send_alerts()
         except Exception as e:
             _sync_state['error'] = str(e)
             log.error(f"Sync error: {e}")
         finally:
             _sync_state['done'] = True
             _sync_state['running'] = False
+    def _schedule_recurring_sync():
+        """Recurring sync every 6 hours (or custom interval from env)."""
+        import time
+        SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_HOURS', 6)) * 3600
+        while True:
+            time.sleep(SYNC_INTERVAL)
+            if not _sync_state['running']:
+                log.info(f"Scheduled sync triggered (every {SYNC_INTERVAL//3600}h)")
+                threading.Thread(target=_do_background_sync, daemon=True).start()
+
+    def _check_milestones_and_export():
+        """Check upcoming events for milestone markers and auto-generate exports."""
+        try:
+            events = db.get_events(upcoming_only=True)
+            for event in events:
+                try:
+                    days_until = (datetime.fromisoformat(event['event_date']).date() - date.today()).days
+                    milestones = {60: '60_days', 45: '45_days', 30: '30_days', 14: '14_days', 7: '7_days'}
+                    export_types = {
+                        60: 'super_early_bird_nudge',
+                        45: 'early_bird_push',
+                        30: 'past_attendee_campaign',
+                        14: 'planner_conversion',
+                        7: 'last_minute_blast'
+                    }
+                    for day_threshold, milestone_name in milestones.items():
+                        if abs(days_until - day_threshold) <= 1:  # Within 1 day of milestone
+                            et = event.get('event_type', '')
+                            ec = event.get('city', '')
+                            if et and ec:
+                                export_type = export_types.get(day_threshold, f'milestone_{day_threshold}')
+                                # Check if this milestone+export combo already exists
+                                existing = db.conn.execute("""
+                                    SELECT id FROM auto_exports
+                                    WHERE event_id = ? AND milestone = ? AND export_type = ?
+                                """, (event['event_id'], milestone_name, export_type)).fetchone()
+                                if not existing:
+                                    # Generate audience based on milestone
+                                    audience = []
+                                    if day_threshold == 60:
+                                        audience = db.get_event_profiles(et, ec, timing_segment='super_early_bird')
+                                    elif day_threshold == 45:
+                                        audience = db.get_event_profiles(et, ec, timing_segment='early_bird')
+                                        acc = db.get_event_profiles(et, ec, momentum='accelerating')
+                                        audience = list(set(audience + acc))
+                                    elif day_threshold == 30:
+                                        past_attendees = db.get_past_attendees_not_purchased(
+                                            event['event_id'], event['name'], limit=5000,
+                                            current_buyer_emails=set(db.get_event_purchasers(event['event_id']))
+                                        )
+                                        audience = past_attendees
+                                    elif day_threshold == 14:
+                                        audience = db.get_event_profiles(et, ec, timing_segment='planner')
+                                        dec = db.get_event_profiles(et, ec, momentum='decelerating')
+                                        audience = list(set(audience + dec))
+                                    elif day_threshold == 7:
+                                        audience = db.get_event_profiles(et, ec, timing_segment='last_minute')
+                                    # Store export record
+                                    audience_emails = [a.get('email') for a in audience]
+                                    db.conn.execute("""
+                                        INSERT INTO auto_exports
+                                        (event_id, milestone, export_type, audience_count, audience_emails, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    """, (event['event_id'], milestone_name, export_type, len(audience),
+                                          json.dumps(audience_emails), datetime.now().isoformat()))
+                                    db.conn.commit()
+                                    log.info(f"Auto-export created: {event['name']} {milestone_name} ({len(audience)} audience)")
+                except Exception as e:
+                    log.warning(f"Error processing event {event.get('event_id')}: {e}")
+        except Exception as e:
+            log.error(f"Milestone export check error: {e}")
+
+    def _send_alert_email(alert_type: str, message: str, event_id: str = None):
+        """Send alert email via SMTP."""
+        try:
+            smtp_host = os.environ.get('SMTP_HOST')
+            smtp_port = int(os.environ.get('SMTP_PORT', 587))
+            smtp_user = os.environ.get('SMTP_USER')
+            smtp_pass = os.environ.get('SMTP_PASS')
+            alert_to = os.environ.get('ALERT_EMAIL_TO')
+            if not (smtp_host and smtp_user and smtp_pass and alert_to):
+                log.warning("SMTP credentials not configured for alerts")
+                return
+            import smtplib
+            from email.mime.text import MIMEText
+            subject = f"[Craft Alert] {alert_type}"
+            msg = MIMEText(message)
+            msg['Subject'] = subject
+            msg['From'] = smtp_user
+            msg['To'] = alert_to
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, alert_to.split(','), msg.as_string())
+            # Log the alert
+            db.conn.execute("""
+                INSERT INTO alert_log (alert_type, event_id, message, sent_at, sent_to)
+                VALUES (?, ?, ?, ?, ?)
+            """, (alert_type, event_id, message, datetime.now().isoformat(), alert_to))
+            db.conn.commit()
+            log.info(f"Alert sent: {alert_type} to {alert_to}")
+        except Exception as e:
+            log.error(f"Alert email error: {e}")
+
+    def _check_and_send_alerts():
+        """Check for critical conditions and send alerts."""
+        try:
+            # Alert 1: Critical churn risks
+            events = db.get_events(upcoming_only=True)
+            for event in events:
+                et = event.get('event_type', '')
+                ec = event.get('city', '')
+                if et and ec:
+                    critical_churn = db.get_event_profiles(et, ec, churn_levels=['critical'])
+                    if len(critical_churn) > 20:
+                        msg = f"{len(critical_churn)} critical churn risks for {event['name']} — immediate action needed"
+                        _send_alert_email('CRITICAL_CHURN', msg, event['event_id'])
+            # Alert 2: New milestone exports
+            recent_exports = db.conn.execute("""
+                SELECT * FROM auto_exports WHERE sent_notified = 0 AND created_at > datetime('now', '-1 hour')
+            """).fetchall()
+            for export in recent_exports:
+                msg = f"New export created: {export['event_id']} {export['milestone']} ({export['audience_count']} audience)"
+                _send_alert_email('NEW_EXPORT', msg, export['event_id'])
+                db.conn.execute("UPDATE auto_exports SET sent_notified = 1 WHERE id = ?", (export['id'],))
+                db.conn.commit()
+        except Exception as e:
+            log.error(f"Alert check error: {e}")
+
     # Auto-sync on app creation (for gunicorn deployment)
     if auto_sync:
         threading.Thread(target=_do_background_sync, daemon=True).start()
+        threading.Thread(target=_schedule_recurring_sync, daemon=True, name='sync-scheduler').start()
+
     def _serialize_pacing(obj):
         """Convert EventPacing dataclass to JSON-safe dict."""
         d = asdict(obj)
@@ -2620,6 +2895,91 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         except Exception as e:
             results['tests'].append({'test': 'Exception', 'error': str(e)})
         return jsonify(results)
+
+    @app.route('/api/sync-schedule')
+    def sync_schedule():
+        """Show scheduled sync configuration and next sync time."""
+        sync_interval = int(os.environ.get('SYNC_INTERVAL_HOURS', 6))
+        return jsonify({
+            'sync_interval_hours': sync_interval,
+            'auto_sync_enabled': auto_sync,
+            'next_sync_estimated': f'In ~{sync_interval} hours from last sync',
+            'message': f'Automatic sync runs every {sync_interval} hours when auto_sync is enabled'
+        })
+
+    @app.route('/api/auto-exports')
+    def list_auto_exports():
+        """List all auto-generated exports from milestone triggers."""
+        exports = db.conn.execute("""
+            SELECT ae.*, e.name as event_name FROM auto_exports ae
+            LEFT JOIN events e ON ae.event_id = e.event_id
+            ORDER BY ae.created_at DESC
+            LIMIT 100
+        """).fetchall()
+        result = []
+        for exp in exports:
+            result.append({
+                'id': exp['id'],
+                'event_id': exp['event_id'],
+                'event_name': exp['event_name'],
+                'milestone': exp['milestone'],
+                'export_type': exp['export_type'],
+                'audience_count': exp['audience_count'],
+                'created_at': exp['created_at'],
+                'download_url': f'/api/auto-exports/{exp["id"]}/download'
+            })
+        return jsonify({
+            'total': len(result),
+            'exports': result
+        })
+
+    @app.route('/api/auto-exports/<int:export_id>/download')
+    def download_auto_export(export_id: int):
+        """Download a specific auto-export as CSV."""
+        export = db.conn.execute("""
+            SELECT * FROM auto_exports WHERE id = ?
+        """, (export_id,)).fetchone()
+        if not export:
+            return jsonify({'error': 'Export not found'}), 404
+        # Reconstruct audience from stored emails
+        audience_emails = json.loads(export['audience_emails'] or '[]')
+        output = io.StringIO()
+        fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
+                  'total_orders', 'total_events', 'total_spent', 'ltv_score']
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for email in audience_emails[:1000]:  # Limit to 1000 rows per file
+            customer = db.get_customer(email)
+            if customer:
+                writer.writerow({
+                    'email': customer.email,
+                    'favorite_city': customer.favorite_city,
+                    'favorite_event_type': customer.favorite_event_type,
+                    'rfm_segment': customer.rfm_segment,
+                    'total_orders': customer.total_orders,
+                    'total_events': customer.total_events_attended,
+                    'total_spent': round(customer.total_spent, 2),
+                    'ltv_score': round(customer.ltv_score, 1),
+                })
+        output.seek(0)
+        return output.getvalue(), 200, {
+            'Content-Disposition': f'attachment; filename="auto_export_{export_id}_{export["milestone"]}.csv"',
+            'Content-Type': 'text/csv'
+        }
+
+    @app.route('/api/alerts')
+    def list_alerts():
+        """List recent alerts."""
+        alerts = db.conn.execute("""
+            SELECT * FROM alert_log
+            ORDER BY sent_at DESC
+            LIMIT 50
+        """).fetchall()
+        return jsonify({
+            'total': len(alerts),
+            'alerts': [dict(a) for a in alerts]
+        })
+
         # === Dashboard ===
     @app.route('/api/dashboard')
     def dashboard():
@@ -3477,6 +3837,37 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'avg_ticket_price': round(avg_ticket_price, 2),
         }
 
+        # ---- 12. BEHAVIORAL INSIGHTS (Micro-segments) ----
+        behavioral_intel = {}
+        if _et and _ec:
+            stats = db.get_event_profile_stats(_et, _ec)
+            accelerating = db.get_event_profiles(_et, _ec, momentum='accelerating')
+            dormant = db.get_event_profiles(_et, _ec, momentum='dormant')
+            # Group size distribution
+            solo = len(db.get_event_profiles(_et, _ec, group_size='solo'))
+            duo = len(db.get_event_profiles(_et, _ec, group_size='duo'))
+            small_group = len(db.get_event_profiles(_et, _ec, group_size='small_group'))
+            large_group = len(db.get_event_profiles(_et, _ec, group_size='large_group'))
+            behavioral_intel = {
+                'accelerating_buyers': len(accelerating),
+                'dormant_buyers': len(dormant),
+                'avg_price_sensitivity': round(stats.get('avg_price_sensitivity', 0), 2),
+                'avg_social_influence': round(stats.get('avg_social_influence', 0), 1),
+                'group_size_distribution': {
+                    'solo': solo,
+                    'duo': duo,
+                    'small_group': small_group,
+                    'large_group': large_group,
+                },
+                'momentum_distribution': {
+                    'accelerating': stats.get('accelerating_count', 0),
+                    'decelerating': stats.get('decelerating_count', 0),
+                    'dormant': stats.get('dormant_count', 0),
+                },
+                'recommendation': f'{len(accelerating)} buyers are accelerating — prioritize them for early bird offers. {len(dormant)} are dormant — send win-back campaigns.' if (len(accelerating) + len(dormant)) > 0 else 'Need more buying behavior data.',
+                'downloadable': len(accelerating) + len(dormant),
+            }
+
         return jsonify({
             'event': event,
             'days_until': days_until,
@@ -3507,6 +3898,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'competitors': competitor_intel,
             'cannibalization': cannibal_intel,
             'revenue_projection': revenue_projection,
+            'behavioral_insights': behavioral_intel,
             'export_token': os.environ.get('EXPORT_API_KEY', ''),
         })
 
@@ -3547,33 +3939,43 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             current_buyers.update(db.get_event_buyers(eid))
 
         customers_list = []
+        _et = event.get('event_type', '')
+        _ec = event.get('city', '')
         if audience == 'cross_sell':
             customers_list = db.get_cross_sell_candidates(
                 event.get('event_type', ''), event.get('city', ''),
                 exclude_emails=current_buyers, limit=5000)
         elif audience == 'super_spreaders':
-            _et = event.get('event_type', '')
-            _ec = event.get('city', '')
             if _et and _ec:
                 customers_list = db.get_event_profiles(_et, _ec, superspreaders_only=True)
         elif audience == 'vips':
-            _et = event.get('event_type', '')
-            _ec = event.get('city', '')
             if _et and _ec:
                 vips = db.get_event_profiles(_et, _ec, vips_only=True)
                 customers_list = [v for v in vips if v['email'] not in current_buyers]
         elif audience == 'churn_critical':
-            _et = event.get('event_type', '')
-            _ec = event.get('city', '')
             if _et and _ec:
                 customers_list = db.get_event_profiles(
                     _et, _ec, churn_levels=['critical', 'urgent']
                 )
+        elif audience == 'accelerating':
+            if _et and _ec:
+                customers_list = db.get_event_profiles(_et, _ec, momentum='accelerating')
+        elif audience == 'dormant':
+            if _et and _ec:
+                customers_list = db.get_event_profiles(_et, _ec, momentum='dormant')
+        elif audience == 'high_influence':
+            if _et and _ec:
+                customers_list = db.get_event_profiles(_et, _ec, min_social_influence=50)
+        elif audience == 'group_buyers':
+            if _et and _ec:
+                customers_list = db.get_event_profiles(_et, _ec, group_size='large_group')
         # Build CSV
         output = io.StringIO()
         fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
                   'total_orders', 'total_events', 'total_spent', 'ltv_score',
-                  'days_since_last', 'avg_tickets_per_order']
+                  'days_since_last', 'avg_tickets_per_order',
+                  'buying_momentum', 'price_sensitivity', 'social_influence_score',
+                  'group_size_segment', 'purchase_velocity', 'cross_event_affinity']
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         for c in customers_list:
