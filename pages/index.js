@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Treemap, ScatterChart, Scatter, ZAxis, Legend } from 'recharts';
 
-const API_BASE = 'https://craft-dominant-production.up.railway.app';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'https://craft-dominant-production.up.railway.app';
 
 const DECISIONS = {
   pivot: { color: '#dc2626', bg: '#fef2f2', icon: '\u{1F6A8}', label: 'PIVOT' },
