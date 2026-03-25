@@ -4624,6 +4624,24 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         if not curve:
             return jsonify({'error': 'Curve not found'}), 404
         return jsonify(curve)
+
+    # ─── AI CAMPAIGN ENGINE ───────────────────────────────────────────
+    # Plugs in: phase detection → Claude generation → SendGrid execution
+    try:
+        from craft_engine import CraftCampaignEngine, register_engine_routes, start_campaign_scheduler
+        campaign_engine = CraftCampaignEngine(db, engine)
+        register_engine_routes(app, campaign_engine)
+        # Start background scheduler if API keys are configured
+        if os.environ.get('ANTHROPIC_API_KEY'):
+            start_campaign_scheduler(campaign_engine, interval_hours=6)
+            log.info("Campaign engine: loaded + scheduler started")
+        else:
+            log.info("Campaign engine: loaded (no ANTHROPIC_API_KEY — manual mode only)")
+    except ImportError:
+        log.warning("craft_engine.py not found — campaign engine disabled")
+    except Exception as e:
+        log.error(f"Campaign engine failed to load: {e}", exc_info=True)
+
     return app
 # =============================================================================
 # MAIN
