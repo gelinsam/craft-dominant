@@ -6,7 +6,7 @@ The brain + hands of the Craft Hospitality marketing system.
 This module plugs into craft_unified.py and adds:
   1. Automated phase detection — watches every event, detects phase transitions
   2. Claude-powered campaign generation — writes emails using full event context
-  3. SendGrid execution — sends approved campaigns, tracks performance
+  3. Mailchimp execution — sends approved campaigns via Mailchimp, tracks performance
   4. Learning loop — post-campaign analysis feeds back into future generation
   5. Campaign approval queue — AI drafts, Sam approves with one click
 
@@ -16,9 +16,9 @@ Integration: Add two lines to craft_unified.py's create_app():
     register_engine_routes(app, campaign_engine)
 
 Required env vars:
-    ANTHROPIC_API_KEY  — Claude API key for campaign generation
-    SENDGRID_API_KEY   — SendGrid API key for email sending
-    SENDGRID_FROM_EMAIL — Sender address (default: hello@crafthospitality.com)
+    ANTHROPIC_API_KEY    — Claude API key for campaign generation
+    MAILCHIMP_API_KEY    — Mailchimp API key (format: xxx-us16)
+    MAILCHIMP_AUDIENCE_ID — Mailchimp Audience/List ID
 """
 
 import os
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS campaign_sends (
     campaign_id TEXT NOT NULL,
     email TEXT NOT NULL,
     first_name TEXT DEFAULT '',
-    sendgrid_message_id TEXT,
+    mailchimp_campaign_id TEXT DEFAULT '',
     sent_at TEXT DEFAULT CURRENT_TIMESTAMP,
     status TEXT DEFAULT 'queued',
     opened_at TEXT,
@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS campaign_sends (
 );
 CREATE TABLE IF NOT EXISTS email_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sendgrid_message_id TEXT,
+    mailchimp_campaign_id TEXT DEFAULT '',
     event_type TEXT NOT NULL,
     email TEXT NOT NULL,
     timestamp TEXT,
@@ -127,8 +127,8 @@ CREATE INDEX IF NOT EXISTS idx_campaigns_event ON campaigns(event_id);
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_sends_campaign ON campaign_sends(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_sends_email ON campaign_sends(email);
-CREATE INDEX IF NOT EXISTS idx_sends_msgid ON campaign_sends(sendgrid_message_id);
-CREATE INDEX IF NOT EXISTS idx_email_events_msgid ON email_events(sendgrid_message_id);
+CREATE INDEX IF NOT EXISTS idx_sends_mc_campaign ON campaign_sends(mailchimp_campaign_id);
+CREATE INDEX IF NOT EXISTS idx_email_events_mc_campaign ON email_events(mailchimp_campaign_id);
 """
 
 # =============================================================================
@@ -243,54 +243,218 @@ class ClaudeClient:
 
 
 # =============================================================================
-# SENDGRID CLIENT — direct HTTP, no SDK
+# MAILCHIMP CLIENT — direct HTTP, no SDK
 # =============================================================================
-class SendGridClient:
-    """SendGrid v3 Mail Send API client."""
+class MailchimpClient:
+    """Mailchimp Marketing API v3 client.
 
-    def __init__(self, api_key: str):
+    Handles: member management, tag-based segmentation, campaign creation & sending.
+    All campaigns are sent through Mailchimp so they show up in the Mailchimp dashboard
+    with full open/click tracking, unsubscribe handling, and CAN-SPAM compliance.
+    """
+
+    def __init__(self, api_key: str, audience_id: str):
         self.api_key = api_key
-        self.from_email = os.environ.get('SENDGRID_FROM_EMAIL', 'hello@crafthospitality.com')
-        self.from_name = os.environ.get('SENDGRID_FROM_NAME', 'Craft Hospitality')
+        self.audience_id = audience_id
+        # Extract data center from API key (format: xxx-us16)
+        self.dc = api_key.split('-')[-1] if '-' in api_key else 'us16'
+        self.base_url = f"https://{self.dc}.api.mailchimp.com/3.0"
+        self.from_email = os.environ.get('MAILCHIMP_FROM_EMAIL', 'tickets@crafthospitality.com')
+        self.from_name = os.environ.get('MAILCHIMP_FROM_NAME', 'Craft Hospitality')
 
-    def send(self, to_email: str, subject: str, html: str,
-             categories: List[str] = None, custom_args: Dict = None) -> Optional[str]:
-        """Send one email. Returns SendGrid message ID or None."""
+    def _headers(self) -> Dict:
+        return {'Content-Type': 'application/json'}
+
+    def _auth(self) -> Tuple:
+        return ('anystring', self.api_key)
+
+    def _request(self, method: str, path: str, data: Dict = None,
+                 timeout: int = 30) -> Optional[Dict]:
+        """Make an authenticated Mailchimp API request."""
         try:
-            import requests
+            import requests as req
         except ImportError:
+            log.error("requests library required for Mailchimp API")
             return None
 
-        payload = {
-            "personalizations": [{"to": [{"email": to_email}], "custom_args": custom_args or {}}],
-            "from": {"email": self.from_email, "name": self.from_name},
-            "subject": subject,
-            "content": [{"type": "text/html", "value": html}],
-            "tracking_settings": {
-                "click_tracking": {"enable": True},
-                "open_tracking": {"enable": True},
-            },
-        }
-        if categories:
-            payload["categories"] = categories[:10]
-
-        unsub = os.environ.get('SENDGRID_UNSUBSCRIBE_GROUP_ID')
-        if unsub:
-            payload["asm"] = {"group_id": int(unsub)}
-
-        resp = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=15,
+        url = f"{self.base_url}{path}"
+        resp = req.request(
+            method, url,
+            auth=self._auth(),
+            headers=self._headers(),
+            json=data,
+            timeout=timeout,
         )
 
-        if resp.status_code in (200, 201, 202):
-            msg_id = resp.headers.get('X-Message-Id', '')
-            return msg_id
+        if resp.status_code in (200, 201, 204):
+            return resp.json() if resp.content else {}
         else:
-            log.error(f"SendGrid {resp.status_code}: {resp.text[:300]}")
+            log.error(f"Mailchimp {method} {path} → {resp.status_code}: {resp.text[:500]}")
             return None
+
+    # ── Member management ──────────────────────────────────
+
+    def ensure_members(self, emails: List[str], tag: str = None) -> Dict:
+        """Batch add/update members in the audience. Optionally apply a tag.
+
+        Uses Mailchimp batch subscribe endpoint (up to 500 per call).
+        Status 'subscribed' for new, existing members keep their status.
+        Returns {'added': N, 'updated': N, 'errors': N}.
+        """
+        stats = {'added': 0, 'updated': 0, 'errors': 0}
+
+        # Process in chunks of 500 (Mailchimp limit)
+        for i in range(0, len(emails), 500):
+            chunk = emails[i:i+500]
+            members = []
+            for email in chunk:
+                members.append({
+                    'email_address': email.lower().strip(),
+                    'status_if_new': 'subscribed',
+                })
+
+            data = {
+                'members': members,
+                'update_existing': True,
+            }
+
+            result = self._request('POST', f'/lists/{self.audience_id}', data, timeout=60)
+            if result:
+                stats['added'] += result.get('total_created', 0)
+                stats['updated'] += result.get('total_updated', 0)
+                stats['errors'] += result.get('error_count', 0)
+                if result.get('errors'):
+                    for err in result['errors'][:5]:
+                        log.warning(f"Mailchimp member error: {err.get('email_address')}: {err.get('error')}")
+            else:
+                stats['errors'] += len(chunk)
+
+            # Brief pause between chunks
+            if i + 500 < len(emails):
+                time.sleep(1)
+
+        # Apply tag if specified
+        if tag and stats['added'] + stats['updated'] > 0:
+            self.tag_members(emails, tag)
+
+        return stats
+
+    def tag_members(self, emails: List[str], tag: str) -> bool:
+        """Apply a tag to a list of members. Creates the tag if it doesn't exist."""
+        # Process in chunks of 500
+        for i in range(0, len(emails), 500):
+            chunk = emails[i:i+500]
+            data = {
+                'members': [
+                    {'email_address': e.lower().strip(), 'status': 'active'}
+                    for e in chunk
+                ],
+            }
+            result = self._request('POST', f'/lists/{self.audience_id}/segments', {
+                'name': tag,
+                'static_segment': [e.lower().strip() for e in chunk],
+            })
+
+            # If tag already exists, add members to it
+            if result is None:
+                # Find existing tag
+                tags_resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
+                if tags_resp:
+                    existing_tag_id = None
+                    for seg in tags_resp.get('segments', []):
+                        if seg.get('name') == tag:
+                            existing_tag_id = seg['id']
+                            break
+                    if existing_tag_id:
+                        self._request('POST', f'/lists/{self.audience_id}/segments/{existing_tag_id}', {
+                            'members_to_add': [e.lower().strip() for e in chunk],
+                        })
+
+            if i + 500 < len(emails):
+                time.sleep(0.5)
+
+        return True
+
+    # ── Campaign creation & sending ────────────────────────
+
+    def create_campaign(self, subject: str, preview_text: str, html: str,
+                        tag: str = None, segment_id: int = None,
+                        campaign_title: str = '') -> Optional[str]:
+        """Create a Mailchimp campaign. Returns campaign ID or None.
+
+        If tag is provided, creates a segment condition for that tag.
+        If segment_id is provided, uses that directly.
+        """
+        recipients = {'list_id': self.audience_id}
+
+        if segment_id:
+            recipients['segment_opts'] = {'saved_segment_id': segment_id}
+        elif tag:
+            recipients['segment_opts'] = {
+                'match': 'all',
+                'conditions': [{
+                    'condition_type': 'StaticSegment',
+                    'field': 'static_segment',
+                    'op': 'static_is',
+                    'value': tag,
+                }],
+            }
+
+        data = {
+            'type': 'regular',
+            'recipients': recipients,
+            'settings': {
+                'subject_line': subject,
+                'preview_text': preview_text or '',
+                'title': campaign_title or subject[:50],
+                'from_name': self.from_name,
+                'reply_to': self.from_email,
+                'auto_footer': True,
+            },
+            'tracking': {
+                'opens': True,
+                'html_clicks': True,
+                'text_clicks': True,
+            },
+        }
+
+        result = self._request('POST', '/campaigns', data)
+        if result:
+            mc_campaign_id = result.get('id')
+            log.info(f"Mailchimp campaign created: {mc_campaign_id}")
+
+            # Set the HTML content
+            content_result = self._request('PUT', f'/campaigns/{mc_campaign_id}/content', {
+                'html': html,
+            })
+            if not content_result:
+                log.error(f"Failed to set campaign content for {mc_campaign_id}")
+                return None
+
+            return mc_campaign_id
+
+        return None
+
+    def send_campaign(self, mc_campaign_id: str) -> bool:
+        """Send a Mailchimp campaign. Returns True on success."""
+        result = self._request('POST', f'/campaigns/{mc_campaign_id}/actions/send')
+        if result is not None:
+            log.info(f"Mailchimp campaign {mc_campaign_id} sent!")
+            return True
+        return False
+
+    def get_campaign_report(self, mc_campaign_id: str) -> Optional[Dict]:
+        """Get campaign performance report from Mailchimp."""
+        return self._request('GET', f'/reports/{mc_campaign_id}')
+
+    def get_tag_segment_id(self, tag: str) -> Optional[int]:
+        """Find the segment ID for a given tag name."""
+        resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
+        if resp:
+            for seg in resp.get('segments', []):
+                if seg.get('name') == tag:
+                    return seg['id']
+        return None
 
 
 # =============================================================================
@@ -391,7 +555,7 @@ class CraftCampaignEngine:
 
         # Initialize clients from env vars
         self._claude = None
-        self._sendgrid = None
+        self._mailchimp = None
 
     def _init_schema(self):
         self.db.conn.executescript(ENGINE_SCHEMA)
@@ -406,12 +570,13 @@ class CraftCampaignEngine:
         return self._claude
 
     @property
-    def sendgrid(self) -> Optional[SendGridClient]:
-        if self._sendgrid is None:
-            key = os.environ.get('SENDGRID_API_KEY')
-            if key:
-                self._sendgrid = SendGridClient(key)
-        return self._sendgrid
+    def mailchimp(self) -> Optional[MailchimpClient]:
+        if self._mailchimp is None:
+            key = os.environ.get('MAILCHIMP_API_KEY')
+            audience_id = os.environ.get('MAILCHIMP_AUDIENCE_ID')
+            if key and audience_id:
+                self._mailchimp = MailchimpClient(key, audience_id)
+        return self._mailchimp
 
     # ─────────────────────────────────────────────────────────
     # PHASE DETECTION — what phase is each event in?
@@ -855,14 +1020,20 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         return {'campaign_id': campaign_id, 'status': 'rejected'}
 
     def send_campaign(self, campaign_id: str, dry_run: bool = False) -> Dict:
-        """Execute a campaign: pull audience from SQL, send each email via SendGrid.
+        """Execute a campaign: pull audience from SQL, push to Mailchimp, create & send campaign.
+
+        Flow:
+        1. Pull audience emails from segment SQL (local SQLite)
+        2. Batch add/update those contacts in Mailchimp with a campaign-specific tag
+        3. Create a Mailchimp campaign targeting that tag
+        4. Send the campaign via Mailchimp API
 
         Args:
             campaign_id: ID of an approved campaign
-            dry_run: If True, validates everything but doesn't actually send emails
+            dry_run: If True, validates everything but doesn't actually send
         """
-        if not dry_run and not self.sendgrid:
-            return {'error': 'SENDGRID_API_KEY not set'}
+        if not dry_run and not self.mailchimp:
+            return {'error': 'MAILCHIMP_API_KEY or MAILCHIMP_AUDIENCE_ID not set'}
 
         row = self.db.conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
         if not row:
@@ -872,128 +1043,173 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         if not dry_run and campaign['status'] not in ('approved',):
             return {'error': f"Campaign status is '{campaign['status']}', must be 'approved'"}
 
-        # Mark sending
-        if not dry_run:
-            self.db.conn.execute("UPDATE campaigns SET status = 'sending', updated_at = ? WHERE id = ?",
-                                 (datetime.now().isoformat(), campaign_id))
-            self.db.conn.commit()
-
-        # Pull audience
+        # Pull audience from local DB
         try:
             recipients = self.db.conn.execute(campaign['segment_sql']).fetchall()
         except Exception as e:
-            if not dry_run:
-                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                    (datetime.now().isoformat(), campaign_id))
-                self.db.conn.commit()
             return {'error': f'Segment SQL failed: {e}'}
+
+        emails = [r['email'] if hasattr(r, 'keys') else r[0] for r in recipients]
 
         if dry_run:
             return {
                 'campaign_id': campaign_id,
                 'status': 'dry_run',
-                'audience_count': len(recipients),
-                'sample_recipients': [r['email'] if hasattr(r, 'keys') else r[0] for r in recipients[:10]],
+                'audience_count': len(emails),
+                'sample_recipients': emails[:10],
                 'subject_line': campaign['subject_line'],
                 'phase': campaign['phase'],
             }
 
-        sent = 0
-        failed = 0
-        batch_size = 50  # Commit to DB every N sends for crash recovery
-
-        for i, r in enumerate(recipients):
-            email = r['email'] if hasattr(r, 'keys') else r[0]
-
-            # Personalize (no first_name in current schema — use friendly fallback)
-            subject = campaign['subject_line'].replace('{{first_name}}', 'there')
-            html = campaign['body_html'].replace('{{first_name}}', 'there')
-
-            try:
-                msg_id = self.sendgrid.send(
-                    to_email=email,
-                    subject=subject,
-                    html=html,
-                    categories=[campaign['campaign_type'], campaign['phase'] or '', campaign_id],
-                    custom_args={'campaign_id': campaign_id, 'event_id': campaign['event_id']},
-                )
-            except Exception as e:
-                log.error(f"SendGrid error for {email}: {e}")
-                msg_id = None
-
-            # Record the send
-            status = 'sent' if msg_id else 'failed'
-            try:
-                self.db.conn.execute("""
-                    INSERT OR IGNORE INTO campaign_sends (campaign_id, email, first_name, sendgrid_message_id, status)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (campaign_id, email, '', msg_id or '', status))
-            except Exception as e:
-                log.error(f"DB insert error for send record: {e}")
-
-            if msg_id:
-                sent += 1
-            else:
-                failed += 1
-
-            # Batch commit for crash recovery
-            if (i + 1) % batch_size == 0:
-                self.db.conn.commit()
-
-            # Brief pause every 100 sends to respect SendGrid rate limits
-            if (i + 1) % 100 == 0:
-                time.sleep(0.5)
-
-        # Final update
-        self.db.conn.execute("""
-            UPDATE campaigns SET status = 'sent', sends = ?, sent_at = ?, updated_at = ?
-            WHERE id = ?
-        """, (sent, datetime.now().isoformat(), datetime.now().isoformat(), campaign_id))
+        # Mark sending
+        self.db.conn.execute("UPDATE campaigns SET status = 'sending', updated_at = ? WHERE id = ?",
+                             (datetime.now().isoformat(), campaign_id))
         self.db.conn.commit()
 
-        log.info(f"Campaign {campaign_id} sent: {sent} delivered, {failed} failed out of {len(recipients)} recipients")
-        return {'campaign_id': campaign_id, 'sent': sent, 'failed': failed, 'total_recipients': len(recipients), 'status': 'sent'}
+        try:
+            # Step 1: Push audience to Mailchimp with campaign-specific tag
+            tag_name = f"craft-{campaign_id}"
+            log.info(f"Pushing {len(emails)} contacts to Mailchimp with tag '{tag_name}'...")
+            member_stats = self.mailchimp.ensure_members(emails, tag=tag_name)
+            log.info(f"Mailchimp members: {member_stats}")
+
+            # Step 2: Find the segment ID for this tag
+            segment_id = self.mailchimp.get_tag_segment_id(tag_name)
+
+            # Step 3: Create the Mailchimp campaign
+            subject = campaign['subject_line'].replace('{{first_name}}', '*|FNAME|*')
+            html = campaign['body_html'].replace('{{first_name}}', '*|FNAME|*')
+
+            mc_campaign_id = self.mailchimp.create_campaign(
+                subject=subject,
+                preview_text=campaign.get('preview_text', ''),
+                html=html,
+                tag=tag_name,
+                segment_id=segment_id,
+                campaign_title=f"Craft AI: {campaign_id} — {campaign.get('phase', '')}",
+            )
+
+            if not mc_campaign_id:
+                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
+                                    (datetime.now().isoformat(), campaign_id))
+                self.db.conn.commit()
+                return {'error': 'Failed to create Mailchimp campaign'}
+
+            # Step 4: Send it
+            sent_ok = self.mailchimp.send_campaign(mc_campaign_id)
+            if not sent_ok:
+                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
+                                    (datetime.now().isoformat(), campaign_id))
+                self.db.conn.commit()
+                return {'error': f'Mailchimp campaign {mc_campaign_id} created but failed to send'}
+
+            # Record sends in local DB for tracking
+            sent_count = member_stats.get('added', 0) + member_stats.get('updated', 0)
+            for email in emails:
+                try:
+                    self.db.conn.execute("""
+                        INSERT OR IGNORE INTO campaign_sends (campaign_id, email, first_name, mailchimp_campaign_id, status)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (campaign_id, email.lower().strip(), '', mc_campaign_id, 'sent'))
+                except Exception:
+                    pass
+
+            # Update campaign record
+            self.db.conn.execute("""
+                UPDATE campaigns SET status = 'sent', sends = ?, sent_at = ?, updated_at = ?
+                WHERE id = ?
+            """, (len(emails), datetime.now().isoformat(), datetime.now().isoformat(), campaign_id))
+            self.db.conn.commit()
+
+            log.info(f"Campaign {campaign_id} sent via Mailchimp ({mc_campaign_id}): {len(emails)} recipients")
+            return {
+                'campaign_id': campaign_id,
+                'mailchimp_campaign_id': mc_campaign_id,
+                'sent': len(emails),
+                'member_stats': member_stats,
+                'status': 'sent',
+            }
+
+        except Exception as e:
+            log.error(f"Campaign send failed: {e}", exc_info=True)
+            self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
+                                (datetime.now().isoformat(), campaign_id))
+            self.db.conn.commit()
+            return {'error': f'Send failed: {str(e)}'}
 
     # ─────────────────────────────────────────────────────────
     # WEBHOOK PROCESSING — track opens, clicks, bounces
     # ─────────────────────────────────────────────────────────
 
-    def process_sendgrid_events(self, events: List[Dict]) -> Dict:
-        """Process SendGrid webhook events."""
-        processed = 0
-        for ev in events:
-            etype = ev.get('event', '')
-            email = ev.get('email', '').lower()
-            msg_id = ev.get('sg_message_id', '').split('.')[0]
-            ts = ev.get('timestamp', '')
+    def process_mailchimp_webhook(self, data: Dict) -> Dict:
+        """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity)."""
+        event_type = data.get('type', '')
+        email = ''
+        ts = datetime.now().isoformat()
 
-            if not email or not etype:
-                continue
-
-            self.db.conn.execute("""
-                INSERT INTO email_events (sendgrid_message_id, event_type, email, timestamp, url, raw_payload)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (msg_id, etype, email, ts, ev.get('url', ''), json.dumps(ev)))
-
-            if etype == 'open':
-                self.db.conn.execute(
-                    "UPDATE campaign_sends SET status = 'opened', opened_at = ? WHERE sendgrid_message_id = ? AND status IN ('sent','delivered')",
-                    (ts, msg_id))
-            elif etype == 'click':
-                self.db.conn.execute(
-                    "UPDATE campaign_sends SET status = 'clicked', clicked_at = ? WHERE sendgrid_message_id = ?",
-                    (ts, msg_id))
-            elif etype in ('bounce', 'dropped'):
-                self.db.conn.execute("UPDATE campaign_sends SET status = 'bounced' WHERE sendgrid_message_id = ?", (msg_id,))
+        if event_type == 'unsubscribe':
+            email = data.get('data', {}).get('email', '').lower()
+            if email:
+                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
+        elif event_type == 'cleaned':
+            email = data.get('data', {}).get('email', '').lower()
+            if email:
                 self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
-            elif etype in ('unsubscribe', 'spamreport'):
-                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, ?)", (email, etype))
+        elif event_type == 'campaign':
+            # Campaign sent notification — we can pull reports
+            mc_campaign_id = data.get('data', {}).get('id', '')
+            if mc_campaign_id:
+                self.db.conn.execute("""
+                    INSERT INTO email_events (mailchimp_campaign_id, event_type, email, timestamp, raw_payload)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (mc_campaign_id, 'campaign_sent', '', ts, json.dumps(data)))
 
-            processed += 1
+        if email:
+            self.db.conn.execute("""
+                INSERT INTO email_events (mailchimp_campaign_id, event_type, email, timestamp, raw_payload)
+                VALUES (?, ?, ?, ?, ?)
+            """, ('', event_type, email, ts, json.dumps(data)))
 
         self.db.conn.commit()
-        self._refresh_campaign_metrics()
-        return {'processed': processed}
+        return {'processed': 1, 'type': event_type}
+
+    def sync_campaign_stats(self, campaign_id: str) -> Optional[Dict]:
+        """Pull campaign stats from Mailchimp and update local DB.
+
+        Call this periodically (e.g. 24h and 72h after send) to sync
+        open/click data from Mailchimp's tracking.
+        """
+        if not self.mailchimp:
+            return None
+
+        # Find the Mailchimp campaign ID from local sends
+        row = self.db.conn.execute("""
+            SELECT DISTINCT mailchimp_campaign_id FROM campaign_sends
+            WHERE campaign_id = ? AND mailchimp_campaign_id != ''
+            LIMIT 1
+        """, (campaign_id,)).fetchone()
+
+        if not row or not row['mailchimp_campaign_id']:
+            return None
+
+        mc_id = row['mailchimp_campaign_id']
+        report = self.mailchimp.get_campaign_report(mc_id)
+
+        if report:
+            opens = report.get('opens', {}).get('unique_opens', 0)
+            clicks = report.get('clicks', {}).get('unique_clicks', 0)
+            sends = report.get('emails_sent', 0)
+
+            self.db.conn.execute("""
+                UPDATE campaigns SET opens = ?, clicks = ?, sends = ?, updated_at = ?
+                WHERE id = ?
+            """, (opens, clicks, sends, datetime.now().isoformat(), campaign_id))
+            self.db.conn.commit()
+
+            log.info(f"Synced stats for {campaign_id}: {opens} opens, {clicks} clicks, {sends} sends")
+            return {'opens': opens, 'clicks': clicks, 'sends': sends}
+
+        return None
 
     def _refresh_campaign_metrics(self):
         """Recalc campaign-level open/click counts from sends table."""
@@ -1222,11 +1438,22 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
     def campaign_performance():
         return jsonify(engine.get_performance_summary())
 
-    @app.route('/api/webhook/sendgrid', methods=['POST'])
-    def sendgrid_webhook():
-        events = request.get_json() or []
-        result = engine.process_sendgrid_events(events)
+    @app.route('/api/webhook/mailchimp', methods=['GET', 'POST'])
+    def mailchimp_webhook():
+        """Mailchimp webhook handler. GET validates the webhook URL, POST receives events."""
+        if request.method == 'GET':
+            return '', 200  # Mailchimp sends GET to validate webhook URL
+        data = request.get_json() or request.form.to_dict() or {}
+        result = engine.process_mailchimp_webhook(data)
         return jsonify(result)
+
+    @app.route('/api/campaigns/<cid>/sync-stats', methods=['POST'])
+    def sync_campaign_stats(cid):
+        """Pull latest open/click stats from Mailchimp for a sent campaign."""
+        result = engine.sync_campaign_stats(cid)
+        if result:
+            return jsonify(result)
+        return jsonify({'error': 'Could not sync stats — campaign not found or Mailchimp not configured'}), 400
 
     @app.route('/api/learnings')
     def list_learnings():
@@ -1257,7 +1484,7 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
             return jsonify({
                 'status': 'ok',
                 'claude_configured': bool(os.environ.get('ANTHROPIC_API_KEY')),
-                'sendgrid_configured': bool(os.environ.get('SENDGRID_API_KEY')),
+                'mailchimp_configured': bool(os.environ.get('MAILCHIMP_API_KEY') and os.environ.get('MAILCHIMP_AUDIENCE_ID')),
                 'campaigns': campaign_counts,
                 'total_suppressions': suppression_count['cnt'] if suppression_count else 0,
                 'active_learnings': learning_count['cnt'] if learning_count else 0,

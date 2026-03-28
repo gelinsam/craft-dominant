@@ -4626,7 +4626,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         return jsonify(curve)
 
     # ─── AI CAMPAIGN ENGINE ───────────────────────────────────────────
-    # Plugs in: phase detection → Claude generation → SendGrid execution
+    # Plugs in: phase detection → Claude generation → Mailchimp execution
     try:
         from craft_engine import CraftCampaignEngine, register_engine_routes, start_campaign_scheduler
         campaign_engine = CraftCampaignEngine(db, engine)

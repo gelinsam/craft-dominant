@@ -284,8 +284,8 @@ export default function CampaignsPage() {
                   {engineStatus.claude_configured ? '●' : '○'} Claude
                 </span>
                 {' · '}
-                <span style={{ color: engineStatus.sendgrid_configured ? '#16a34a' : '#dc2626' }}>
-                  {engineStatus.sendgrid_configured ? '●' : '○'} SendGrid
+                <span style={{ color: engineStatus.mailchimp_configured ? '#16a34a' : '#dc2626' }}>
+                  {engineStatus.mailchimp_configured ? '●' : '○'} Mailchimp
                 </span>
               </div>
             )}
