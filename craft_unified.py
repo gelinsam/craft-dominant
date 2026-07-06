@@ -53,6 +53,15 @@ def _normalize_event_pattern(name: str, include_season: bool = False) -> str:
     name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
     return name_lower + season
 
+# Pattern aliases: map current Eventbrite names to their historical pattern equivalents.
+# "DC Wine Fest" (2026) was previously listed as "DC Wine Fest! Fall Edition" (2022-2025).
+PATTERN_ALIASES = {
+    'dc_wine_fest': 'dc_wine_fest_fall_fall',
+}
+
+# Patterns that should be combined across ALL days into one event, not split by day-of-week.
+MULTI_DAY_COMBINE = {'dc_wine_fest_fall_fall'}
+
 def _json_key_match(json_field, key: str) -> bool:
     """Check if key exists in a JSON dict field — safe, no substring false positives."""
     if not key or not json_field:
@@ -1868,8 +1877,9 @@ class EventbriteSync:
             curves_built += 1
         return curves_built
     def _get_pattern(self, name: str) -> str:
-        """Extract pattern from event name."""
-        return _normalize_event_pattern(name, include_season=True)
+        """Extract pattern from event name, resolving aliases."""
+        p = _normalize_event_pattern(name, include_season=True)
+        return PATTERN_ALIASES.get(p, p)
 # =============================================================================
 # META ADS SYNC
 # =============================================================================
@@ -2139,9 +2149,10 @@ class DecisionEngine:
             if c:
                 self._curves[c['pattern']] = c
     def _get_pattern(self, name: str) -> str:
-        """Extract pattern from event name (cached)."""
+        """Extract pattern from event name (cached), resolving aliases."""
         if name not in self._pattern_cache:
-            self._pattern_cache[name] = _normalize_event_pattern(name, include_season=True)
+            p = _normalize_event_pattern(name, include_season=True)
+            self._pattern_cache[name] = PATTERN_ALIASES.get(p, p)
         return self._pattern_cache[name]
     def _get_all_events(self) -> list:
         """Get all events (cached per portfolio run)."""
@@ -2561,13 +2572,20 @@ class DecisionEngine:
                     grouped_ids.add(a.event_id)
             ungrouped = [a for a in analyses if a.event_id not in grouped_ids]
             for pattern, group in timed_groups.items():
-                by_date = defaultdict(list)
-                for a in group:
-                    d = datetime.fromisoformat(a.event_date).date()
-                    by_date[d].append(a)
-                for date, day_group in by_date.items():
-                    day_event = self._create_day_event(pattern, day_group, group)
-                    ungrouped.append(day_event)
+                if pattern in MULTI_DAY_COMBINE:
+                    # Combine ALL days into ONE event instead of splitting by day
+                    combined = self._create_day_event(pattern, group, group)
+                    fixed_name = combined.event_name.rsplit(' - ', 1)[0] if ' - ' in combined.event_name else combined.event_name
+                    combined = combined._replace(event_name=fixed_name)
+                    ungrouped.append(combined)
+                else:
+                    by_date = defaultdict(list)
+                    for a in group:
+                        d = datetime.fromisoformat(a.event_date).date()
+                        by_date[d].append(a)
+                    for date, day_group in by_date.items():
+                        day_event = self._create_day_event(pattern, day_group, group)
+                        ungrouped.append(day_event)
             analyses = ungrouped
         analyses.sort(key=lambda x: (-x.urgency, x.days_until))
         return analyses
