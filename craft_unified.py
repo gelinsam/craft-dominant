@@ -8,7 +8,7 @@ import hashlib
 import logging
 import statistics
 import re
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, dat
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
@@ -1199,7 +1199,7 @@ class EventbriteSync:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         import time
         url = f"{self.BASE_URL}{endpoint}"
-        response = self.session.get(url, params=params or {}, timeout=30)
+        response = self.session.get(url, params=params or {}, timeout=90)
         if response.status_code == 429:
             retry = int(response.headers.get('Retry-After', 60))
             log.warning(f"Rate limited, waiting {retry}s")
