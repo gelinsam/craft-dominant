@@ -1199,7 +1199,7 @@ class EventbriteSync:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         import time
         url = f"{self.BASE_URL}{endpoint}"
-                for attempt in range(3):
+        for attempt in range(3):
             try:
                 response = self.session.get(url, params=params or {}, timeout=90)
                 if response.status_code == 429:
@@ -1216,7 +1216,7 @@ class EventbriteSync:
                     time.sleep(5 * (attempt + 1))
                 else:
                     raise
-def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
+    def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
         params = params or {}
         results = []
         while True:
