@@ -2576,7 +2576,7 @@ class DecisionEngine:
                     # Combine ALL days into ONE event instead of splitting by day
                     combined = self._create_day_event(pattern, group, group)
                     fixed_name = combined.event_name.rsplit(' - ', 1)[0] if ' - ' in combined.event_name else combined.event_name
-                    combined = combined._replace(event_name=fixed_name)
+                    combined.event_name = fixed_name
                     ungrouped.append(combined)
                 else:
                     by_date = defaultdict(list)
