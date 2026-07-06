@@ -1199,16 +1199,24 @@ class EventbriteSync:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         import time
         url = f"{self.BASE_URL}{endpoint}"
-        response = self.session.get(url, params=params or {}, timeout=90)
-        if response.status_code == 429:
-            retry = int(response.headers.get('Retry-After', 60))
-            log.warning(f"Rate limited, waiting {retry}s")
-            time.sleep(retry)
-            return self._get(endpoint, params)
-        if response.status_code != 200:
-            raise Exception(f"API error {response.status_code}: {response.text[:200]}")
-        return response.json()
-    def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
+                for attempt in range(3):
+            try:
+                response = self.session.get(url, params=params or {}, timeout=90)
+                if response.status_code == 429:
+                    retry = int(response.headers.get('Retry-After', 60))
+                    log.warning(f"Rate limited, waiting {retry}s")
+                    time.sleep(retry)
+                    continue
+                if response.status_code != 200:
+                    raise Exception(f"API error {response.status_code}: {response.text[:200]}")
+                return response.json()
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                log.warning(f"Eventbrite API error (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise
+def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
         params = params or {}
         results = []
         while True:
