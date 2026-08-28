@@ -1193,6 +1193,63 @@ class Database:
             FROM ad_spend
         """).fetchone()
         return dict(row) if row else {}
+
+    def backfill_ad_spend_into_snapshots(self):
+        """Backfill ad_spend_cumulative into daily_snapshots from the ad_spend table.
+
+        For each event that has ad_spend records, computes the running cumulative
+        spend by date and updates matching daily_snapshot rows.
+        """
+        event_ids = [r['event_id'] for r in self.conn.execute(
+            "SELECT DISTINCT event_id FROM ad_spend"
+        ).fetchall()]
+        updated = 0
+        for event_id in event_ids:
+            # Get all daily spend for this event, ordered by date
+            daily_spend = self.conn.execute("""
+                SELECT spend_date, SUM(spend) as day_total
+                FROM ad_spend WHERE event_id = ?
+                GROUP BY spend_date ORDER BY spend_date
+            """, (event_id,)).fetchall()
+            if not daily_spend:
+                continue
+            # Build cumulative spend by date
+            cumulative = 0.0
+            spend_by_date = {}
+            for row in daily_spend:
+                cumulative += row['day_total']
+                spend_by_date[row['spend_date']] = cumulative
+            # Also fill forward: for snapshot dates after the last spend date,
+            # the cumulative stays at the final total
+            final_cumulative = cumulative
+            # Get all snapshot dates for this event
+            snapshots = self.conn.execute("""
+                SELECT snapshot_date FROM daily_snapshots
+                WHERE event_id = ? ORDER BY snapshot_date
+            """, (event_id,)).fetchall()
+            with self.transaction() as conn:
+                running_spend = 0.0
+                for snap in snapshots:
+                    snap_date = snap['snapshot_date']
+                    if snap_date in spend_by_date:
+                        running_spend = spend_by_date[snap_date]
+                    elif snap_date > max(spend_by_date.keys()) if spend_by_date else False:
+                        running_spend = final_cumulative
+                    # For dates before any spend, running_spend stays at 0 or last known
+                    # We need to find the latest spend date <= snap_date
+                    else:
+                        # Find the most recent spend_date <= snap_date
+                        best = 0.0
+                        for sd, cum in spend_by_date.items():
+                            if sd <= snap_date:
+                                best = cum
+                        running_spend = best
+                    conn.execute("""
+                        UPDATE daily_snapshots SET ad_spend_cumulative = ?
+                        WHERE event_id = ? AND snapshot_date = ?
+                    """, (round(running_spend, 2), event_id, snap_date))
+                    updated += 1
+        log.info(f"Backfilled ad_spend_cumulative into {updated} snapshot rows for {len(event_ids)} events")
 # =============================================================================
 # EVENTBRITE SYNC
 # =============================================================================
@@ -1393,7 +1450,7 @@ class EventbriteSync:
                 return t
         return 'other'
     def _build_snapshots(self, event_id: str, event_date: date, capacity: int):
-        """Build daily snapshots from orders."""
+        """Build daily snapshots from orders, including ad spend."""
         orders = self.db.get_orders_for_event(event_id)
         if not orders:
             return
@@ -1406,8 +1463,16 @@ class EventbriteSync:
                 pass
         if not daily:
             return
+        # Pre-load ad spend by date for this event
+        ad_spend_rows = self.db.conn.execute("""
+            SELECT spend_date, SUM(spend) as day_total
+            FROM ad_spend WHERE event_id = ?
+            GROUP BY spend_date ORDER BY spend_date
+        """, (event_id,)).fetchall()
+        ad_spend_by_date = {r['spend_date']: r['day_total'] for r in ad_spend_rows}
         cumulative_tickets = 0
         cumulative_revenue = 0
+        cumulative_spend = 0.0
         first_date = min(daily.keys())
         current = first_date
         while current <= event_date:
@@ -1417,11 +1482,13 @@ class EventbriteSync:
             revenue_today = sum((o.get('gross_amount') or 0) for o in day_orders)
             cumulative_tickets += tickets_today
             cumulative_revenue += revenue_today
+            cumulative_spend += ad_spend_by_date.get(current.isoformat(), 0)
             sell_through = (cumulative_tickets / capacity * 100) if capacity > 0 else 0
             self.db.save_snapshot(
                 event_id, current.isoformat(), days_before,
                 cumulative_tickets, cumulative_revenue,
-                tickets_today, revenue_today, len(day_orders), sell_through
+                tickets_today, revenue_today, len(day_orders), sell_through,
+                spend=round(cumulative_spend, 2)
             )
             current += timedelta(days=1)
     def _build_all_customers(self) -> int:
@@ -2645,6 +2712,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                         log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
                                  f"${meta_result.get('total_spend', 0):.2f} spend")
                     log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
+                    # Backfill ad spend into daily snapshots so historical comparisons work
+                    db.backfill_ad_spend_into_snapshots()
                 except Exception as me:
                     log.error(f"Meta sync error: {me}")
             # Check for milestones and generate auto-exports
@@ -2859,6 +2928,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                     meta = MetaAdsSync(meta_token, acct_id, db)
                     result = meta.sync_all_events(all_events)
                     log.info(f"Manual Meta sync complete for {acct_id}: {result}")
+                # Backfill ad spend into daily snapshots
+                db.backfill_ad_spend_into_snapshots()
             except Exception as e:
                 log.error(f"Manual Meta sync error: {e}")
         threading.Thread(target=_do_meta_sync, daemon=True).start()
