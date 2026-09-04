@@ -174,7 +174,7 @@ def get_phase(days_until: int) -> Optional[Dict]:
 class ClaudeClient:
     """Minimal Anthropic Messages API client using requests."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, api_key: str, model: str = "claude-sonnet-5"):
         self.api_key = api_key
         self.model = model
         self.base_url = "https://api.anthropic.com/v1/messages"
