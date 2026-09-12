@@ -2017,80 +2017,81 @@ class MetaAdsSync:
                     time.sleep(2 ** attempt)
         return None
 
-    def _generate_keywords(self, event_name: str):
-        """Generate search keywords from event name for campaign matching.
-
-        Includes: full name, bigrams, auto-abbreviations, and alias lookups
-        so campaigns named 'DBF Winter' match 'District Beer Fest: Winter'.
-        """
+    def _clean_event_name(self, event_name: str) -> str:
+        """Strip year, season, edition from event name and return lowercase cleaned version."""
         cleaned = re.sub(r'\b20\d{2}\b', '', event_name)
         for word in ['spring edition', 'fall edition', 'summer edition', 'winter edition',
                       'edition', 'spring', 'fall', 'summer', 'winter']:
             cleaned = re.sub(r'\b' + word + r'\b', '', cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r'[^\w\s]', '', cleaned)
-        cleaned = ' '.join(cleaned.split()).strip().lower()
-        if not cleaned:
-            return []
-        keywords = [cleaned]
-        words = cleaned.split()
-        if len(words) >= 2:
-            for i in range(len(words) - 1):
-                keywords.append(f"{words[i]} {words[i+1]}")
+        return ' '.join(cleaned.split()).strip().lower()
 
-        # Auto-generate abbreviations from first letters of each word
-        if len(words) >= 2:
-            # Full initials: "district beer fest" -> "dbf"
-            initials = ''.join(w[0] for w in words if w)
-            if len(initials) >= 2:
-                keywords.append(initials)
-            # Also try without common filler words for shorter abbrevs
-            skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an'}
-            content_words = [w for w in words if w not in skip_words]
-            if len(content_words) >= 2:
-                content_initials = ''.join(w[0] for w in content_words if w)
-                if content_initials != initials and len(content_initials) >= 2:
-                    keywords.append(content_initials)
-
-        # Check alias map: find aliases whose event patterns match this event name
+    def _get_abbreviations(self, event_name: str) -> List[str]:
+        """Get known abbreviations for this event from the alias map."""
+        abbrevs = []
         event_lower = event_name.lower()
         for alias, patterns in self.EVENT_ALIASES.items():
             for pattern in patterns:
                 if pattern in event_lower or event_lower in pattern:
-                    keywords.append(alias)
+                    abbrevs.append(alias)
                     break
+        return abbrevs
 
-        # Reverse alias lookup: check if any alias IS in the event name
-        # (handles cases where we're searching from the campaign side)
-        for alias, patterns in self.EVENT_ALIASES.items():
-            if alias in event_lower.replace(' ', ''):
-                for pattern in patterns:
-                    if pattern not in keywords:
-                        keywords.append(pattern)
+    def _campaign_matches_event(self, campaign_name: str, event_name: str) -> Optional[str]:
+        """Determine if a Meta campaign belongs to a specific event.
 
-        # Deduplicate while preserving order
-        seen = set()
-        unique = []
-        for kw in keywords:
-            if kw not in seen:
-                seen.add(kw)
-                unique.append(kw)
-        return unique
+        Uses strict matching to avoid cross-event contamination:
+        1. Full cleaned event name appears in campaign name
+        2. ALL content words from event name appear in campaign name
+        3. A known abbreviation appears as a whole word in campaign name
+        4. Reverse alias: campaign contains abbreviation that maps to this event
+
+        Returns the match reason string, or None if no match.
+        """
+        cleaned = self._clean_event_name(event_name)
+        if not cleaned:
+            return None
+        cname = campaign_name.lower()
+        cname_clean = re.sub(r'[^\w\s]', '', cname)
+
+        # Strategy 1: Full cleaned name is substring of campaign name
+        if cleaned in cname_clean:
+            return f"full name '{cleaned}'"
+
+        # Strategy 2: ALL content words present in campaign name
+        skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an', 'festival', 'fest'}
+        content_words = [w for w in cleaned.split() if w not in skip_words]
+        if len(content_words) >= 2:
+            cname_words_set = set(cname_clean.split())
+            if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
+                return f"all content words {content_words}"
+
+        # Strategy 3: Known abbreviation appears as whole word in campaign
+        abbrevs = self._get_abbreviations(event_name)
+        cname_words = set(cname_clean.split())
+        for abbr in abbrevs:
+            if abbr in cname_words:
+                return f"abbreviation '{abbr}'"
+
+        # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
+        event_lower = event_name.lower()
+        for word in cname_words:
+            if word in self.EVENT_ALIASES:
+                for pattern in self.EVENT_ALIASES[word]:
+                    if pattern in event_lower or event_lower in pattern:
+                        return f"reverse alias '{word}'->'{pattern}'"
+
+        return None
 
     def _find_campaigns(self, event_name: str):
-        """Find Meta campaigns matching an event name.
-
-        Uses two matching strategies:
-        1. Forward match: event keywords found in campaign name
-        2. Reverse alias match: campaign name words that are known aliases for this event
-        """
-        keywords = self._generate_keywords(event_name)
-        if not keywords:
+        """Find Meta campaigns matching an event name using strict matching."""
+        cleaned = self._clean_event_name(event_name)
+        if not cleaned:
             return []
         url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
         params = {'fields': 'id,name,status,objective', 'limit': 200}
         matched = []
         seen_ids = set()
-        event_lower = event_name.lower()
         while url:
             data = self._api_get(url, params)
             if not data:
@@ -2098,24 +2099,7 @@ class MetaAdsSync:
             for campaign in data.get('data', []):
                 if campaign['id'] in seen_ids:
                     continue
-                cname = campaign['name'].lower()
-                match_reason = None
-                # Forward match: check if any event keyword appears in campaign name
-                for kw in keywords:
-                    if kw in cname:
-                        match_reason = f"keyword '{kw}'"
-                        break
-                # Reverse alias match: check if any word in campaign name is a known alias
-                if not match_reason:
-                    cname_clean = re.sub(r'[^\w\s]', '', cname)
-                    for word in cname_clean.split():
-                        if word in self.EVENT_ALIASES:
-                            for pattern in self.EVENT_ALIASES[word]:
-                                if pattern in event_lower or event_lower in pattern:
-                                    match_reason = f"reverse alias '{word}'->'{pattern}'"
-                                    break
-                            if match_reason:
-                                break
+                match_reason = self._campaign_matches_event(campaign['name'], event_name)
                 if match_reason:
                     matched.append({'id': campaign['id'], 'name': campaign['name'],
                                     'status': campaign.get('status')})
@@ -2128,7 +2112,7 @@ class MetaAdsSync:
                 params = {}
             else:
                 break
-        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}' (keywords: {keywords[:5]})")
+        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}'")
         return matched
 
     def _fetch_daily_insights(self, campaign_id: str, date_start: str, date_stop: str):
@@ -2985,11 +2969,13 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             upcoming = db.get_events(upcoming_only=True)
             if upcoming:
                 test_event = upcoming[0]
-                keywords = meta._generate_keywords(test_event['name'])
+                abbreviations = meta._get_abbreviations(test_event['name'])
+                cleaned = meta._clean_event_name(test_event['name'])
                 campaigns_found = meta._find_campaigns(test_event['name'])
                 results['tests'].append({
                     'test': f'Campaign match for "{test_event["name"]}"',
-                    'keywords_generated': keywords[:10],
+                    'cleaned_name': cleaned,
+                    'abbreviations': abbreviations,
                     'campaigns_matched': len(campaigns_found),
                     'matched_names': [c['name'] for c in campaigns_found[:5]],
                 })
