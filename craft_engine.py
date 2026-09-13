@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, date
 from typing import Optional, Dict, List, Any, Tuple
 from collections import defaultdict
 from contextlib import contextmanager
+from suppression_guard import SuppressionGuard
 
 log = logging.getLogger('craft.engine')
 
@@ -455,6 +456,66 @@ class MailchimpClient:
                 if seg.get('name') == tag:
                     return seg['id']
         return None
+
+    # ── Suppression queries ───────────────────────────────
+
+    def get_suppressed_members(self) -> Optional[List[str]]:
+        """Fetch all suppressed members (unsubscribed + cleaned) from Mailchimp.
+
+        Paginates through the full audience for each non-sendable status.
+        Returns a list of lowercased email addresses, or None on any error.
+
+        None return means "we could not get the authoritative set" — callers
+        must treat this as a failure and NOT update local state.
+        """
+        suppressed: List[str] = []
+
+        for status in ("unsubscribed", "cleaned"):
+            page_emails = self._get_members_by_status(status)
+            if page_emails is None:
+                # Any pagination failure ⇒ abort entirely
+                log.error(f"Failed to fetch {status} members — aborting suppression refresh")
+                return None
+            suppressed.extend(page_emails)
+
+        return suppressed
+
+    def _get_members_by_status(self, status: str, page_size: int = 1000) -> Optional[List[str]]:
+        """Paginate through all audience members with a given status.
+
+        Returns list of lowercased emails, or None on any request failure.
+        """
+        emails: List[str] = []
+        offset = 0
+
+        while True:
+            resp = self._request(
+                'GET',
+                f'/lists/{self.audience_id}/members'
+                f'?status={status}&count={page_size}&offset={offset}',
+                timeout=60,
+            )
+            if resp is None:
+                log.error(f"Mailchimp members request failed: status={status}, offset={offset}")
+                return None
+
+            members = resp.get('members', [])
+            for m in members:
+                addr = m.get('email_address', '').lower().strip()
+                if addr:
+                    emails.append(addr)
+
+            total_items = resp.get('total_items', 0)
+            offset += len(members)
+
+            # Done when we've fetched all or got an empty page
+            if not members or offset >= total_items:
+                break
+
+            # Brief pause between pages to respect rate limits
+            time.sleep(0.2)
+
+        return emails
 
 
 # =============================================================================
@@ -1142,19 +1203,27 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
     # ─────────────────────────────────────────────────────────
 
     def process_mailchimp_webhook(self, data: Dict) -> Dict:
-        """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity)."""
+        """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity).
+
+        After writing a suppression row, updates the suppression sentinel
+        via SuppressionGuard.record_mutation() so the fail-closed guard
+        stays in sync with actual table state.
+        """
         event_type = data.get('type', '')
         email = ''
+        suppression_written = False
         ts = datetime.now().isoformat()
 
         if event_type == 'unsubscribe':
             email = data.get('data', {}).get('email', '').lower()
             if email:
                 self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
+                suppression_written = True
         elif event_type == 'cleaned':
             email = data.get('data', {}).get('email', '').lower()
             if email:
                 self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
+                suppression_written = True
         elif event_type == 'campaign':
             # Campaign sent notification — we can pull reports
             mc_campaign_id = data.get('data', {}).get('id', '')
@@ -1171,6 +1240,17 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
             """, ('', event_type, email, ts, json.dumps(data)))
 
         self.db.conn.commit()
+
+        # Update suppression sentinel AFTER successful commit
+        if suppression_written:
+            try:
+                guard = SuppressionGuard(self.db)
+                guard.record_mutation(source=f"webhook_{event_type}")
+            except Exception as e:
+                log.error(f"Failed to update suppression sentinel after webhook: {e}")
+                # Do not fail the webhook — the suppression row is already committed.
+                # The sentinel mismatch will be caught on next validate() call.
+
         return {'processed': 1, 'type': event_type}
 
     def sync_campaign_stats(self, campaign_id: str) -> Optional[Dict]:
