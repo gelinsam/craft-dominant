@@ -71,7 +71,11 @@ class CampaignDraftAdapter:
         # Conversion modeling — deterministic, no LLM
         avg_price = diagnosis_data.get("avg_ticket_price", 0)
         champions = diagnosis_data.get("crm_champions", 0)
+        gap_tickets = diagnosis_data.get("gap_tickets")
         conversions = self._model_conversions(audience_count, champions)
+        # Cap conversions at the gap — we can't sell more tickets than are needed
+        if gap_tickets is not None and gap_tickets > 0:
+            conversions["expected_tickets"] = min(conversions["expected_tickets"], gap_tickets)
         expected_revenue = conversions["expected_tickets"] * avg_price
 
         # Generate campaign draft ID
@@ -150,13 +154,17 @@ class CampaignDraftAdapter:
         buyers = self.db.get_event_buyers(event_id)
         buyer_set = set(buyers)
 
-        # Get suppressions
+        # Get suppressions — this is a hard invariant.
+        # If we cannot verify the suppression list, we MUST NOT produce an audience.
         suppressed = set()
         try:
             rows = self.db.conn.execute("SELECT email FROM suppressions").fetchall()
             suppressed = {r["email"] for r in rows}
-        except Exception:
-            pass  # suppressions table may not exist
+        except Exception as e:
+            raise ValueError(
+                f"Cannot verify suppression list: {e}. "
+                "Campaign draft blocked to prevent sending to unsubscribed contacts."
+            )
 
         exclude = buyer_set | suppressed
 
@@ -206,13 +214,24 @@ class CampaignDraftAdapter:
         }
 
     def _model_conversions(self, audience_count: int, champions: int) -> Dict[str, int]:
-        """Deterministic conversion model — no LLM involved."""
+        """Deterministic conversion model — no LLM involved.
+
+        Uses one coherent funnel for all segments:
+          base_prob = open_rate × click_rate × conversion_rate
+          champion_prob = min(base_prob × champion_multiplier, 1.0)
+
+        Non-champions convert at base_prob; champions convert at champion_prob.
+        """
         expected_opens = int(audience_count * EMAIL_OPEN_RATE)
         expected_clicks = int(expected_opens * EMAIL_CLICK_RATE)
-        base_conversions = int(expected_clicks * EMAIL_CONVERSION_RATE)
-        champion_conversions = int(
-            champions * EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * CHAMPION_MULTIPLIER
-        )
+
+        base_prob = EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * EMAIL_CONVERSION_RATE
+        champion_prob = min(base_prob * CHAMPION_MULTIPLIER, 1.0)
+
+        non_champions = max(0, audience_count - champions)
+        base_conversions = int(non_champions * base_prob)
+        champion_conversions = int(champions * champion_prob)
+
         return {
             "expected_opens": expected_opens,
             "expected_clicks": expected_clicks,

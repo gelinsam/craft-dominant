@@ -57,7 +57,7 @@ class Diagnosis:
     meta_spend_recent_7d: float
     meta_impressions_recent_7d: int
     meta_clicks_recent_7d: int
-    cac: float  # cost per acquisition; 0 if no spend data
+    blended_ad_spend_per_ticket: float  # total ad spend / all tickets; 0 if no spend data
     # Audience
     crm_audience_total: int
     crm_past_attendees: int
@@ -123,8 +123,9 @@ class DiagnosisEngine:
         historical_velocity = self._compute_historical_velocity(event_id, event, days_until)
 
         # ── Meta spend ──────────────────────────────────────────────────
+        meta_data_status = self._check_meta_data_status(event_id)
         meta_total, meta_7d_spend, meta_7d_impressions, meta_7d_clicks = self._get_meta_spend(event_id)
-        cac = self._compute_cac(event_id, meta_total)
+        blended_ad_spend_per_ticket = self._compute_blended_ad_spend_per_ticket(event_id, meta_total)
 
         # ── CRM audience ────────────────────────────────────────────────
         audience = self._compute_audience(event_id, event)
@@ -137,6 +138,7 @@ class DiagnosisEngine:
         missing = self._detect_missing_data(
             meta_total, recent_velocity, historical_velocity,
             audience, historical_editions, historical_campaigns,
+            meta_data_status,
         )
 
         # ── Root cause analysis ─────────────────────────────────────────
@@ -147,11 +149,12 @@ class DiagnosisEngine:
             meta_total=meta_total,
             meta_7d_spend=meta_7d_spend,
             meta_7d_clicks=meta_7d_clicks,
-            cac=cac,
+            blended_ad_spend_per_ticket=blended_ad_spend_per_ticket,
             days_until=days_until,
             sell_through=sell_through,
             audience=audience,
             historical_campaigns=historical_campaigns,
+            meta_data_status=meta_data_status,
         )
 
         # ── Intervention options ────────────────────────────────────────
@@ -162,7 +165,7 @@ class DiagnosisEngine:
             days_until=days_until,
             audience=audience,
             meta_total=meta_total,
-            cac=cac,
+            blended_ad_spend_per_ticket=blended_ad_spend_per_ticket,
         )
 
         # Pick recommendation
@@ -187,7 +190,7 @@ class DiagnosisEngine:
             meta_spend_recent_7d=round(meta_7d_spend, 2),
             meta_impressions_recent_7d=meta_7d_impressions,
             meta_clicks_recent_7d=meta_7d_clicks,
-            cac=round(cac, 2),
+            blended_ad_spend_per_ticket=round(blended_ad_spend_per_ticket, 2),
             crm_audience_total=audience["total"],
             crm_past_attendees=audience["past_attendees"],
             crm_champions=audience["champions"],
@@ -268,14 +271,36 @@ class DiagnosisEngine:
             log.warning(f"Meta spend lookup failed for {event_id}: {e}")
         return total, spend_7d, impressions_7d, clicks_7d
 
-    def _compute_cac(self, event_id: str, total_spend: float) -> float:
-        """Cost per acquisition: total ad spend / tickets sold."""
+    def _check_meta_data_status(self, event_id: str) -> str:
+        """Check if Meta ad spend data is available for this event.
+
+        Returns:
+            'has_data'   - ad_spend table has rows for this event
+            'no_records' - ad_spend table exists but no rows for this event
+            'unavailable' - ad_spend table doesn't exist or query failed
+        """
+        try:
+            row = self.db.conn.execute(
+                "SELECT COUNT(*) as cnt FROM ad_spend WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return "has_data" if row and int(row["cnt"]) > 0 else "no_records"
+        except Exception:
+            return "unavailable"
+
+    def _compute_blended_ad_spend_per_ticket(self, event_id: str, total_spend: float) -> float:
+        """Blended ad spend per ticket: total ad spend / all tickets sold.
+
+        Note: this divides total Meta spend by ALL tickets (including organic).
+        It is NOT a true CAC — it's a blended cost metric.
+        """
         if total_spend <= 0:
             return 0.0
         try:
             tickets = self.db.get_event_tickets(event_id)
             return total_spend / tickets if tickets > 0 else 0.0
-        except Exception:
+        except Exception as e:
+            log.warning(f"Blended ad spend computation failed for {event_id}: {e}")
             return 0.0
 
     def _compute_audience(self, event_id: str, event: dict) -> Dict[str, int]:
@@ -346,10 +371,10 @@ class DiagnosisEngine:
         return editions
 
     def _count_historical_campaigns(self, event_id: str) -> int:
-        """Count campaigns already sent for this event."""
+        """Count campaigns actually sent for this event (excludes drafts)."""
         try:
             row = self.db.conn.execute(
-                "SELECT COUNT(*) as cnt FROM campaigns WHERE event_id = ?",
+                "SELECT COUNT(*) as cnt FROM campaigns WHERE event_id = ? AND sent_at IS NOT NULL",
                 (event_id,),
             ).fetchone()
             return int(row["cnt"]) if row else 0
@@ -365,10 +390,19 @@ class DiagnosisEngine:
         audience: Dict[str, int],
         historical_editions: list,
         historical_campaigns: int,
+        meta_data_status: str = "unknown",
     ) -> List[str]:
         warnings = []
         if meta_total <= 0:
-            warnings.append("No Meta ad spend data available — cannot assess paid performance or CAC.")
+            if meta_data_status == "unavailable":
+                warnings.append(
+                    "Meta ad spend data is unavailable (possible expired token, sync failure, "
+                    "or missing ad_spend table) — cannot assess paid performance."
+                )
+            else:
+                warnings.append(
+                    "No Meta ad spend recorded for this event — cannot assess paid performance."
+                )
         if recent_velocity is None:
             warnings.append("Insufficient snapshot data to compute recent ticket velocity.")
         if historical_velocity is None:
@@ -391,11 +425,12 @@ class DiagnosisEngine:
         meta_total: float,
         meta_7d_spend: float,
         meta_7d_clicks: int,
-        cac: float,
+        blended_ad_spend_per_ticket: float,
         days_until: int,
         sell_through: float,
         audience: dict,
         historical_campaigns: int,
+        meta_data_status: str = "unknown",
     ) -> List[RootCause]:
         """Deterministic root cause identification from available signals."""
         causes: List[RootCause] = []
@@ -426,23 +461,35 @@ class DiagnosisEngine:
                     ],
                     confidence=0.70,
                 ))
-            if cac > 0 and cac > 50:
+            if blended_ad_spend_per_ticket > 0 and blended_ad_spend_per_ticket > 50:
                 causes.append(RootCause(
-                    cause="Customer acquisition cost is high",
+                    cause="Blended ad spend per ticket is high",
                     evidence=[
-                        f"CAC is ${cac:.2f} per ticket (total spend ${meta_total:.0f})",
+                        f"Blended ad spend is ${blended_ad_spend_per_ticket:.2f} per ticket "
+                        f"(total spend ${meta_total:.0f} / all tickets including organic)",
                     ],
                     confidence=0.60,
                 ))
         elif meta_total <= 0 and days_until > 14:
-            causes.append(RootCause(
-                cause="No paid advertising detected",
-                evidence=[
-                    "No Meta ad spend records found for this event",
-                    f"{days_until} days of runway remain",
-                ],
-                confidence=0.50,
-            ))
+            # Distinguish: is Meta data unavailable, or is there genuinely no spend?
+            if meta_data_status == "unavailable":
+                causes.append(RootCause(
+                    cause="Meta ad spend data is unavailable",
+                    evidence=[
+                        "Could not query ad_spend table — possible expired token, sync failure, or missing configuration",
+                        f"{days_until} days of runway remain — ad performance cannot be assessed",
+                    ],
+                    confidence=0.40,
+                ))
+            else:
+                causes.append(RootCause(
+                    cause="No paid advertising detected",
+                    evidence=[
+                        "No Meta ad spend records found for this event",
+                        f"{days_until} days of runway remain",
+                    ],
+                    confidence=0.50,
+                ))
 
         # 3. Under-marketed (few campaigns sent)
         if historical_campaigns < 2 and days_until > 7:
@@ -504,21 +551,23 @@ class DiagnosisEngine:
         days_until: int,
         audience: dict,
         meta_total: float,
-        cac: float,
+        blended_ad_spend_per_ticket: float,
     ) -> List[InterventionOption]:
         options: List[InterventionOption] = []
 
         # Option 1: CRM recovery campaign (always available if audience exists)
         if audience["total"] > 0:
             reachable = audience["past_attendees"] + audience["city_prospects"]
-            # Expected conversions from an email campaign
+            # Expected conversions from an email campaign — unified funnel model
             expected_opens = int(reachable * self.EMAIL_OPEN_RATE)
             expected_clicks = int(expected_opens * self.EMAIL_CLICK_RATE)
-            # Champion boost
-            champion_conversions = int(
-                audience["champions"] * self.EMAIL_OPEN_RATE * self.EMAIL_CLICK_RATE * self.CHAMPION_MULTIPLIER
-            )
-            base_conversions = int(expected_clicks * self.EMAIL_CONVERSION_RATE)
+
+            base_prob = self.EMAIL_OPEN_RATE * self.EMAIL_CLICK_RATE * self.EMAIL_CONVERSION_RATE
+            champion_prob = min(base_prob * self.CHAMPION_MULTIPLIER, 1.0)
+
+            non_champions = max(0, reachable - audience["champions"])
+            base_conversions = int(non_champions * base_prob)
+            champion_conversions = int(audience["champions"] * champion_prob)
             total_conversions = base_conversions + champion_conversions
             # Cap at gap
             total_conversions = min(total_conversions, gap_tickets)
@@ -543,11 +592,11 @@ class DiagnosisEngine:
             ))
 
         # Option 2: Ad budget reallocation (only if we have spend data)
-        if meta_total > 0 and cac > 0 and days_until > 7:
-            # Model: what if we could reduce CAC by 20% through better targeting?
-            improved_cac = cac * 0.80
-            additional_budget = min(meta_total * 0.25, gap_tickets * improved_cac)
-            additional_tickets = int(additional_budget / improved_cac) if improved_cac > 0 else 0
+        if meta_total > 0 and blended_ad_spend_per_ticket > 0 and days_until > 7:
+            # Model: what if we could reduce blended spend/ticket by 20% through better targeting?
+            improved_cost = blended_ad_spend_per_ticket * 0.80
+            additional_budget = min(meta_total * 0.25, gap_tickets * improved_cost)
+            additional_tickets = int(additional_budget / improved_cost) if improved_cost > 0 else 0
             additional_tickets = min(additional_tickets, gap_tickets)
             expected_rev = additional_tickets * avg_price
 
@@ -555,9 +604,9 @@ class DiagnosisEngine:
                 intervention_type="ad_budget_shift",
                 label="Paid ad optimization / budget shift",
                 rationale=(
-                    f"Current CAC is ${cac:.2f}. Reallocating or optimizing "
-                    f"${additional_budget:.0f} in ad spend could yield ~{additional_tickets} "
-                    f"additional tickets at improved targeting."
+                    f"Current blended ad spend is ${blended_ad_spend_per_ticket:.2f}/ticket. "
+                    f"Reallocating or optimizing ${additional_budget:.0f} in ad spend could "
+                    f"yield ~{additional_tickets} additional tickets at improved targeting."
                 ),
                 expected_revenue=round(expected_rev, 2),
                 expected_cost=round(additional_budget, 2),

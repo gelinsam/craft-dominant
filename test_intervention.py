@@ -432,11 +432,17 @@ class TestCampaignAdapter(unittest.TestCase):
             self.assertNotIn(email, buyer_set)
 
     def test_conversion_math_deterministic(self):
+        """Regression: unified funnel — champions include purchase conversion rate."""
         result = self.adapter._model_conversions(1000, 50)
         expected_opens = int(1000 * EMAIL_OPEN_RATE)
         expected_clicks = int(expected_opens * EMAIL_CLICK_RATE)
-        base = int(expected_clicks * EMAIL_CONVERSION_RATE)
-        champion = int(50 * EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * CHAMPION_MULTIPLIER)
+
+        # Unified funnel: all segments use open → click → purchase
+        base_prob = EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * EMAIL_CONVERSION_RATE
+        champion_prob = min(base_prob * CHAMPION_MULTIPLIER, 1.0)
+        non_champions = 1000 - 50
+        base = int(non_champions * base_prob)
+        champion = int(50 * champion_prob)
 
         self.assertEqual(result["expected_opens"], expected_opens)
         self.assertEqual(result["expected_clicks"], expected_clicks)
@@ -494,6 +500,52 @@ class TestCampaignAdapter(unittest.TestCase):
 
         # Different opportunity → different ID
         self.assertNotEqual(iid, _intervention_id("opp-xyz", "crm_campaign"))
+
+    def test_suppression_failure_blocks_draft(self):
+        """Regression: if suppression list cannot be read, prepare_draft must fail."""
+        # Drop the suppressions table to simulate unavailability
+        self.db.conn.execute("DROP TABLE suppressions")
+        self.db.conn.commit()
+
+        adapter = CampaignDraftAdapter(self.db)
+        intervention = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", confidence=0.55,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            adapter.prepare_draft(intervention, {
+                "avg_ticket_price": 50.0,
+                "crm_champions": 25,
+            })
+        self.assertIn("suppression", str(ctx.exception).lower())
+
+    def test_gap_cap_applied_in_prepare_draft(self):
+        """Regression: conversions should be capped at gap_tickets in campaign adapter."""
+        intervention = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", confidence=0.55,
+        )
+        # gap_tickets=1 should cap conversions at 1
+        result = self.adapter.prepare_draft(intervention, {
+            "avg_ticket_price": 50.0,
+            "crm_champions": 25,
+            "gap_tickets": 1,
+        })
+        self.assertLessEqual(result["conversion_assumptions"]["expected_tickets"], 1)
+
+    def test_champion_funnel_includes_conversion_rate(self):
+        """Regression: champion conversions must include EMAIL_CONVERSION_RATE term."""
+        # With unified funnel, champion prob should be base_prob * CHAMPION_MULTIPLIER
+        result = self.adapter._model_conversions(0, 100)
+        # With 0 non-champion audience, only champion conversions should be present
+        base_prob = EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * EMAIL_CONVERSION_RATE
+        champion_prob = min(base_prob * CHAMPION_MULTIPLIER, 1.0)
+        expected = int(100 * champion_prob)
+        self.assertEqual(result["expected_tickets"], expected)
+        # Verify the champion_prob is meaningfully smaller than the old (buggy) formula
+        old_buggy = int(100 * EMAIL_OPEN_RATE * EMAIL_CLICK_RATE * CHAMPION_MULTIPLIER)
+        self.assertLess(result["expected_tickets"], old_buggy,
+                        "Champion conversions should be smaller with conversion_rate included")
 
 
 if __name__ == "__main__":

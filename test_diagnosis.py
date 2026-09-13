@@ -326,7 +326,7 @@ class TestDiagnosisComplete(unittest.TestCase):
         self.assertIn("intervention_options", d)
 
     def test_expected_value_math(self):
-        """Verify the CRM campaign conversion math is deterministic."""
+        """Verify the CRM campaign conversion math uses unified funnel model."""
         opp = {
             "opportunity_id": "abc123",
             "evidence": {
@@ -343,20 +343,39 @@ class TestDiagnosisComplete(unittest.TestCase):
             None,
         )
         if crm_opt:
-            # Verify deterministic math
+            # Verify unified funnel: all segments use open → click → purchase
             audience = diagnosis.crm_audience_total
-            expected_opens = int(audience * 0.22)
-            expected_clicks = int(expected_opens * 0.035)
-            base_conversions = int(expected_clicks * 0.012)
-            champion_conversions = int(
-                diagnosis.crm_champions * 0.22 * 0.035 * 2.5
-            )
+            base_prob = 0.22 * 0.035 * 0.012
+            champion_prob = min(base_prob * 2.5, 1.0)
+            non_champions = max(0, audience - diagnosis.crm_champions)
+            base_conversions = int(non_champions * base_prob)
+            champion_conversions = int(diagnosis.crm_champions * champion_prob)
             total_conversions = min(base_conversions + champion_conversions, 300)
             expected_rev = total_conversions * 50.0
 
             self.assertAlmostEqual(crm_opt.expected_revenue, expected_rev, places=0)
             self.assertEqual(crm_opt.expected_cost, 0.0)  # Email is free
             self.assertEqual(crm_opt.risk, "low")
+
+    def test_blended_ad_spend_per_ticket_field(self):
+        """Regression: field is blended_ad_spend_per_ticket, not cac."""
+        opp = {
+            "opportunity_id": "abc123",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 700,
+                "pace_delta_pct": -29, "gap_tickets": 300,
+                "avg_ticket_price": 50.0,
+            },
+        }
+        diagnosis = self.engine.diagnose("evt1", opp)
+        self.assertTrue(hasattr(diagnosis, "blended_ad_spend_per_ticket"))
+        self.assertFalse(hasattr(diagnosis, "cac"))
+        # 1400 total spend / 700 tickets = 2.0
+        self.assertAlmostEqual(diagnosis.blended_ad_spend_per_ticket, 2.0, places=1)
+        # Verify serialized dict also uses correct name
+        d = diagnosis.to_dict()
+        self.assertIn("blended_ad_spend_per_ticket", d)
+        self.assertNotIn("cac", d)
 
 
 class TestDiagnosisMissingData(unittest.TestCase):
@@ -471,6 +490,117 @@ class TestDiagnosisRootCauses(unittest.TestCase):
         diagnosis = engine.diagnose("evt3", opp)
         velocity_causes = [rc for rc in diagnosis.root_causes if "velocity" in rc.cause.lower() or "stall" in rc.cause.lower()]
         self.assertGreater(len(velocity_causes), 0)
+
+    def test_meta_unavailable_vs_zero_spend(self):
+        """Regression: distinguish meta data unavailable from no spend."""
+        # evt3 has an ad_spend table (created by FakeDB) but no rows → "no_records"
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        opp = {
+            "opportunity_id": "test_meta",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 200,
+                "pace_delta_pct": -20, "gap_tickets": 200,
+                "avg_ticket_price": 60.0,
+            },
+        }
+        diagnosis = engine.diagnose("evt3", opp)
+        # With ad_spend table existing but no rows: should say "No paid advertising detected"
+        no_ad = [rc for rc in diagnosis.root_causes if "No paid advertising" in rc.cause]
+        self.assertGreater(len(no_ad), 0, "Should detect no paid advertising when table exists but has no rows")
+
+    def test_meta_unavailable_warns_differently(self):
+        """Regression: when ad_spend table is missing, root cause should say 'unavailable'."""
+        # Drop the ad_spend table to simulate unavailable Meta data
+        self.db.conn.execute("DROP TABLE ad_spend")
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        opp = {
+            "opportunity_id": "test_meta_unavail",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 200,
+                "pace_delta_pct": -20, "gap_tickets": 200,
+                "avg_ticket_price": 60.0,
+            },
+        }
+        diagnosis = engine.diagnose("evt3", opp)
+        # Should say "unavailable" not "No paid advertising detected"
+        unavailable = [rc for rc in diagnosis.root_causes if "unavailable" in rc.cause.lower()]
+        self.assertGreater(len(unavailable), 0, "Should detect Meta data unavailability")
+        no_ad = [rc for rc in diagnosis.root_causes if "No paid advertising detected" in rc.cause]
+        self.assertEqual(len(no_ad), 0, "Should NOT say 'no paid advertising' when data is unavailable")
+
+    def test_campaign_history_counts_only_sent(self):
+        """Regression: historical_campaigns_sent counts only sent campaigns, not drafts."""
+        # Create campaigns table with both draft and sent campaigns
+        self.db.conn.executescript("""
+            CREATE TABLE campaigns (
+                id TEXT PRIMARY KEY, event_id TEXT, campaign_type TEXT,
+                channel TEXT, phase TEXT, subject_line TEXT, preview_text TEXT,
+                body_html TEXT, cta_text TEXT, cta_url TEXT,
+                segment_name TEXT, segment_sql TEXT, audience_count INTEGER,
+                status TEXT, sent_at TEXT, barrier_addressed TEXT,
+                confidence_score REAL, strategic_reasoning TEXT,
+                predicted_open_rate REAL, predicted_click_rate REAL,
+                predicted_revenue REAL, created_at TEXT, updated_at TEXT
+            );
+            INSERT INTO campaigns (id, event_id, campaign_type, channel, subject_line,
+                body_html, status, sent_at)
+            VALUES ('c1', 'evt3', 'recovery', 'email', 'Test1', '<p>test</p>', 'sent', '2024-01-01');
+            INSERT INTO campaigns (id, event_id, campaign_type, channel, subject_line,
+                body_html, status, sent_at)
+            VALUES ('c2', 'evt3', 'recovery', 'email', 'Test2', '<p>test</p>', 'draft', NULL);
+            INSERT INTO campaigns (id, event_id, campaign_type, channel, subject_line,
+                body_html, status, sent_at)
+            VALUES ('c3', 'evt3', 'recovery', 'email', 'Test3', '<p>test</p>', 'draft', NULL);
+        """)
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        opp = {
+            "opportunity_id": "test_campaigns",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 200,
+                "pace_delta_pct": -20, "gap_tickets": 200,
+                "avg_ticket_price": 60.0,
+            },
+        }
+        diagnosis = engine.diagnose("evt3", opp)
+        # Should count only the 1 sent campaign, not all 3
+        self.assertEqual(diagnosis.historical_campaigns_sent, 1)
+
+    def test_root_cause_uses_blended_spend_label(self):
+        """Regression: root cause text should say 'Blended ad spend' not 'CAC'."""
+        # Add ad spend and enough tickets to make blended_ad_spend_per_ticket > 50
+        for d in range(14):
+            spend_date = (date.today() - timedelta(days=d)).isoformat()
+            self.db.conn.execute(
+                "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+                ("evt3", "camp1", spend_date, 500.0, 5000, 50),
+            )
+        # Just 1 ticket sold at $60 → blended = $7000/1 = $7000
+        self.db.conn.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?)",
+            ("o1", "evt3", "buyer1@example.com", 1, 60.0),
+        )
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        opp = {
+            "opportunity_id": "test_label",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 1,
+                "pace_delta_pct": -90, "gap_tickets": 1999,
+                "avg_ticket_price": 60.0,
+            },
+        }
+        diagnosis = engine.diagnose("evt3", opp)
+        # Find the high-cost root cause
+        cost_causes = [rc for rc in diagnosis.root_causes if "spend" in rc.cause.lower() or "cost" in rc.cause.lower()]
+        for rc in cost_causes:
+            self.assertNotIn("CAC", rc.cause)
+            for e in rc.evidence:
+                self.assertNotIn("CAC is", e)
 
 
 if __name__ == "__main__":
