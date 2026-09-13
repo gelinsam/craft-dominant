@@ -428,7 +428,7 @@ class TestPostgresV2Repository:
         assert health["status"] == "ok"
         assert health["backend"] == "postgres"
         assert health["tables_ok"] is True
-        assert health["schema_version"] == 1
+        assert health["schema_version"] == 2
 
     def test_legal_transition_persists(self):
         """Verify a legal state transition round-trips through Postgres."""
