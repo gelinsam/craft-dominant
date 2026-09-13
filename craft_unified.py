@@ -8,6 +8,7 @@ import hashlib
 import logging
 import statistics
 import re
+import threading
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
@@ -154,6 +155,8 @@ class EventPacing:
     historical_comparisons: List[dict] = field(default_factory=list)
     # For timed-entry groups: the real DB event_ids that make up this grouped event
     constituent_event_ids: List[str] = field(default_factory=list)
+    # Spend data status: current_has_spend, current_zero_spend, stale, no_records, unavailable
+    spend_status: str = "unknown"
 # =============================================================================
 # DATABASE - UNIFIED SCHEMA
 # =============================================================================
@@ -339,10 +342,11 @@ class Database:
     """Unified database for all Craft data."""
     def __init__(self, path: str = "craft_unified.db"):
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA busy_timeout = 30000")  # 30s retry on lock
         self._init_schema()
     def _init_schema(self):
         self.conn.executescript(UNIFIED_SCHEMA)
@@ -1160,6 +1164,54 @@ class Database:
                 (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks))
+    def save_ad_spend_batch(self, rows: list):
+        """Write many ad_spend rows in a single transaction.
+
+        Each row is a tuple: (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks).
+        Avoids holding the write lock across remote API calls.
+        """
+        if not rows:
+            return
+        with self.transaction() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO ad_spend
+                (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+    def get_spend_status(self, event_id: str) -> str:
+        """Determine the spend data status for an event.
+
+        Returns one of:
+            'current_has_spend'  - recent spend data exists with spend > 0
+            'current_zero_spend' - recent data exists but spend is $0
+            'stale'              - data exists but latest spend_date is old
+            'no_records'         - no ad_spend rows for this event
+            'unavailable'        - ad_spend table doesn't exist or query failed
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT MAX(spend_date) as latest_date, "
+                "       SUM(spend) as total_spend, "
+                "       COUNT(*) as cnt "
+                "FROM ad_spend WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if not row or int(row["cnt"]) == 0:
+                return "no_records"
+            latest_date_str = row["latest_date"]
+            if not latest_date_str:
+                return "no_records"
+            try:
+                latest_date = date.fromisoformat(str(latest_date_str))
+            except (ValueError, TypeError):
+                return "stale"
+            days_since = (date.today() - latest_date).days
+            if days_since > 3:
+                return "stale"
+            total = float(row["total_spend"] or 0)
+            return "current_has_spend" if total > 0 else "current_zero_spend"
+        except Exception:
+            return "unavailable"
     def get_event_spend(self, event_id: str) -> float:
         row = self.conn.execute(
             "SELECT COALESCE(SUM(spend), 0) as total FROM ad_spend WHERE event_id = ?",
@@ -2140,7 +2192,13 @@ class MetaAdsSync:
                 break
         return insights
     def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str):
-        """Sync ad spend from Meta for a single event."""
+        """Sync ad spend from Meta for a single event.
+
+        All API data is fetched first, then written to the database in a
+        single batch transaction.  This avoids holding the SQLite write lock
+        across remote API calls, which was the root cause of "database is
+        locked" errors in production.
+        """
         try:
             event_date = datetime.fromisoformat(event_date_str).date()
             today = date.today()
@@ -2149,6 +2207,8 @@ class MetaAdsSync:
             campaigns = self._find_campaigns(event_name)
             if not campaigns:
                 return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0, 'days_of_data': 0}
+            # Phase 1: Fetch all data from Meta API (no DB writes)
+            batch_rows = []
             total_spend = 0.0
             total_days = 0
             for campaign in campaigns:
@@ -2158,30 +2218,66 @@ class MetaAdsSync:
                     impressions = int(day_data.get('impressions', 0))
                     clicks = int(day_data.get('clicks', 0))
                     spend_date = day_data.get('date_start', '')
-                    self.db.save_ad_spend(
-                        event_id=event_id, campaign_id=campaign['id'],
-                        campaign_name=campaign['name'], spend_date=spend_date,
-                        spend=spend, impressions=impressions, clicks=clicks
-                    )
+                    batch_rows.append((
+                        event_id, campaign['id'], campaign['name'],
+                        spend_date, spend, impressions, clicks
+                    ))
                     total_spend += spend
                 total_days += len(insights)
-            log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns")
+            # Phase 2: Write all rows in a single transaction
+            self.db.save_ad_spend_batch(batch_rows)
+            log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns, {len(batch_rows)} rows")
             return {'event_id': event_id, 'total_spend': round(total_spend, 2),
-                    'campaigns_found': len(campaigns), 'days_of_data': total_days}
+                    'campaigns_found': len(campaigns), 'days_of_data': total_days,
+                    'rows_written': len(batch_rows)}
         except Exception as e:
             log.error(f"Meta sync error for {event_id}: {e}")
             return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0,
                     'days_of_data': 0, 'error': str(e)}
     def sync_all_events(self, events_list):
-        """Sync Meta ad spend for all events."""
-        results = {'total_events': len(events_list), 'successful': 0, 'total_spend': 0.0, 'event_results': []}
+        """Sync Meta ad spend for all events with observability logging."""
+        import time as _time
+        sync_start = _time.monotonic()
+        results = {
+            'total_events': len(events_list), 'successful': 0, 'failed': 0,
+            'total_spend': 0.0, 'total_rows': 0,
+            'matched_events': 0, 'unmatched_events': 0,
+            'event_results': [],
+        }
         for event in events_list:
             result = self.sync_event_spend(event['event_id'], event['name'], event['event_date'])
             results['event_results'].append(result)
             results['total_spend'] += result.get('total_spend', 0)
-            if not result.get('error'):
+            results['total_rows'] += result.get('rows_written', 0)
+            if result.get('error'):
+                results['failed'] += 1
+            else:
                 results['successful'] += 1
-        log.info(f"Meta sync complete: {results['successful']}/{results['total_events']} events, ${results['total_spend']:.2f}")
+                if result.get('campaigns_found', 0) > 0:
+                    results['matched_events'] += 1
+                else:
+                    results['unmatched_events'] += 1
+        elapsed = round(_time.monotonic() - sync_start, 1)
+        results['duration_seconds'] = elapsed
+        log.info(
+            f"Meta sync complete: {results['successful']}/{results['total_events']} events, "
+            f"${results['total_spend']:.2f} spend, {results['total_rows']} rows written, "
+            f"{results['matched_events']} matched / {results['unmatched_events']} unmatched, "
+            f"{results['failed']} failed, {elapsed}s elapsed"
+        )
+        # Post-sync verification: readback totals
+        try:
+            row = self.db.conn.execute(
+                "SELECT COUNT(DISTINCT event_id) as events, COUNT(*) as rows, "
+                "SUM(spend) as total FROM ad_spend"
+            ).fetchone()
+            if row:
+                log.info(
+                    f"Post-sync verification: {row['events']} events with spend data, "
+                    f"{row['rows']} total rows, ${float(row['total'] or 0):.2f} total spend in DB"
+                )
+        except Exception as e:
+            log.warning(f"Post-sync verification query failed: {e}")
         return results
 # =============================================================================
 # DECISION ENGINE
@@ -2225,9 +2321,11 @@ class DecisionEngine:
         tickets = self.db.get_event_tickets(event_id)
         revenue = self.db.get_event_revenue(event_id)
         spend = self.db.get_event_spend(event_id)
+        spend_status = self.db.get_spend_status(event_id)
         capacity = event.get('capacity', 0)
         sell_through = (tickets / capacity * 100) if capacity > 0 else 0
-        cac = spend / tickets if tickets > 0 else 0
+        # CAC is only meaningful when spend data is current and > 0
+        cac = spend / tickets if tickets > 0 and spend > 0 and spend_status == 'current_has_spend' else 0
         # --- Find all past editions of this event pattern ---
         pattern = self._get_pattern(event['name'])
         all_events = self._get_all_events()
@@ -2306,7 +2404,8 @@ class DecisionEngine:
             confidence = 0.9 if len(projections) >= 3 else 0.75 if len(projections) >= 2 else 0.6
         # --- Decision ---
         decision, urgency, rationale, actions = self._decide(
-            tickets, pace, cac, days_until, hist_median, comparison_events
+            tickets, pace, cac, days_until, hist_median, comparison_events,
+            spend_status=spend_status
         )
         # Targeting
         high_value = len(self.db.get_high_value_customers(
@@ -2331,20 +2430,38 @@ class DecisionEngine:
             rationale=rationale, actions=actions,
             high_value_targets=high_value,
             reactivation_targets=at_risk,
-            historical_comparisons=historical_comparisons
+            historical_comparisons=historical_comparisons,
+            spend_status=spend_status,
         )
     def _decide(self, tickets: int, pace: float, cac: float, days_until: int,
-                hist_median: float, comparison_events: List[str]) -> Tuple[Decision, int, str, List[str]]:
+                hist_median: float, comparison_events: List[str],
+                spend_status: str = "unknown") -> Tuple[Decision, int, str, List[str]]:
         """Make decision based on ticket-count pace vs historical median.
 
         pace = ((current_tickets - median_historical_tickets) / median_historical_tickets) * 100
         hist_median = median ticket count at this days-out point across past editions
+        spend_status: one of 'current_has_spend', 'current_zero_spend', 'stale',
+                      'no_records', 'unavailable', 'unknown'
         """
         target_cac = 12.00
-        cac_ok = cac <= target_cac * 1.5 or cac == 0
+        # CAC is only trustworthy when we have current spend data
+        spend_known = spend_status == 'current_has_spend'
+        cac_ok = spend_known and cac > 0 and cac <= target_cac * 1.5
         has_history = hist_median > 0 and len(comparison_events) > 0
         context = f" vs median {int(hist_median)} tickets at this point" if has_history else ""
         basis = f"Based on {len(comparison_events)} past editions" if comparison_events else "No historical data"
+
+        # Build spend context string based on actual data status
+        if spend_known and cac > 0:
+            spend_context = f"CAC ${cac:.2f}"
+        elif spend_status == 'current_zero_spend':
+            spend_context = "No active paid campaigns"
+        elif spend_status == 'stale':
+            spend_context = "Paid performance unavailable (stale data)"
+        elif spend_status in ('no_records', 'unavailable', 'unknown'):
+            spend_context = "Paid performance unavailable"
+        else:
+            spend_context = "Paid performance unavailable"
 
         # --- COAST: Clearly ahead ---
         if has_history and pace > 25:
@@ -2376,15 +2493,19 @@ class DecisionEngine:
             )
 
         # --- PUSH: Behind but recoverable ---
-        if has_history and pace < -15 and cac_ok and days_until > 7:
+        if has_history and pace < -15 and days_until > 7:
             urgency = 7 if days_until < 30 else 5
             bump = min(50, abs(pace))
+            if cac_ok:
+                push_rationale = f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. {spend_context}. {basis}."
+            else:
+                push_rationale = f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. {spend_context}. {basis}."
             return (
                 Decision.PUSH, urgency,
-                f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. CAC ${cac:.2f} acceptable. {basis}.",
+                push_rationale,
                 [
-                    f"Increase ad budget by {bump:.0f}%",
-                    "Expand lookalike audiences",
+                    f"Increase ad budget by {bump:.0f}%" if spend_known else "Review paid media setup",
+                    "Expand lookalike audiences" if spend_known else "Verify Meta ad account connection",
                     "Add urgency messaging",
                     "Email high-value past attendees",
                     "Increase retargeting frequency"
@@ -2395,9 +2516,9 @@ class DecisionEngine:
         if not has_history:
             return (
                 Decision.MAINTAIN, 5 if days_until < 30 else 3,
-                f"{tickets} tickets at {days_until}d out. {basis} — monitor manually.",
+                f"{tickets} tickets at {days_until}d out. {spend_context}. {basis} — monitor manually.",
                 [
-                    "Maintain current spend",
+                    "Maintain current spend" if spend_known else "Review paid media setup",
                     "Continue daily monitoring",
                     "Prepare final push for last 2 weeks"
                 ]
@@ -2408,11 +2529,28 @@ class DecisionEngine:
             Decision.MAINTAIN, 5 if days_until < 30 else 3,
             f"{tickets} tickets — tracking within historical norms{context}. {basis}.",
             [
-                "Maintain current spend",
+                "Maintain current spend" if spend_known else "Review paid media setup",
                 "Continue daily monitoring",
                 "Prepare final push for last 2 weeks"
             ]
         )
+    def _get_grouped_spend_status(self, event_ids: list) -> str:
+        """Get the best spend status across constituent event IDs.
+
+        If any constituent has 'current_has_spend', that wins.
+        Otherwise: current_zero_spend > stale > no_records > unavailable.
+        """
+        if not event_ids:
+            return "no_records"
+        priority = {'current_has_spend': 5, 'current_zero_spend': 4,
+                     'stale': 3, 'no_records': 2, 'unavailable': 1}
+        best = 'unavailable'
+        for eid in event_ids:
+            status = self.db.get_spend_status(eid)
+            if priority.get(status, 0) > priority.get(best, 0):
+                best = status
+        return best
+
     def _detect_timed_entry_groups(self, analyses):
         """Detect timed-entry events (same name, within 3 days of each other)."""
         by_pattern = defaultdict(list)
@@ -2450,7 +2588,11 @@ class DecisionEngine:
         max_capacity = total_capacity  # keep variable name for downstream compat
         total_spend = sum(a.ad_spend for a in day_analyses)
         sell_through = (total_tickets / max_capacity * 100) if max_capacity > 0 else 0
-        cac_val = (total_spend / total_tickets) if total_tickets > 0 else 0
+        # Compute grouped spend status from constituent event IDs
+        constituent_ids = [a.event_id for a in day_analyses]
+        grouped_spend_status = self._get_grouped_spend_status(constituent_ids)
+        # CAC only meaningful with current spend
+        cac_val = (total_spend / total_tickets) if total_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
         days_until = day_analyses[0].days_until
         best_urgency = max(a.urgency for a in day_analyses)
         best_decision = None
@@ -2583,7 +2725,8 @@ class DecisionEngine:
         grouped_decision, grouped_urgency, grouped_rationale, grouped_actions = self._decide(
             total_tickets, grouped_pace,
             cac_val, days_until, grouped_hist_median,
-            [c['event_name'] for c in historical_comparisons]
+            [c['event_name'] for c in historical_comparisons],
+            spend_status=grouped_spend_status
         )
         return EventPacing(
             event_id=eid, event_name=logical_name,
@@ -2605,6 +2748,7 @@ class DecisionEngine:
             reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
             historical_comparisons=historical_comparisons,
             constituent_event_ids=[a.event_id for a in day_analyses],
+            spend_status=grouped_spend_status,
         )
     def analyze_portfolio(self) -> List[EventPacing]:
         """Analyze all upcoming events, grouping timed-entry events by day."""
@@ -2651,6 +2795,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     engine = DecisionEngine(db)
     # Sync status tracking
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
+    _meta_sync_lock = threading.Lock()  # Serialize Meta sync writers
+    _meta_sync_running = False  # Single-flight guard for Meta sync
     _portfolio_cache = {'analyses': None, 'ts': 0}  # Cache portfolio analysis for 60s
     def _get_portfolio():
         """Get cached portfolio analysis (avoids re-analyzing on every targeting request)."""
@@ -2684,22 +2830,29 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
             meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
             if meta_token and meta_accounts:
-                try:
-                    log.info(f"Starting Meta ad spend sync for {len(meta_accounts)} account(s)...")
-                    all_events = db.get_events(upcoming_only=False)
-                    total_meta_spend = 0
-                    for acct_id in meta_accounts:
-                        log.info(f"  Syncing Meta account: {acct_id}")
-                        meta = MetaAdsSync(meta_token, acct_id, db)
-                        meta_result = meta.sync_all_events(all_events)
-                        total_meta_spend += meta_result.get('total_spend', 0)
-                        log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
-                                 f"${meta_result.get('total_spend', 0):.2f} spend")
-                    log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
-                    # Backfill ad spend into daily snapshots so historical comparisons work
-                    db.backfill_ad_spend_into_snapshots()
-                except Exception as me:
-                    log.error(f"Meta sync error: {me}")
+                if _meta_sync_running:
+                    log.info("Skipping Meta sync — already running from another source")
+                else:
+                    with _meta_sync_lock:
+                        _meta_sync_running = True
+                        try:
+                            log.info(f"Starting Meta ad spend sync for {len(meta_accounts)} account(s)...")
+                            all_events = db.get_events(upcoming_only=False)
+                            total_meta_spend = 0
+                            for acct_id in meta_accounts:
+                                log.info(f"  Syncing Meta account: {acct_id}")
+                                meta = MetaAdsSync(meta_token, acct_id, db)
+                                meta_result = meta.sync_all_events(all_events)
+                                total_meta_spend += meta_result.get('total_spend', 0)
+                                log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
+                                         f"${meta_result.get('total_spend', 0):.2f} spend")
+                            log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
+                            # Backfill ad spend into daily snapshots so historical comparisons work
+                            db.backfill_ad_spend_into_snapshots()
+                        except Exception as me:
+                            log.error(f"Meta sync error: {me}")
+                        finally:
+                            _meta_sync_running = False
             # Check for milestones and generate auto-exports
             _check_milestones_and_export()
             # Check and send alerts
@@ -2895,7 +3048,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         return jsonify({'status': 'started', 'message': 'Sync started in background. Poll /api/sync-status for progress.'})
     @app.route('/api/meta-sync')
     def meta_sync_endpoint():
-        """Trigger Meta ad spend sync for all events."""
+        """Trigger Meta ad spend sync for all events.
+
+        Single-flight: rejects if a Meta sync is already running from any
+        source (background or manual).  Uses _meta_sync_lock to serialize
+        writes so overlapping threads can't corrupt the SQLite WAL.
+        """
+        nonlocal _meta_sync_running
+        if _meta_sync_running:
+            return jsonify({'status': 'already_running', 'message': 'Meta sync is already in progress'}), 409
         meta_token = os.environ.get('META_ACCESS_TOKEN')
         meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
         meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
@@ -2905,17 +3066,22 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 'setup': 'Set these environment variables in Railway to enable Meta ad spend tracking'
             }), 400
         def _do_meta_sync():
-            try:
-                all_events = db.get_events(upcoming_only=False)
-                for acct_id in meta_accounts:
-                    log.info(f"Manual Meta sync for account: {acct_id}")
-                    meta = MetaAdsSync(meta_token, acct_id, db)
-                    result = meta.sync_all_events(all_events)
-                    log.info(f"Manual Meta sync complete for {acct_id}: {result}")
-                # Backfill ad spend into daily snapshots
-                db.backfill_ad_spend_into_snapshots()
-            except Exception as e:
-                log.error(f"Manual Meta sync error: {e}")
+            nonlocal _meta_sync_running
+            with _meta_sync_lock:
+                _meta_sync_running = True
+                try:
+                    all_events = db.get_events(upcoming_only=False)
+                    for acct_id in meta_accounts:
+                        log.info(f"Manual Meta sync for account: {acct_id}")
+                        meta = MetaAdsSync(meta_token, acct_id, db)
+                        result = meta.sync_all_events(all_events)
+                        log.info(f"Manual Meta sync complete for {acct_id}: {result}")
+                    # Backfill ad spend into daily snapshots
+                    db.backfill_ad_spend_into_snapshots()
+                except Exception as e:
+                    log.error(f"Manual Meta sync error: {e}")
+                finally:
+                    _meta_sync_running = False
         threading.Thread(target=_do_meta_sync, daemon=True).start()
         return jsonify({'status': 'started', 'message': f'Meta ad spend sync started for {len(meta_accounts)} account(s)'})
     @app.route('/api/meta-status')
@@ -3095,7 +3261,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 'total_capacity': total_capacity,
                 'total_revenue': total_revenue,
                 'total_spend': total_spend,
-                'portfolio_cac': total_spend / total_tickets if total_tickets > 0 else 0,
+                'portfolio_cac': total_spend / total_tickets if total_tickets > 0 and total_spend > 0 and any(getattr(a, 'spend_status', 'unknown') == 'current_has_spend' for a in analyses) else 0,
                 'event_count': len(analyses)
             },
             'decisions': decisions,
@@ -4893,6 +5059,10 @@ Then:
 # =============================================================================
 # gunicorn craft_unified:app will use this.
 # auto_sync=True starts Eventbrite sync in background immediately.
-app = create_app_with_db(auto_sync=True)
+# Skip when imported under test to avoid side effects.
+if os.environ.get('TESTING') != '1':
+    app = create_app_with_db(auto_sync=True)
+else:
+    app = None
 if __name__ == "__main__":
     main()
