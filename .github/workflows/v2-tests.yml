@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  opportunity-engine:
+  v2-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -18,5 +18,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run deterministic opportunity engine tests
-        run: python -m unittest -v test_dominant_agent.py
+      - name: Run full V2 test suite
+        run: python -m unittest -v test_dominant_agent test_diagnosis test_intervention
