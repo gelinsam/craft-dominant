@@ -622,8 +622,8 @@ class FakeExecutionDB:
             );
             CREATE TABLE orders (
                 order_id TEXT PRIMARY KEY, event_id TEXT, email TEXT,
-                ticket_count INTEGER, gross_amount REAL,
-                order_date TEXT DEFAULT '2026-01-01'
+                order_timestamp TEXT NOT NULL DEFAULT '2026-01-01T00:00:00+00:00',
+                ticket_count INTEGER, gross_amount REAL
             );
             CREATE TABLE customers (
                 email TEXT PRIMARY KEY, favorite_city TEXT,
@@ -883,20 +883,27 @@ class TestMeasurement(unittest.TestCase):
         self.db.conn.commit()
         return i
 
+    def _in_window_timestamp(self, days_after_send=3):
+        """Return an ISO timestamp N days after the send (which is 8 days ago)."""
+        from datetime import datetime, timezone, timedelta
+        sent_dt = datetime.now(timezone.utc) - timedelta(days=8)
+        return (sent_dt + timedelta(days=days_after_send)).isoformat()
+
     def test_measure_only_counts_sent_recipients(self):
         """Attribution must only count orders from emails in the sent list."""
         sent = ["alice@test.com", "bob@test.com"]
         self._make_measuring_intervention(sent_emails=sent)
+        ts = self._in_window_timestamp(3)
 
         # Alice ordered (should be attributed)
         self.db.conn.execute(
-            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
-            ("o1", "evt1", "alice@test.com", 2, 100.0),
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o1", "evt1", "alice@test.com", ts, 2, 100.0),
         )
         # Carol ordered (NOT sent to, should NOT be attributed)
         self.db.conn.execute(
-            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
-            ("o2", "evt1", "carol@test.com", 3, 150.0),
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o2", "evt1", "carol@test.com", ts, 3, 150.0),
         )
         self.db.conn.commit()
 
@@ -908,11 +915,12 @@ class TestMeasurement(unittest.TestCase):
     def test_measure_excludes_non_sent_orders(self):
         """Orders from people NOT in the sent list must be excluded."""
         self._make_measuring_intervention(sent_emails=["alice@test.com"])
+        ts = self._in_window_timestamp(3)
 
         # Only non-sent person ordered
         self.db.conn.execute(
-            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
-            ("o1", "evt1", "stranger@test.com", 5, 500.0),
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o1", "evt1", "stranger@test.com", ts, 5, 500.0),
         )
         self.db.conn.commit()
 
@@ -951,10 +959,11 @@ class TestMeasurement(unittest.TestCase):
         """Response must include predicted and actual for comparison."""
         sent = ["alice@test.com"]
         self._make_measuring_intervention(sent_emails=sent)
+        ts = self._in_window_timestamp(3)
 
         self.db.conn.execute(
-            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
-            ("o1", "evt1", "alice@test.com", 2, 200.0),
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o1", "evt1", "alice@test.com", ts, 2, 200.0),
         )
         self.db.conn.commit()
 
@@ -968,6 +977,143 @@ class TestMeasurement(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────
 # Learning record persistence tests
 # ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+# Attribution window regression tests (PR #1 review requirement)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestAttributionWindowRegression(unittest.TestCase):
+    """Regression: _compute_attribution must respect the attribution window.
+
+    Validates that:
+    - pre-send orders from sent recipients are EXCLUDED
+    - orders inside the window are COUNTED
+    - orders after the window are EXCLUDED
+    - orders from unrelated recipients are EXCLUDED
+    - multiple qualifying orders aggregate correctly
+    """
+
+    def setUp(self):
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        self.db = FakeExecutionDB()
+        self.store = InterventionStore(self.db)
+        self.audit = AuditLogger(self.db)
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+
+        from datetime import datetime, timezone, timedelta as td
+
+        # Seed event
+        event_date = (date.today() + td(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test Fest", "coffee", "Philadelphia", event_date, 5000),
+        )
+        self.db.conn.commit()
+
+        # Fixed timestamps for deterministic testing
+        self.send_dt = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.window_end = self.send_dt + td(days=7)
+
+        self.sent_emails = {"alice@test.com", "bob@test.com"}
+
+    def test_pre_send_order_excluded(self):
+        """An order from a sent recipient BEFORE the send must NOT be attributed."""
+        pre_send_ts = (self.send_dt - timedelta(days=1)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o-pre", "evt1", "alice@test.com", pre_send_ts, 2, 100.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter._compute_attribution("evt1", self.sent_emails, self.send_dt, self.window_end)
+        self.assertEqual(result["orders"], 0, "Pre-send orders must be excluded")
+        self.assertEqual(result["revenue"], 0.0)
+
+    def test_in_window_order_counted(self):
+        """An order from a sent recipient INSIDE the window must be attributed."""
+        in_window_ts = (self.send_dt + timedelta(days=3)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o-in", "evt1", "alice@test.com", in_window_ts, 2, 100.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter._compute_attribution("evt1", self.sent_emails, self.send_dt, self.window_end)
+        self.assertEqual(result["orders"], 1, "In-window order must be counted")
+        self.assertEqual(result["revenue"], 100.0)
+        self.assertEqual(result["tickets"], 2)
+
+    def test_post_window_order_excluded(self):
+        """An order from a sent recipient AFTER the window must NOT be attributed."""
+        post_window_ts = (self.window_end + timedelta(days=1)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o-post", "evt1", "alice@test.com", post_window_ts, 2, 100.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter._compute_attribution("evt1", self.sent_emails, self.send_dt, self.window_end)
+        self.assertEqual(result["orders"], 0, "Post-window orders must be excluded")
+        self.assertEqual(result["revenue"], 0.0)
+
+    def test_unrelated_recipient_excluded(self):
+        """An in-window order from a non-sent recipient must NOT be attributed."""
+        in_window_ts = (self.send_dt + timedelta(days=3)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o-stranger", "evt1", "stranger@test.com", in_window_ts, 5, 500.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter._compute_attribution("evt1", self.sent_emails, self.send_dt, self.window_end)
+        self.assertEqual(result["orders"], 0, "Non-sent recipient orders must be excluded")
+        self.assertEqual(result["revenue"], 0.0)
+
+    def test_multiple_qualifying_orders_aggregate(self):
+        """Multiple in-window orders from different sent recipients must sum correctly."""
+        ts1 = (self.send_dt + timedelta(days=1)).isoformat()
+        ts2 = (self.send_dt + timedelta(days=4)).isoformat()
+        ts3 = (self.send_dt + timedelta(days=6)).isoformat()
+
+        # Alice: 2 orders
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o1", "evt1", "alice@test.com", ts1, 2, 100.0),
+        )
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o2", "evt1", "alice@test.com", ts2, 1, 50.0),
+        )
+        # Bob: 1 order
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o3", "evt1", "bob@test.com", ts3, 3, 200.0),
+        )
+        # Stranger: should not be counted
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o4", "evt1", "stranger@test.com", ts1, 10, 1000.0),
+        )
+        # Alice: pre-send order — should NOT be counted
+        pre_ts = (self.send_dt - timedelta(hours=1)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o5", "evt1", "alice@test.com", pre_ts, 5, 500.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter._compute_attribution("evt1", self.sent_emails, self.send_dt, self.window_end)
+        # Alice: 2 in-window orders (100+50=150, 2+1=3 tickets, 2 orders)
+        # Bob: 1 in-window order (200, 3 tickets, 1 order)
+        # Total: 3 orders, 6 tickets, 350.0 revenue
+        self.assertEqual(result["orders"], 3, "Should count 3 qualifying orders from Alice(2)+Bob(1)")
+        self.assertEqual(result["tickets"], 6)
+        self.assertEqual(result["revenue"], 350.0)
+
 
 class TestLearningRecord(unittest.TestCase):
 
@@ -1023,9 +1169,11 @@ class TestLearningRecord(unittest.TestCase):
                    VALUES (?,?,?,?)""",
                 ("learn-intv", "v2-draft-1", email, sent_at),
             )
+        # Order placed 5 days ago (within 7-day window after send 8 days ago)
+        order_ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
         self.db.conn.execute(
-            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
-            ("o1", "evt1", "a@test.com", 1, 100.0),
+            "INSERT INTO orders (order_id, event_id, email, order_timestamp, ticket_count, gross_amount) VALUES (?,?,?,?,?,?)",
+            ("o1", "evt1", "a@test.com", order_ts, 1, 100.0),
         )
         self.db.conn.commit()
 

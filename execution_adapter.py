@@ -432,12 +432,11 @@ class ExecutionAdapter:
 
         Only counts orders where:
         1. The order's email is in the sent_emails set
-        2. The order was placed after the send time
-        3. The order was placed before the window end
+        2. The order was placed AFTER the send time (executed_dt)
+        3. The order was placed BEFORE the window end
         """
-        # Build date range for query
-        start_date = executed_dt.strftime("%Y-%m-%d")
-        end_date = window_end.strftime("%Y-%m-%d")
+        start_ts = executed_dt.isoformat()
+        end_ts = window_end.isoformat()
 
         try:
             rows = self.db.conn.execute(
@@ -445,8 +444,10 @@ class ExecutionAdapter:
                           COUNT(*) as order_count
                    FROM orders
                    WHERE event_id = ?
+                     AND order_timestamp >= ?
+                     AND order_timestamp <= ?
                    GROUP BY email""",
-                (event_id,),
+                (event_id, start_ts, end_ts),
             ).fetchall()
         except Exception:
             return {"orders": 0, "tickets": 0, "revenue": 0.0}
