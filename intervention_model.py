@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
@@ -95,6 +95,13 @@ class Intervention:
     evidence: Dict[str, Any] = field(default_factory=dict)
     # Link to campaign draft if applicable
     campaign_draft_id: Optional[str] = None
+    # Measurement fields
+    measurement_started_at: Optional[str] = None
+    measurement_ends_at: Optional[str] = None
+    attributed_orders: Optional[int] = None
+    attributed_tickets: Optional[int] = None
+    attributed_revenue: Optional[float] = None
+    sent_count: Optional[int] = None
 
     def __post_init__(self):
         if not self.created_at:
@@ -106,10 +113,16 @@ class Intervention:
         """Move to a new status, enforcing the state machine."""
         validate_transition(self.status, target)
         self.status = target
+        now = datetime.now(timezone.utc).isoformat()
         if target == InterventionStatus.APPROVED:
-            self.approved_at = datetime.now(timezone.utc).isoformat()
+            self.approved_at = now
         elif target == InterventionStatus.EXECUTING:
-            self.executed_at = datetime.now(timezone.utc).isoformat()
+            self.executed_at = now
+        elif target == InterventionStatus.MEASURING:
+            self.measurement_started_at = now
+            # Default 7-day attribution window
+            ends = datetime.now(timezone.utc) + timedelta(days=self.measurement_window)
+            self.measurement_ends_at = ends.isoformat()
 
     @property
     def is_terminal(self) -> bool:
@@ -142,6 +155,62 @@ class Intervention:
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
+AUDIT_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS intervention_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    intervention_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    actor TEXT DEFAULT 'system',
+    timestamp TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}',
+    error TEXT,
+    FOREIGN KEY (intervention_id) REFERENCES interventions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_intervention ON intervention_audit_log(intervention_id);
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON intervention_audit_log(timestamp);
+"""
+
+CAMPAIGN_SENDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS v2_campaign_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    intervention_id TEXT NOT NULL,
+    campaign_draft_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    UNIQUE(intervention_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_v2_sends_intervention ON v2_campaign_sends(intervention_id);
+CREATE INDEX IF NOT EXISTS idx_v2_sends_email ON v2_campaign_sends(email);
+"""
+
+LEARNING_RECORD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS v2_learning_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    intervention_id TEXT NOT NULL UNIQUE,
+    intervention_type TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    event_type TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    predicted_revenue REAL DEFAULT 0,
+    attributed_revenue REAL DEFAULT 0,
+    prediction_error REAL DEFAULT 0,
+    audience_count INTEGER DEFAULT 0,
+    sent_count INTEGER DEFAULT 0,
+    attributed_orders INTEGER DEFAULT 0,
+    attributed_tickets INTEGER DEFAULT 0,
+    actual_conversion_rate REAL,
+    conversion_assumptions TEXT DEFAULT '{}',
+    confidence REAL DEFAULT 0,
+    measurement_window_days INTEGER DEFAULT 7,
+    measurement_started_at TEXT,
+    measurement_ended_at TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
 INTERVENTION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS interventions (
     id TEXT PRIMARY KEY,
@@ -165,7 +234,13 @@ CREATE TABLE IF NOT EXISTS interventions (
     actual_net_value REAL,
     outcome_status TEXT,
     evidence TEXT DEFAULT '{}',
-    campaign_draft_id TEXT
+    campaign_draft_id TEXT,
+    measurement_started_at TEXT,
+    measurement_ends_at TEXT,
+    attributed_orders INTEGER,
+    attributed_tickets INTEGER,
+    attributed_revenue REAL,
+    sent_count INTEGER
 );
 """
 
@@ -179,6 +254,9 @@ class InterventionStore:
 
     def _ensure_schema(self):
         self.db.conn.executescript(INTERVENTION_SCHEMA)
+        self.db.conn.executescript(AUDIT_LOG_SCHEMA)
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
         self.db.conn.commit()
 
     def save(self, intervention: Intervention) -> None:
@@ -190,8 +268,9 @@ class InterventionStore:
                 expected_net_value, confidence, approval_required, created_at,
                 approved_at, executed_at, measurement_window, actual_revenue,
                 actual_cost, actual_net_value, outcome_status, evidence,
-                campaign_draft_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                campaign_draft_id, measurement_started_at, measurement_ends_at,
+                attributed_orders, attributed_tickets, attributed_revenue, sent_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 intervention.id,
                 intervention.opportunity_id,
@@ -215,6 +294,12 @@ class InterventionStore:
                 intervention.outcome_status,
                 evidence_json,
                 intervention.campaign_draft_id,
+                intervention.measurement_started_at,
+                intervention.measurement_ends_at,
+                intervention.attributed_orders,
+                intervention.attributed_tickets,
+                intervention.attributed_revenue,
+                intervention.sent_count,
             ),
         )
         self.db.conn.commit()
@@ -287,4 +372,134 @@ class InterventionStore:
             outcome_status=d.get("outcome_status"),
             evidence=evidence,
             campaign_draft_id=d.get("campaign_draft_id"),
+            measurement_started_at=d.get("measurement_started_at"),
+            measurement_ends_at=d.get("measurement_ends_at"),
+            attributed_orders=int(d["attributed_orders"]) if d.get("attributed_orders") is not None else None,
+            attributed_tickets=int(d["attributed_tickets"]) if d.get("attributed_tickets") is not None else None,
+            attributed_revenue=float(d["attributed_revenue"]) if d.get("attributed_revenue") is not None else None,
+            sent_count=int(d["sent_count"]) if d.get("sent_count") is not None else None,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit log
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AuditLogger:
+    """Append-only audit log for intervention lifecycle events."""
+
+    def __init__(self, db):
+        self.db = db
+        self.db.conn.executescript(AUDIT_LOG_SCHEMA)
+        self.db.conn.commit()
+
+    def log(
+        self,
+        intervention_id: str,
+        event_id: str,
+        action: str,
+        from_status: Optional[str] = None,
+        to_status: Optional[str] = None,
+        actor: str = "system",
+        metadata: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Write an append-only audit record."""
+        meta_json = json.dumps(metadata) if metadata else "{}"
+        self.db.conn.execute(
+            """INSERT INTO intervention_audit_log
+               (intervention_id, event_id, action, from_status, to_status,
+                actor, timestamp, metadata, error)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                intervention_id,
+                event_id,
+                action,
+                from_status,
+                to_status,
+                actor,
+                datetime.now(timezone.utc).isoformat(),
+                meta_json,
+                error,
+            ),
+        )
+        self.db.conn.commit()
+
+    def get_log(self, intervention_id: str) -> List[Dict[str, Any]]:
+        """Return all audit entries for an intervention, oldest first."""
+        rows = self.db.conn.execute(
+            "SELECT * FROM intervention_audit_log WHERE intervention_id = ? ORDER BY id ASC",
+            (intervention_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            if isinstance(d.get("metadata"), str):
+                try:
+                    d["metadata"] = json.loads(d["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    d["metadata"] = {}
+            result.append(d)
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Learning record store
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LearningStore:
+    """Persists structured learning records when interventions reach 'learned'."""
+
+    def __init__(self, db):
+        self.db = db
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+        self.db.conn.commit()
+
+    def save(self, record: Dict[str, Any]) -> None:
+        self.db.conn.execute(
+            """INSERT OR REPLACE INTO v2_learning_records
+               (intervention_id, intervention_type, event_id, event_type, city,
+                predicted_revenue, attributed_revenue, prediction_error,
+                audience_count, sent_count, attributed_orders, attributed_tickets,
+                actual_conversion_rate, conversion_assumptions, confidence,
+                measurement_window_days, measurement_started_at, measurement_ended_at,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                record["intervention_id"],
+                record["intervention_type"],
+                record["event_id"],
+                record.get("event_type", ""),
+                record.get("city", ""),
+                record.get("predicted_revenue", 0),
+                record.get("attributed_revenue", 0),
+                record.get("prediction_error", 0),
+                record.get("audience_count", 0),
+                record.get("sent_count", 0),
+                record.get("attributed_orders", 0),
+                record.get("attributed_tickets", 0),
+                record.get("actual_conversion_rate"),
+                json.dumps(record.get("conversion_assumptions", {})),
+                record.get("confidence", 0),
+                record.get("measurement_window_days", 7),
+                record.get("measurement_started_at"),
+                record.get("measurement_ended_at"),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self.db.conn.commit()
+
+    def get(self, intervention_id: str) -> Optional[Dict[str, Any]]:
+        row = self.db.conn.execute(
+            "SELECT * FROM v2_learning_records WHERE intervention_id = ?",
+            (intervention_id,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if isinstance(d.get("conversion_assumptions"), str):
+            try:
+                d["conversion_assumptions"] = json.loads(d["conversion_assumptions"])
+            except (json.JSONDecodeError, TypeError):
+                d["conversion_assumptions"] = {}
+        return d

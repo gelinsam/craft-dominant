@@ -159,17 +159,48 @@ function DiagnosisSummary({ diagnosis }) {
   );
 }
 
-function InterventionBadge({ intervention }) {
+function InterventionBadge({ intervention, onUpdate }) {
+  const [actionLoading, setActionLoading] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [actionResult, setActionResult] = useState(null);
+
   if (!intervention) return null;
+
+  const doAction = async (action) => {
+    setActionLoading(action);
+    setActionError('');
+    setActionResult(null);
+    try {
+      const res = await fetch(`/api/v2/interventions/${intervention.id}/${action}`, {
+        method: 'POST',
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.message || body?.error || `${action} failed: ${res.status}`);
+      setActionResult(body);
+      if (body.intervention && onUpdate) onUpdate(body.intervention);
+    } catch (err) {
+      setActionError(err?.message || `${action} failed`);
+    } finally {
+      setActionLoading('');
+    }
+  };
+
+  const s = intervention.status;
+  const canApprove = s === 'proposed';
+  const canReject = s === 'proposed';
+  const canExecute = s === 'approved';
+  const canMeasure = s === 'measuring';
+
   return (
     <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex items-center gap-2">
         <div className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Intervention</div>
-        <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${statusBadge(intervention.status)}`}>
-          {String(intervention.status).toUpperCase()}
+        <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${statusBadge(s)}`}>
+          {String(s).toUpperCase()}
         </span>
       </div>
       <div className="mt-2 text-sm text-slate-700">{intervention.rationale}</div>
+
       <div className="mt-2 grid gap-2 sm:grid-cols-3">
         <div>
           <div className="text-[10px] font-semibold uppercase text-slate-400">Expected revenue</div>
@@ -184,9 +215,106 @@ function InterventionBadge({ intervention }) {
           <div className="text-sm font-semibold text-emerald-700">{money(intervention.expected_net_value)}</div>
         </div>
       </div>
+
+      {/* Measurement results */}
+      {intervention.attributed_revenue != null ? (
+        <div className="mt-3 rounded-lg bg-purple-50 border border-purple-200 p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-purple-600">Attributed results</div>
+          <div className="mt-2 grid gap-2 sm:grid-cols-4">
+            <div>
+              <div className="text-[10px] font-semibold uppercase text-slate-400">Attributed revenue</div>
+              <div className="text-sm font-semibold text-purple-800">{money(intervention.attributed_revenue)}</div>
+            </div>
+            <div>
+              <div className="text-[10px] font-semibold uppercase text-slate-400">Orders</div>
+              <div className="text-sm font-semibold text-slate-800">{intervention.attributed_orders ?? '—'}</div>
+            </div>
+            <div>
+              <div className="text-[10px] font-semibold uppercase text-slate-400">Tickets</div>
+              <div className="text-sm font-semibold text-slate-800">{intervention.attributed_tickets ?? '—'}</div>
+            </div>
+            <div>
+              <div className="text-[10px] font-semibold uppercase text-slate-400">Sent</div>
+              <div className="text-sm font-semibold text-slate-800">{intervention.sent_count ?? '—'}</div>
+            </div>
+          </div>
+          {intervention.expected_revenue > 0 ? (
+            <div className="mt-2 text-xs text-purple-700">
+              Predicted {money(intervention.expected_revenue)} vs attributed {money(intervention.attributed_revenue)}
+              {' '}({intervention.attributed_revenue >= intervention.expected_revenue ? '+' : ''}
+              {Math.round(((intervention.attributed_revenue || 0) - intervention.expected_revenue) / intervention.expected_revenue * 100)}%)
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       {intervention.campaign_draft_id ? (
         <div className="mt-2 text-xs text-slate-500">
           Campaign draft: <span className="font-mono">{intervention.campaign_draft_id}</span>
+        </div>
+      ) : null}
+
+      {/* Measurement in progress */}
+      {s === 'measuring' && intervention.measurement_ends_at ? (
+        <div className="mt-2 rounded-lg bg-purple-50 border border-purple-200 p-3">
+          <div className="text-xs font-semibold text-purple-700">Measurement in progress</div>
+          <div className="mt-1 text-xs text-purple-600">
+            Window ends: {new Date(intervention.measurement_ends_at).toLocaleDateString()}
+          </div>
+        </div>
+      ) : null}
+
+      {/* Action buttons — only show when state machine allows */}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {canApprove ? (
+          <button
+            onClick={() => doAction('approve')}
+            disabled={!!actionLoading}
+            className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
+          >
+            {actionLoading === 'approve' ? 'Approving…' : 'Approve'}
+          </button>
+        ) : null}
+        {canReject ? (
+          <button
+            onClick={() => doAction('reject')}
+            disabled={!!actionLoading}
+            className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:opacity-50"
+          >
+            {actionLoading === 'reject' ? 'Rejecting…' : 'Reject'}
+          </button>
+        ) : null}
+        {canExecute ? (
+          <button
+            onClick={() => doAction('execute')}
+            disabled={!!actionLoading}
+            className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:opacity-50"
+          >
+            {actionLoading === 'execute' ? 'Executing…' : 'Execute'}
+          </button>
+        ) : null}
+        {canMeasure ? (
+          <button
+            onClick={() => doAction('measure')}
+            disabled={!!actionLoading}
+            className="rounded-lg border border-purple-200 bg-purple-50 px-3 py-1.5 text-xs font-semibold text-purple-700 transition hover:bg-purple-100 disabled:opacity-50"
+          >
+            {actionLoading === 'measure' ? 'Measuring…' : 'Measure outcomes'}
+          </button>
+        ) : null}
+      </div>
+
+      {actionError ? (
+        <div className="mt-2 text-xs text-rose-600">{actionError}</div>
+      ) : null}
+
+      {actionResult && actionResult.status === 'external_send_disabled' ? (
+        <div className="mt-2 rounded-lg bg-amber-50 border border-amber-200 p-3">
+          <div className="text-xs font-semibold text-amber-700">External send disabled (dry run)</div>
+          <div className="mt-1 text-xs text-amber-600">
+            Audience: {actionResult.dry_run?.audience_count ?? 0} recipients.
+            Set V2_ENABLE_EXTERNAL_SEND=1 on the server to enable real sends.
+          </div>
         </div>
       ) : null}
     </div>
@@ -305,7 +433,7 @@ function OpportunityCard({ item, rank, onRefresh }) {
           ) : null}
 
           {showDiagnosis ? <DiagnosisSummary diagnosis={diagnosis} /> : null}
-          {intervention ? <InterventionBadge intervention={intervention} /> : null}
+          {intervention ? <InterventionBadge intervention={intervention} onUpdate={setIntervention} /> : null}
         </div>
 
         <div className="grid min-w-[260px] grid-cols-2 gap-3 lg:w-[340px]">

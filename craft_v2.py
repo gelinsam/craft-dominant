@@ -21,7 +21,9 @@ from campaign_adapter import CampaignDraftAdapter
 from craft_unified import Database, DecisionEngine, create_app
 from diagnosis_engine import DiagnosisEngine
 from dominant_agent import OpportunityEngine
+from execution_adapter import ExecutionAdapter
 from intervention_model import (
+    AuditLogger,
     IllegalTransition,
     Intervention,
     InterventionStatus,
@@ -62,7 +64,17 @@ def _build_app():
     opportunity_engine = OpportunityEngine(db, decision_engine)
     diagnosis_engine = DiagnosisEngine(db, decision_engine)
     intervention_store = InterventionStore(db)
+    audit_logger = AuditLogger(db)
     campaign_adapter = CampaignDraftAdapter(db)
+    # Wire up CraftCampaignEngine for Mailchimp sends if available
+    _campaign_engine = None
+    try:
+        from craft_engine import CraftCampaignEngine
+        if os.environ.get("MAILCHIMP_API_KEY") and os.environ.get("MAILCHIMP_AUDIENCE_ID"):
+            _campaign_engine = CraftCampaignEngine(db)
+    except Exception:
+        pass
+    execution_adapter = ExecutionAdapter(db, intervention_store, audit_logger, _campaign_engine)
 
     def require_command_auth(fn):
         """Protect V2 business intelligence with a server-side bearer token."""
@@ -262,6 +274,19 @@ def _build_app():
 
         intervention_store.save(intervention)
 
+        audit_logger.log(
+            intervention.id, event_id,
+            action="prepared",
+            from_status="new",
+            to_status=intervention.status.value,
+            actor="system",
+            metadata={
+                "opportunity_id": opportunity_id,
+                "intervention_type": recommended_type,
+                "campaign_draft_id": intervention.campaign_draft_id,
+            },
+        )
+
         return jsonify({
             "intervention": intervention.to_dict(),
             "diagnosis_summary": {
@@ -275,6 +300,143 @@ def _build_app():
             },
             "campaign_draft": campaign_result,
         }), 201
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Approve / Reject
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.post("/api/v2/interventions/<intervention_id>/approve")
+    @require_command_auth
+    def approve_intervention(intervention_id: str):
+        """Approve a proposed intervention. Does NOT trigger execution."""
+        item = intervention_store.get(intervention_id)
+        if not item:
+            return jsonify({"error": "intervention_not_found"}), 404
+
+        from_status = item.status.value
+        try:
+            item.transition_to(InterventionStatus.APPROVED)
+        except IllegalTransition as e:
+            audit_logger.log(
+                intervention_id, item.event_id,
+                action="approve_rejected",
+                from_status=from_status,
+                actor="user",
+                error=str(e),
+            )
+            return jsonify({"error": "illegal_transition", "message": str(e)}), 409
+
+        intervention_store.save(item)
+        audit_logger.log(
+            intervention_id, item.event_id,
+            action="approved",
+            from_status=from_status,
+            to_status=item.status.value,
+            actor="user",
+        )
+        return jsonify({"status": "approved", "intervention": item.to_dict()})
+
+    @app.post("/api/v2/interventions/<intervention_id>/reject")
+    @require_command_auth
+    def reject_intervention(intervention_id: str):
+        """Reject a proposed intervention."""
+        item = intervention_store.get(intervention_id)
+        if not item:
+            return jsonify({"error": "intervention_not_found"}), 404
+
+        from_status = item.status.value
+        try:
+            item.transition_to(InterventionStatus.REJECTED)
+        except IllegalTransition as e:
+            audit_logger.log(
+                intervention_id, item.event_id,
+                action="reject_rejected",
+                from_status=from_status,
+                actor="user",
+                error=str(e),
+            )
+            return jsonify({"error": "illegal_transition", "message": str(e)}), 409
+
+        intervention_store.save(item)
+        audit_logger.log(
+            intervention_id, item.event_id,
+            action="rejected",
+            from_status=from_status,
+            to_status=item.status.value,
+            actor="user",
+        )
+        return jsonify({"status": "rejected", "intervention": item.to_dict()})
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Execute
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.post("/api/v2/interventions/<intervention_id>/execute")
+    @require_command_auth
+    def execute_intervention(intervention_id: str):
+        """Execute an approved CRM intervention.
+
+        Actual external sends require V2_ENABLE_EXTERNAL_SEND=1.
+        Without that flag, returns a dry-run/preflight result.
+        """
+        result = execution_adapter.execute(intervention_id, actor="user")
+        if "error" in result:
+            status_code = {
+                "intervention_not_found": 404,
+                "illegal_status": 409,
+                "no_campaign_draft": 422,
+                "campaign_draft_missing": 422,
+                "suppression_unavailable": 503,
+                "empty_audience": 422,
+                "execution_failed": 500,
+            }.get(result["error"], 400)
+            return jsonify(result), status_code
+
+        # external_send_disabled is a 200 — it's not an error, just a gate
+        return jsonify(result)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Measure
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.post("/api/v2/interventions/<intervention_id>/measure")
+    @require_command_auth
+    def measure_intervention(intervention_id: str):
+        """Compute attributed outcomes for an executed CRM intervention.
+
+        Returns predicted vs actual values.
+        Attribution is deterministic (order match by email within window),
+        NOT causal lift.
+        """
+        result = execution_adapter.measure(intervention_id, actor="user")
+        if "error" in result:
+            status_code = {
+                "intervention_not_found": 404,
+                "illegal_status": 409,
+                "no_sends": 422,
+            }.get(result["error"], 400)
+            return jsonify(result), status_code
+
+        return jsonify(result)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Audit log
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.get("/api/v2/interventions/<intervention_id>/audit")
+    @require_command_auth
+    def intervention_audit_log(intervention_id: str):
+        """Return the full audit trail for an intervention."""
+        item = intervention_store.get(intervention_id)
+        if not item:
+            return jsonify({"error": "intervention_not_found"}), 404
+
+        entries = audit_logger.get_log(intervention_id)
+        return jsonify({
+            "intervention_id": intervention_id,
+            "count": len(entries),
+            "entries": entries,
+        })
 
     # ─────────────────────────────────────────────────────────────────────
     # Health

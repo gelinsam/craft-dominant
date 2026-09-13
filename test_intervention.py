@@ -6,6 +6,7 @@ linkage, and deterministic IDs.
 """
 
 import json
+import os
 import sqlite3
 import unittest
 from datetime import date, timedelta
@@ -347,7 +348,7 @@ class TestCampaignAdapter(unittest.TestCase):
         # Buyers
         for i in range(50):
             self.db.conn.execute(
-                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
                 (f"o{i}", "evt1", f"buyer{i}@example.com", 2, 100.0),
             )
         # CRM audience
@@ -548,6 +549,773 @@ class TestCampaignAdapter(unittest.TestCase):
                         "Champion conversions should be smaller with conversion_rate included")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Audit logger tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestAuditLogger(unittest.TestCase):
+
+    def setUp(self):
+        self.db = FakeStoreDB()
+        from intervention_model import AuditLogger
+        self.logger = AuditLogger(self.db)
+
+    def test_log_and_retrieve(self):
+        self.logger.log(
+            "intv-1", "evt-1",
+            action="prepared",
+            from_status="new",
+            to_status="proposed",
+            actor="system",
+        )
+        entries = self.logger.get_log("intv-1")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["action"], "prepared")
+        self.assertEqual(entries[0]["from_status"], "new")
+        self.assertEqual(entries[0]["to_status"], "proposed")
+        self.assertEqual(entries[0]["actor"], "system")
+
+    def test_multiple_entries_ordered_by_id(self):
+        for action in ["prepared", "approved", "executed"]:
+            self.logger.log("intv-1", "evt-1", action=action, actor="user")
+        entries = self.logger.get_log("intv-1")
+        self.assertEqual(len(entries), 3)
+        self.assertEqual([e["action"] for e in entries], ["prepared", "approved", "executed"])
+
+    def test_metadata_json_roundtrip(self):
+        self.logger.log(
+            "intv-1", "evt-1", action="executed",
+            metadata={"sent_count": 42, "campaign_id": "v2-abc"},
+        )
+        entries = self.logger.get_log("intv-1")
+        self.assertEqual(entries[0]["metadata"]["sent_count"], 42)
+        self.assertEqual(entries[0]["metadata"]["campaign_id"], "v2-abc")
+
+    def test_error_field_persisted(self):
+        self.logger.log(
+            "intv-1", "evt-1", action="execute_blocked",
+            error="suppression unavailable",
+        )
+        entries = self.logger.get_log("intv-1")
+        self.assertEqual(entries[0]["error"], "suppression unavailable")
+
+    def test_separate_intervention_isolation(self):
+        self.logger.log("intv-1", "evt-1", action="prepared")
+        self.logger.log("intv-2", "evt-2", action="prepared")
+        self.assertEqual(len(self.logger.get_log("intv-1")), 1)
+        self.assertEqual(len(self.logger.get_log("intv-2")), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Execution adapter tests
+# ─────────────────────────────────────────────────────────────────────
+
+class FakeExecutionDB:
+    """Full-featured test DB for execution adapter tests."""
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE events (
+                event_id TEXT PRIMARY KEY, name TEXT, event_type TEXT,
+                city TEXT, event_date TEXT, capacity INTEGER
+            );
+            CREATE TABLE orders (
+                order_id TEXT PRIMARY KEY, event_id TEXT, email TEXT,
+                ticket_count INTEGER, gross_amount REAL,
+                order_date TEXT DEFAULT '2026-01-01'
+            );
+            CREATE TABLE customers (
+                email TEXT PRIMARY KEY, favorite_city TEXT,
+                event_types TEXT, rfm_segment TEXT
+            );
+            CREATE TABLE suppressions (email TEXT PRIMARY KEY);
+            CREATE TABLE campaigns (
+                id TEXT PRIMARY KEY, intervention_id TEXT, event_id TEXT,
+                subject_line TEXT, preview_text TEXT, body_html TEXT,
+                audience_json TEXT, audience_count INTEGER,
+                segment_description TEXT, status TEXT DEFAULT 'draft',
+                sent_at TEXT, created_at TEXT
+            );
+        """)
+
+    def get_event(self, event_id):
+        row = self.conn.execute(
+            "SELECT * FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_event_buyers(self, event_id):
+        rows = self.conn.execute(
+            "SELECT DISTINCT email FROM orders WHERE event_id = ?",
+            (event_id,),
+        ).fetchall()
+        return [r["email"] for r in rows]
+
+    def get_past_attendees_not_purchased(self, event_id, event_name, limit=50000, current_buyer_emails=None):
+        buyer_set = set(current_buyer_emails or [])
+        rows = self.conn.execute("SELECT * FROM customers").fetchall()
+        return [dict(r) for r in rows if r["email"] not in buyer_set]
+
+    def get_city_prospects(self, city, exclude_emails=None, limit=50000):
+        exclude = set(exclude_emails or [])
+        rows = self.conn.execute(
+            "SELECT * FROM customers WHERE favorite_city = ?", (city,)
+        ).fetchall()
+        return [dict(r) for r in rows if r["email"] not in exclude]
+
+
+class TestExecutionAdapter(unittest.TestCase):
+
+    def setUp(self):
+        from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        self.db = FakeExecutionDB()
+        self.store = InterventionStore(self.db)
+        self.audit = AuditLogger(self.db)
+
+        # Create campaign_sends and learning_records tables
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+
+        # Seed event
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test Fest", "coffee", "Philadelphia", event_date, 5000),
+        )
+        # Seed audience
+        for i in range(50):
+            self.db.conn.execute(
+                "INSERT INTO customers VALUES (?,?,?,?)",
+                (f"audience{i}@example.com", "Philadelphia", "coffee", "regular"),
+            )
+        # Seed campaign draft
+        self.db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-draft-1", "test-intv", "evt1", "Test subject", 50, "draft", "2026-01-01"),
+        )
+        self.db.conn.commit()
+
+    def _make_approved_intervention(self, intv_id="test-intv"):
+        """Helper: create an approved intervention linked to campaign draft."""
+        i = Intervention(
+            id=intv_id,
+            opportunity_id="opp1",
+            event_id="evt1",
+            intervention_type="crm_campaign",
+            status=InterventionStatus.NEW,
+            expected_revenue=5000,
+            confidence=0.6,
+            campaign_draft_id="v2-draft-1",
+            measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        self.store.save(i)
+        return i
+
+    # Gate 1: status check
+    def test_execute_blocks_non_approved(self):
+        """Execute must reject if status is not 'approved'."""
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        self.store.save(i)
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["error"], "illegal_status")
+
+    # Gate 2: campaign draft required
+    def test_execute_blocks_without_campaign_draft(self):
+        """Execute must reject if no campaign draft is linked."""
+        i = Intervention.create(
+            opportunity_id="opp2", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        # campaign_draft_id is None
+        self.store.save(i)
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["error"], "no_campaign_draft")
+
+    def test_execute_blocks_missing_campaign_record(self):
+        """Execute must reject if campaign_draft_id points to a missing record."""
+        i = Intervention.create(
+            opportunity_id="opp3", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        i.campaign_draft_id = "v2-nonexistent"
+        self.store.save(i)
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["error"], "campaign_draft_missing")
+
+    # Gate 3: suppression list
+    def test_execute_blocks_suppression_unavailable(self):
+        """Execute must block if suppression list is unreadable."""
+        i = self._make_approved_intervention()
+        self.db.conn.execute("DROP TABLE suppressions")
+        self.db.conn.commit()
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["error"], "suppression_unavailable")
+
+    # Gate 5: external send flag
+    def test_execute_dry_run_without_flag(self):
+        """Default: no V2_ENABLE_EXTERNAL_SEND → dry-run, no external HTTP."""
+        i = self._make_approved_intervention()
+        # Make sure flag is NOT set
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["status"], "external_send_disabled")
+        self.assertIn("dry_run", result)
+        self.assertGreater(result["dry_run"]["audience_count"], 0)
+
+        # Verify intervention status did NOT advance
+        loaded = self.store.get(i.id)
+        self.assertEqual(loaded.status, InterventionStatus.APPROVED)
+
+    def test_execute_dry_run_audits(self):
+        """Dry-run must write an audit log entry."""
+        i = self._make_approved_intervention()
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+        self.adapter.execute(i.id, actor="user")
+
+        entries = self.audit.get_log(i.id)
+        dry_run_entries = [e for e in entries if e["action"] == "execute_dry_run"]
+        self.assertEqual(len(dry_run_entries), 1)
+
+    def test_execute_not_found(self):
+        result = self.adapter.execute("nonexistent", actor="user")
+        self.assertEqual(result["error"], "intervention_not_found")
+
+    # Audit trail on blocks
+    def test_blocked_execution_writes_audit(self):
+        """Every blocked execution attempt must leave an audit trail."""
+        i = Intervention.create(
+            opportunity_id="opp-audit", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        self.store.save(i)
+
+        self.adapter.execute(i.id, actor="user")
+        entries = self.audit.get_log(i.id)
+        blocked = [e for e in entries if "blocked" in e["action"]]
+        self.assertGreater(len(blocked), 0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Measurement tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestMeasurement(unittest.TestCase):
+
+    def setUp(self):
+        from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        self.db = FakeExecutionDB()
+        self.store = InterventionStore(self.db)
+        self.audit = AuditLogger(self.db)
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+
+        # Seed event
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test Fest", "coffee", "Philadelphia", event_date, 5000),
+        )
+        self.db.conn.commit()
+
+    def _make_measuring_intervention(self, sent_emails=None):
+        """Helper: create an intervention in 'measuring' status with campaign sends."""
+        from datetime import datetime, timezone, timedelta
+
+        i = Intervention(
+            id="meas-intv",
+            opportunity_id="opp1",
+            event_id="evt1",
+            intervention_type="crm_campaign",
+            status=InterventionStatus.NEW,
+            expected_revenue=5000,
+            confidence=0.6,
+            campaign_draft_id="v2-draft-1",
+            measurement_window=7,
+            sent_count=len(sent_emails or []),
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        i.transition_to(InterventionStatus.EXECUTING)
+        i.transition_to(InterventionStatus.MEASURING)
+        self.store.save(i)
+
+        # Record sends
+        sent_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        for email in (sent_emails or []):
+            self.db.conn.execute(
+                """INSERT INTO v2_campaign_sends
+                   (intervention_id, campaign_draft_id, email, sent_at)
+                   VALUES (?,?,?,?)""",
+                ("meas-intv", "v2-draft-1", email, sent_at),
+            )
+        self.db.conn.commit()
+        return i
+
+    def test_measure_only_counts_sent_recipients(self):
+        """Attribution must only count orders from emails in the sent list."""
+        sent = ["alice@test.com", "bob@test.com"]
+        self._make_measuring_intervention(sent_emails=sent)
+
+        # Alice ordered (should be attributed)
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
+            ("o1", "evt1", "alice@test.com", 2, 100.0),
+        )
+        # Carol ordered (NOT sent to, should NOT be attributed)
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
+            ("o2", "evt1", "carol@test.com", 3, 150.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter.measure("meas-intv", actor="user")
+        self.assertEqual(result["actual"]["attributed_orders"], 1)  # Only Alice
+        self.assertEqual(result["actual"]["attributed_revenue"], 100.0)
+        self.assertEqual(result["actual"]["attributed_tickets"], 2)
+
+    def test_measure_excludes_non_sent_orders(self):
+        """Orders from people NOT in the sent list must be excluded."""
+        self._make_measuring_intervention(sent_emails=["alice@test.com"])
+
+        # Only non-sent person ordered
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
+            ("o1", "evt1", "stranger@test.com", 5, 500.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter.measure("meas-intv", actor="user")
+        self.assertEqual(result["actual"]["attributed_orders"], 0)
+        self.assertEqual(result["actual"]["attributed_revenue"], 0.0)
+
+    def test_measure_blocks_non_measuring_status(self):
+        """Measure must reject if status is not 'measuring'."""
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        self.store.save(i)
+
+        result = self.adapter.measure(i.id, actor="user")
+        self.assertEqual(result["error"], "illegal_status")
+
+    def test_measure_transitions_to_learned_when_window_complete(self):
+        """When attribution window has passed, status → learned."""
+        sent = ["alice@test.com"]
+        self._make_measuring_intervention(sent_emails=sent)
+
+        # The helper sets sent_at 8 days ago and window is 7 days, so window is complete
+        result = self.adapter.measure("meas-intv", actor="user")
+        self.assertEqual(result["status"], "learned")
+        self.assertTrue(result["window_complete"])
+
+        loaded = self.store.get("meas-intv")
+        self.assertEqual(loaded.status, InterventionStatus.LEARNED)
+
+    def test_measure_returns_predicted_vs_actual(self):
+        """Response must include predicted and actual for comparison."""
+        sent = ["alice@test.com"]
+        self._make_measuring_intervention(sent_emails=sent)
+
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
+            ("o1", "evt1", "alice@test.com", 2, 200.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter.measure("meas-intv", actor="user")
+        self.assertIn("predicted", result)
+        self.assertIn("actual", result)
+        self.assertEqual(result["predicted"]["expected_revenue"], 5000)
+        self.assertEqual(result["actual"]["attributed_revenue"], 200.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Learning record persistence tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestLearningRecord(unittest.TestCase):
+
+    def setUp(self):
+        from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        self.db = FakeExecutionDB()
+        self.store = InterventionStore(self.db)
+        self.audit = AuditLogger(self.db)
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+
+        # Seed event
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test Fest", "coffee", "Philadelphia", event_date, 5000),
+        )
+        self.db.conn.commit()
+
+    def test_learning_record_created_on_learned(self):
+        """When measure completes (window over), a learning record must be persisted."""
+        from intervention_model import LearningStore
+        from datetime import datetime, timezone, timedelta
+
+        i = Intervention(
+            id="learn-intv",
+            opportunity_id="opp1",
+            event_id="evt1",
+            intervention_type="crm_campaign",
+            status=InterventionStatus.NEW,
+            expected_revenue=5000,
+            confidence=0.6,
+            campaign_draft_id="v2-draft-1",
+            measurement_window=7,
+            sent_count=2,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        i.transition_to(InterventionStatus.EXECUTING)
+        i.transition_to(InterventionStatus.MEASURING)
+        self.store.save(i)
+
+        # Record sends 8 days ago (window complete)
+        sent_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        for email in ["a@test.com", "b@test.com"]:
+            self.db.conn.execute(
+                """INSERT INTO v2_campaign_sends
+                   (intervention_id, campaign_draft_id, email, sent_at)
+                   VALUES (?,?,?,?)""",
+                ("learn-intv", "v2-draft-1", email, sent_at),
+            )
+        self.db.conn.execute(
+            "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
+            ("o1", "evt1", "a@test.com", 1, 100.0),
+        )
+        self.db.conn.commit()
+
+        result = self.adapter.measure("learn-intv", actor="user")
+        self.assertEqual(result["status"], "learned")
+
+        # Verify learning record exists
+        ls = LearningStore(self.db)
+        record = ls.get("learn-intv")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["intervention_type"], "crm_campaign")
+        self.assertEqual(record["predicted_revenue"], 5000)
+        self.assertEqual(record["attributed_revenue"], 100.0)
+        self.assertEqual(record["prediction_error"], -4900.0)
+        self.assertEqual(record["sent_count"], 2)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Campaign sends persistence tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestCampaignSendsPersistence(unittest.TestCase):
+
+    def setUp(self):
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        self.db = FakeExecutionDB()
+        self.store = InterventionStore(self.db)
+        self.audit = AuditLogger(self.db)
+        self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
+        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+
+    def test_record_sends_persists_emails(self):
+        emails = ["a@test.com", "b@test.com", "c@test.com"]
+        self.adapter._record_sends("intv-1", "draft-1", emails)
+
+        rows = self.db.conn.execute(
+            "SELECT * FROM v2_campaign_sends WHERE intervention_id = ?",
+            ("intv-1",),
+        ).fetchall()
+        self.assertEqual(len(rows), 3)
+        stored_emails = {r["email"] for r in rows}
+        self.assertEqual(stored_emails, set(emails))
+
+    def test_record_sends_deduplicates(self):
+        """UNIQUE(intervention_id, email) should prevent double-recording."""
+        self.adapter._record_sends("intv-1", "draft-1", ["a@test.com"])
+        self.adapter._record_sends("intv-1", "draft-1", ["a@test.com"])
+
+        rows = self.db.conn.execute(
+            "SELECT * FROM v2_campaign_sends WHERE intervention_id = ?",
+            ("intv-1",),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Frontend security tests (proxy routes)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestFrontendSecurityPatterns(unittest.TestCase):
+    """Verify no secrets leak to browser and all calls go through server-side proxies."""
+
+    def test_command_js_never_reads_command_api_key(self):
+        """pages/command.js must not reference COMMAND_API_KEY."""
+        with open("pages/command.js", "r") as f:
+            content = f.read()
+        self.assertNotIn("COMMAND_API_KEY", content)
+        self.assertNotIn("NEXT_PUBLIC_COMMAND_API_KEY", content)
+
+    def test_command_js_never_calls_railway_directly(self):
+        """pages/command.js must only use relative /api/ paths."""
+        with open("pages/command.js", "r") as f:
+            content = f.read()
+        self.assertNotIn("railway.app", content)
+        self.assertNotIn("craft-dominant-production", content)
+
+    def test_command_js_never_constructs_auth_headers(self):
+        """pages/command.js must never build Authorization headers."""
+        with open("pages/command.js", "r") as f:
+            content = f.read()
+        self.assertNotIn("Authorization", content)
+        self.assertNotIn("Bearer", content)
+
+    def test_proxy_routes_use_server_side_key(self):
+        """All proxy routes must read COMMAND_API_KEY from process.env (server-side)."""
+        import glob as globmod
+        proxy_files = globmod.glob("pages/api/v2/**/*.js", recursive=True)
+        self.assertGreater(len(proxy_files), 0)
+        for path in proxy_files:
+            with open(path, "r") as f:
+                content = f.read()
+            # Server-side key injection
+            self.assertIn("process.env", content,
+                          f"{path} must read secrets from process.env")
+            self.assertIn("COMMAND_API_KEY", content,
+                          f"{path} must use COMMAND_API_KEY")
+            # Must NOT expose via NEXT_PUBLIC_ prefix
+            self.assertNotIn("NEXT_PUBLIC_COMMAND_API_KEY", content,
+                             f"{path} must not use NEXT_PUBLIC_ prefix for secrets")
+
+    def test_proxy_routes_exist_for_all_actions(self):
+        """Each closed-loop action must have a server-side proxy route."""
+        import os as _os
+        for action in ["approve", "reject", "execute", "measure"]:
+            path = f"pages/api/v2/interventions/[id]/{action}.js"
+            self.assertTrue(
+                _os.path.exists(path),
+                f"Missing proxy route: {path}",
+            )
+
+    def test_command_js_uses_relative_proxy_paths(self):
+        """Action buttons in command.js should call /api/v2/... paths."""
+        with open("pages/command.js", "r") as f:
+            content = f.read()
+        # The InterventionBadge doAction function must use relative proxy paths
+        self.assertIn("/api/v2/interventions/", content)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Approval transition tests (closed-loop specific)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestApprovalTransitions(unittest.TestCase):
+
+    def setUp(self):
+        self.db = FakeStoreDB()
+        self.store = InterventionStore(self.db)
+
+    def test_proposed_to_approved(self):
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        self.assertEqual(i.status, InterventionStatus.APPROVED)
+        self.assertIsNotNone(i.approved_at)
+
+    def test_proposed_to_rejected(self):
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.REJECTED)
+        self.assertEqual(i.status, InterventionStatus.REJECTED)
+        self.assertTrue(i.is_terminal)
+
+    def test_approved_cannot_be_re_approved(self):
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        with self.assertRaises(IllegalTransition):
+            i.transition_to(InterventionStatus.APPROVED)
+
+    def test_approve_from_new_illegal(self):
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        with self.assertRaises(IllegalTransition):
+            i.transition_to(InterventionStatus.APPROVED)
+
+    def test_execute_from_proposed_illegal(self):
+        """Cannot skip approval — executing from proposed must be blocked."""
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        with self.assertRaises(IllegalTransition):
+            i.transition_to(InterventionStatus.EXECUTING)
+
+    def test_measuring_transition_sets_timestamps(self):
+        """Transition to MEASURING must set measurement_started_at and measurement_ends_at."""
+        i = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        i.transition_to(InterventionStatus.EXECUTING)
+        i.transition_to(InterventionStatus.MEASURING)
+        self.assertIsNotNone(i.measurement_started_at)
+        self.assertIsNotNone(i.measurement_ends_at)
+
+    def test_new_measurement_fields_roundtrip(self):
+        """Measurement fields must survive save/load cycle."""
+        i = Intervention.create(
+            opportunity_id="opp-rt", event_id="evt1",
+            intervention_type="crm_campaign",
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        i.transition_to(InterventionStatus.EXECUTING)
+        i.transition_to(InterventionStatus.MEASURING)
+        i.sent_count = 42
+        i.attributed_orders = 5
+        i.attributed_tickets = 8
+        i.attributed_revenue = 1234.56
+        self.store.save(i)
+
+        loaded = self.store.get(i.id)
+        self.assertEqual(loaded.sent_count, 42)
+        self.assertEqual(loaded.attributed_orders, 5)
+        self.assertEqual(loaded.attributed_tickets, 8)
+        self.assertAlmostEqual(loaded.attributed_revenue, 1234.56, places=2)
+        self.assertEqual(loaded.status, InterventionStatus.MEASURING)
+        self.assertIsNotNone(loaded.measurement_started_at)
+        self.assertIsNotNone(loaded.measurement_ends_at)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# No-external-HTTP default test
+# ─────────────────────────────────────────────────────────────────────
+
+class TestNoExternalHTTPByDefault(unittest.TestCase):
+    """Verify that tests/dev mode never makes external HTTP calls."""
+
+    def test_external_send_flag_not_set_by_default(self):
+        """V2_ENABLE_EXTERNAL_SEND must not be set in the test environment."""
+        import os as _os
+        self.assertNotEqual(_os.environ.get("V2_ENABLE_EXTERNAL_SEND", "0"), "1",
+                            "V2_ENABLE_EXTERNAL_SEND must not be '1' in test env")
+
+    def test_execution_adapter_defaults_to_dry_run(self):
+        """Without V2_ENABLE_EXTERNAL_SEND, execute() returns dry-run, never calls Mailchimp."""
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        db = FakeExecutionDB()
+        store = InterventionStore(db)
+        audit = AuditLogger(db)
+        db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        # Seed data
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test Fest", "coffee", "Phila", event_date, 5000),
+        )
+        for i in range(10):
+            db.conn.execute(
+                "INSERT INTO customers VALUES (?,?,?,?)",
+                (f"c{i}@test.com", "Phila", "coffee", "regular"),
+            )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "test-intv", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        db.conn.commit()
+
+        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+
+        i = Intervention(
+            id="test-intv",
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign",
+            status=InterventionStatus.NEW,
+            campaign_draft_id="v2-d1",
+            measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        store.save(i)
+
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+        result = adapter.execute("test-intv", actor="user")
+        self.assertEqual(result["status"], "external_send_disabled")
+
+        # Verify NO state change happened
+        loaded = store.get("test-intv")
+        self.assertEqual(loaded.status, InterventionStatus.APPROVED)
+
+
 class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
     """Regression tests for blocker-removal pass — campaign adapter side."""
 
@@ -561,7 +1329,7 @@ class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
         # Buyers
         for i in range(10):
             self.db.conn.execute(
-                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
                 (f"o{i}", "evt_br", f"buyer{i}@example.com", 1, 50.0),
             )
         self.db.conn.commit()
