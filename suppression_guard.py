@@ -359,6 +359,100 @@ class SuppressionGuard:
             )
         self.db.conn.commit()
 
+    def refresh_from_mailchimp(self, mailchimp_client) -> Dict[str, Any]:
+        """Perform an authoritative full-refresh of suppressions from Mailchimp.
+
+        This is the bootstrap and ongoing refresh path. It:
+        1. Queries Mailchimp for ALL unsubscribed + cleaned members (paginated).
+        2. Normalizes emails (lowercase, stripped).
+        3. In a single local transaction: replaces the entire suppressions table,
+           then updates the sentinel with exact count, timestamp, and source.
+        4. If the Mailchimp query fails at any point, returns an error WITHOUT
+           touching local state — all-or-nothing from the sentinel's perspective.
+
+        Returns dict with either {"refreshed": True, "row_count": N, ...}
+        or {"error": "..."}.
+        """
+        from datetime import datetime, timezone
+
+        # Step 1: Fetch complete suppressed set from Mailchimp
+        log.info("refresh_from_mailchimp: starting authoritative suppression refresh")
+        try:
+            raw_emails = mailchimp_client.get_suppressed_members()
+        except Exception as e:
+            log.error(f"refresh_from_mailchimp: Mailchimp query raised: {e}")
+            return {"error": f"Mailchimp query failed: {e}"}
+
+        if raw_emails is None:
+            log.error("refresh_from_mailchimp: Mailchimp returned None — incomplete data")
+            return {"error": "Mailchimp suppression query returned incomplete data. "
+                            "Local suppressions NOT updated."}
+
+        # Step 2: Normalize and deduplicate
+        normalized = sorted(set(e.lower().strip() for e in raw_emails if e and e.strip()))
+        count = len(normalized)
+        log.info(f"refresh_from_mailchimp: {count} unique suppressed emails from Mailchimp")
+
+        # Step 3: Atomic local replacement — transaction wraps both tables
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            # Delete all existing suppressions
+            self.db.conn.execute("DELETE FROM suppressions")
+
+            # Insert the authoritative set
+            for email in normalized:
+                self.db.conn.execute(
+                    "INSERT OR IGNORE INTO suppressions (email, reason) "
+                    "VALUES (?, 'mailchimp_suppressed')",
+                    (email,),
+                )
+
+            # Update sentinel — clear any acknowledgment if real rows exist
+            if count > 0:
+                self.db.conn.execute(
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason)
+                       VALUES (1, ?, ?, 'mailchimp_full_refresh', 0, NULL, NULL, NULL)
+                       ON CONFLICT(id) DO UPDATE SET
+                           last_synced_at = excluded.last_synced_at,
+                           row_count = excluded.row_count,
+                           source = 'mailchimp_full_refresh',
+                           empty_acknowledged = 0,
+                           acknowledged_by = NULL,
+                           acknowledged_at = NULL,
+                           acknowledged_reason = NULL""",
+                    (now, count),
+                )
+            else:
+                # Zero suppressions from Mailchimp — preserve acknowledgment state
+                self.db.conn.execute(
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source)
+                       VALUES (1, ?, 0, 'mailchimp_full_refresh')
+                       ON CONFLICT(id) DO UPDATE SET
+                           last_synced_at = excluded.last_synced_at,
+                           row_count = 0,
+                           source = 'mailchimp_full_refresh'""",
+                    (now,),
+                )
+
+            self.db.conn.commit()
+        except Exception as e:
+            # Rollback on any failure — suppressions and sentinel stay untouched
+            try:
+                self.db.conn.rollback()
+            except Exception:
+                pass
+            log.error(f"refresh_from_mailchimp: local write failed: {e}")
+            return {"error": f"Local write failed — suppressions NOT updated: {e}"}
+
+        log.info(f"refresh_from_mailchimp: complete. {count} suppressions, sentinel updated.")
+        return {
+            "refreshed": True,
+            "row_count": count,
+            "source": "mailchimp_full_refresh",
+            "last_synced_at": now,
+        }
+
     def acknowledge_empty(self, actor: str, reason: str) -> Dict[str, Any]:
         """Explicitly acknowledge that an empty suppression list is legitimate.
 

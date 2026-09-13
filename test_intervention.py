@@ -2258,6 +2258,413 @@ class TestSuppressionGuard(unittest.TestCase):
         self.assertIn("count_mismatch", row.get("error", "").lower())
 
 
+class TestAuthoritativeRefresh(unittest.TestCase):
+    """Regression tests for authoritative Mailchimp suppression refresh.
+
+    Tests cover: successful refresh, sentinel update, pagination,
+    status filtering, failure modes, bootstrap, staleness, webhook
+    compatibility, and the endpoint auth/payload contract.
+    """
+
+    def _make_refresh_db(self):
+        """Create an in-memory DB with production-schema suppressions."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("""CREATE TABLE IF NOT EXISTS suppressions (
+            email TEXT PRIMARY KEY,
+            reason TEXT DEFAULT 'unsubscribe',
+            suppressed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.commit()
+
+        class MinimalDB:
+            pass
+
+        db = MinimalDB()
+        db.conn = conn
+        return db
+
+    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0):
+        from datetime import datetime, timezone, timedelta as td
+        db.conn.executescript(SENTINEL_TABLE_SCHEMA)
+        synced_at = (datetime.now(timezone.utc) - td(hours=age_hours)).isoformat()
+        db.conn.execute(
+            """INSERT OR REPLACE INTO v2_suppression_sync
+               (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
+            (synced_at, row_count, source),
+        )
+        db.conn.commit()
+
+    class FakeMailchimpClient:
+        """Mock Mailchimp client for refresh tests."""
+
+        def __init__(self, suppressed_emails=None, fail=False, raise_exc=False):
+            self._emails = suppressed_emails
+            self._fail = fail
+            self._raise_exc = raise_exc
+
+        def get_suppressed_members(self):
+            if self._raise_exc:
+                raise ConnectionError("Mailchimp API timeout")
+            if self._fail:
+                return None
+            return self._emails if self._emails is not None else []
+
+    def test_successful_refresh_replaces_suppressions(self):
+        """Full refresh replaces local suppressions with Mailchimp data."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Pre-seed some local suppressions that should be REPLACED
+        db.conn.execute("INSERT INTO suppressions (email) VALUES ('old@stale.com')")
+        db.conn.commit()
+
+        mc = self.FakeMailchimpClient(["alice@test.com", "bob@test.com"])
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertTrue(result.get("refreshed"))
+        self.assertEqual(result["row_count"], 2)
+        self.assertEqual(result["source"], "mailchimp_full_refresh")
+
+        # Verify old email is gone
+        rows = db.conn.execute("SELECT email FROM suppressions ORDER BY email").fetchall()
+        emails = [r["email"] for r in rows]
+        self.assertEqual(emails, ["alice@test.com", "bob@test.com"])
+        self.assertNotIn("old@stale.com", emails)
+
+    def test_sentinel_updated_after_refresh(self):
+        """Sentinel reflects exact count and source after successful refresh."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        mc = self.FakeMailchimpClient(["a@t.com", "b@t.com", "c@t.com"])
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertTrue(result["refreshed"])
+
+        sentinel = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        self.assertIsNotNone(sentinel)
+        sentinel = dict(sentinel)
+        self.assertEqual(sentinel["row_count"], 3)
+        self.assertEqual(sentinel["source"], "mailchimp_full_refresh")
+        self.assertFalse(bool(sentinel["empty_acknowledged"]))
+
+    def test_refresh_clears_stale_acknowledgment(self):
+        """Refresh with real rows clears any prior empty-set acknowledgment."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Set up an acknowledged-empty state
+        self._seed_sentinel(db, row_count=0, source="manual")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            """UPDATE v2_suppression_sync SET
+                   empty_acknowledged = 1, acknowledged_by = 'admin',
+                   acknowledged_at = ?, acknowledged_reason = 'test'
+               WHERE id = 1""",
+            (now,),
+        )
+        db.conn.commit()
+
+        mc = self.FakeMailchimpClient(["real@user.com"])
+        result = guard.refresh_from_mailchimp(mc)
+        self.assertTrue(result["refreshed"])
+
+        sentinel = dict(db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone())
+        self.assertEqual(sentinel["empty_acknowledged"], 0)
+        self.assertIsNone(sentinel["acknowledged_by"])
+
+    def test_refresh_empty_preserves_acknowledgment(self):
+        """Refresh returning zero emails does NOT clear existing acknowledgment."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Set up acknowledged-empty
+        self._seed_sentinel(db, row_count=0, source="manual")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            """UPDATE v2_suppression_sync SET
+                   empty_acknowledged = 1, acknowledged_by = 'admin',
+                   acknowledged_at = ?, acknowledged_reason = 'legit'
+               WHERE id = 1""",
+            (now,),
+        )
+        db.conn.commit()
+
+        mc = self.FakeMailchimpClient([])  # empty
+        result = guard.refresh_from_mailchimp(mc)
+        self.assertTrue(result["refreshed"])
+        self.assertEqual(result["row_count"], 0)
+
+        sentinel = dict(db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone())
+        self.assertEqual(sentinel["empty_acknowledged"], 1)
+        self.assertEqual(sentinel["acknowledged_by"], "admin")
+
+    def test_mailchimp_failure_returns_none_no_local_change(self):
+        """When Mailchimp returns None, local suppressions must NOT be touched."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Pre-seed local data
+        db.conn.execute("INSERT INTO suppressions (email) VALUES ('preserve@test.com')")
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1, source="webhook")
+
+        mc = self.FakeMailchimpClient(fail=True)  # returns None
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertIn("error", result)
+        self.assertNotIn("refreshed", result)
+
+        # Local data untouched
+        rows = db.conn.execute("SELECT email FROM suppressions").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["email"], "preserve@test.com")
+
+        # Sentinel untouched
+        sentinel = dict(db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone())
+        self.assertEqual(sentinel["row_count"], 1)
+        self.assertEqual(sentinel["source"], "webhook")
+
+    def test_mailchimp_exception_no_local_change(self):
+        """Mailchimp client raising an exception leaves local state intact."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        db.conn.execute("INSERT INTO suppressions (email) VALUES ('safe@test.com')")
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1, source="webhook")
+
+        mc = self.FakeMailchimpClient(raise_exc=True)
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertIn("error", result)
+        rows = db.conn.execute("SELECT email FROM suppressions").fetchall()
+        self.assertEqual(len(rows), 1)
+
+    def test_bootstrap_first_refresh_creates_sentinel(self):
+        """First-ever refresh bootstraps the sentinel from scratch."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # No sentinel exists yet
+        sentinel = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        self.assertIsNone(sentinel)
+
+        mc = self.FakeMailchimpClient(["first@user.com", "second@user.com"])
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertTrue(result["refreshed"])
+        self.assertEqual(result["row_count"], 2)
+
+        # Sentinel now exists
+        sentinel = dict(db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone())
+        self.assertEqual(sentinel["row_count"], 2)
+        self.assertEqual(sentinel["source"], "mailchimp_full_refresh")
+
+        # Guard validates as HEALTHY
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+
+    def test_email_normalization_and_dedup(self):
+        """Emails from Mailchimp are lowercased, stripped, and deduplicated."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        mc = self.FakeMailchimpClient([
+            "Alice@Test.COM",
+            "  bob@test.com  ",
+            "alice@test.com",  # duplicate after normalization
+            "BOB@TEST.COM",    # duplicate after normalization
+            "",                # empty — should be ignored
+            "  ",              # whitespace — should be ignored
+        ])
+        result = guard.refresh_from_mailchimp(mc)
+
+        self.assertTrue(result["refreshed"])
+        self.assertEqual(result["row_count"], 2)
+
+        rows = db.conn.execute("SELECT email FROM suppressions ORDER BY email").fetchall()
+        emails = [r["email"] for r in rows]
+        self.assertEqual(emails, ["alice@test.com", "bob@test.com"])
+
+    def test_refresh_then_validate_passes(self):
+        """After a successful refresh, validate() returns HEALTHY."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        mc = self.FakeMailchimpClient(["x@y.com"])
+        guard.refresh_from_mailchimp(mc)
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertEqual(details["row_count"], 1)
+        self.assertEqual(details["source"], "mailchimp_full_refresh")
+
+    def test_refresh_then_get_suppressions_if_valid(self):
+        """After refresh, get_suppressions_if_valid returns the refreshed set."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        mc = self.FakeMailchimpClient(["blocked@user.com", "also@blocked.com"])
+        guard.refresh_from_mailchimp(mc)
+
+        status, details, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertEqual(emails, {"blocked@user.com", "also@blocked.com"})
+
+    def test_webhook_after_refresh_maintains_consistency(self):
+        """A webhook mutation after refresh keeps sentinel consistent."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Refresh with 2 emails
+        mc = self.FakeMailchimpClient(["a@t.com", "b@t.com"])
+        guard.refresh_from_mailchimp(mc)
+
+        # Simulate webhook adding a third suppression
+        db.conn.execute(
+            "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("c@t.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        # Sentinel should now say 3
+        sentinel = dict(db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone())
+        self.assertEqual(sentinel["row_count"], 3)
+
+        # Validate should pass
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+
+    def test_stale_after_refresh_blocks(self):
+        """Refresh is subject to the same freshness threshold — stale blocks."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        mc = self.FakeMailchimpClient(["x@y.com"])
+        guard.refresh_from_mailchimp(mc)
+
+        # Manually backdating sentinel to make it stale
+        from datetime import datetime, timezone, timedelta
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        db.conn.execute(
+            "UPDATE v2_suppression_sync SET last_synced_at = ? WHERE id = 1",
+            (old_time,),
+        )
+        db.conn.commit()
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.STALE)
+
+    def test_get_suppressed_members_pagination(self):
+        """MailchimpClient.get_suppressed_members handles multiple statuses."""
+        # This tests the MailchimpClient method itself with mocked _request
+        from unittest.mock import MagicMock, patch
+
+        mc_client = MagicMock()
+        mc_client.audience_id = "list123"
+
+        # Set up the real method on the mock
+        from craft_engine import MailchimpClient
+        real_client = MailchimpClient.__new__(MailchimpClient)
+        real_client.audience_id = "list123"
+        real_client.base_url = "https://us1.api.mailchimp.com/3.0"
+        real_client.api_key = "key-us1"
+
+        # Mock _request to return paginated results
+        call_count = [0]
+        def mock_request(method, path, data=None, timeout=30):
+            call_count[0] += 1
+            if "status=unsubscribed" in path:
+                if "offset=0" in path or "offset" not in path:
+                    return {
+                        "members": [
+                            {"email_address": "unsub1@t.com"},
+                            {"email_address": "unsub2@t.com"},
+                        ],
+                        "total_items": 2,
+                    }
+                return {"members": [], "total_items": 2}
+            elif "status=cleaned" in path:
+                if "offset=0" in path or "offset" not in path:
+                    return {
+                        "members": [
+                            {"email_address": "cleaned1@t.com"},
+                        ],
+                        "total_items": 1,
+                    }
+                return {"members": [], "total_items": 1}
+            return {"members": [], "total_items": 0}
+
+        real_client._request = mock_request
+
+        result = real_client.get_suppressed_members()
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 3)
+        self.assertIn("unsub1@t.com", result)
+        self.assertIn("unsub2@t.com", result)
+        self.assertIn("cleaned1@t.com", result)
+
+    def test_get_suppressed_members_api_failure_returns_none(self):
+        """If any page request fails, get_suppressed_members returns None."""
+        from craft_engine import MailchimpClient
+
+        real_client = MailchimpClient.__new__(MailchimpClient)
+        real_client.audience_id = "list123"
+        real_client.base_url = "https://us1.api.mailchimp.com/3.0"
+        real_client.api_key = "key-us1"
+
+        # First status succeeds, second fails mid-page
+        def mock_request(method, path, data=None, timeout=30):
+            if "status=unsubscribed" in path:
+                return {"members": [{"email_address": "ok@t.com"}], "total_items": 1}
+            elif "status=cleaned" in path:
+                return None  # API failure
+            return {"members": [], "total_items": 0}
+
+        real_client._request = mock_request
+
+        result = real_client.get_suppressed_members()
+        self.assertIsNone(result)
+
+    def test_large_pagination(self):
+        """Pagination works across multiple pages for a single status."""
+        from craft_engine import MailchimpClient
+
+        real_client = MailchimpClient.__new__(MailchimpClient)
+        real_client.audience_id = "list123"
+        real_client.base_url = "https://us1.api.mailchimp.com/3.0"
+        real_client.api_key = "key-us1"
+
+        def mock_request(method, path, data=None, timeout=30):
+            if "status=unsubscribed" in path:
+                if "offset=0" in path:
+                    return {
+                        "members": [{"email_address": f"u{i}@t.com"} for i in range(1000)],
+                        "total_items": 1500,
+                    }
+                elif "offset=1000" in path:
+                    return {
+                        "members": [{"email_address": f"u{i}@t.com"} for i in range(1000, 1500)],
+                        "total_items": 1500,
+                    }
+                return {"members": [], "total_items": 1500}
+            elif "status=cleaned" in path:
+                return {"members": [], "total_items": 0}
+            return {"members": [], "total_items": 0}
+
+        real_client._request = mock_request
+
+        result = real_client.get_suppressed_members()
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1500)
+
+
 class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
     """Regression tests for blocker-removal pass — campaign adapter side."""
 

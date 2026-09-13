@@ -440,6 +440,56 @@ def _build_app():
         })
 
     # ─────────────────────────────────────────────────────────────────────
+    # Suppression refresh (authoritative Mailchimp sync)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.post("/api/v2/suppressions/refresh")
+    @require_command_auth
+    def refresh_suppressions():
+        """Trigger an authoritative suppression refresh from Mailchimp.
+
+        Queries Mailchimp for all unsubscribed + cleaned contacts,
+        replaces local suppressions table atomically, updates sentinel.
+
+        Returns count and timestamp — never returns email addresses.
+        Requires MAILCHIMP_API_KEY and MAILCHIMP_AUDIENCE_ID in env.
+        """
+        from suppression_guard import SuppressionGuard
+
+        mc_key = os.environ.get("MAILCHIMP_API_KEY")
+        mc_audience = os.environ.get("MAILCHIMP_AUDIENCE_ID")
+        if not mc_key or not mc_audience:
+            return jsonify({
+                "error": "mailchimp_not_configured",
+                "message": "MAILCHIMP_API_KEY and MAILCHIMP_AUDIENCE_ID must be set.",
+            }), 503
+
+        try:
+            from craft_engine import MailchimpClient
+            mc_client = MailchimpClient(mc_key, mc_audience)
+        except Exception as e:
+            return jsonify({
+                "error": "mailchimp_client_init_failed",
+                "message": str(e),
+            }), 500
+
+        guard = SuppressionGuard(db)
+        result = guard.refresh_from_mailchimp(mc_client)
+
+        if "error" in result:
+            return jsonify({
+                "error": "refresh_failed",
+                "message": result["error"],
+            }), 500
+
+        return jsonify({
+            "status": "refreshed",
+            "row_count": result["row_count"],
+            "source": result["source"],
+            "last_synced_at": result["last_synced_at"],
+        })
+
+    # ─────────────────────────────────────────────────────────────────────
     # Health
     # ─────────────────────────────────────────────────────────────────────
 

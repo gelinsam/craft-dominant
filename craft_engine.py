@@ -457,6 +457,66 @@ class MailchimpClient:
                     return seg['id']
         return None
 
+    # ── Suppression queries ───────────────────────────────
+
+    def get_suppressed_members(self) -> Optional[List[str]]:
+        """Fetch all suppressed members (unsubscribed + cleaned) from Mailchimp.
+
+        Paginates through the full audience for each non-sendable status.
+        Returns a list of lowercased email addresses, or None on any error.
+
+        None return means "we could not get the authoritative set" — callers
+        must treat this as a failure and NOT update local state.
+        """
+        suppressed: List[str] = []
+
+        for status in ("unsubscribed", "cleaned"):
+            page_emails = self._get_members_by_status(status)
+            if page_emails is None:
+                # Any pagination failure ⇒ abort entirely
+                log.error(f"Failed to fetch {status} members — aborting suppression refresh")
+                return None
+            suppressed.extend(page_emails)
+
+        return suppressed
+
+    def _get_members_by_status(self, status: str, page_size: int = 1000) -> Optional[List[str]]:
+        """Paginate through all audience members with a given status.
+
+        Returns list of lowercased emails, or None on any request failure.
+        """
+        emails: List[str] = []
+        offset = 0
+
+        while True:
+            resp = self._request(
+                'GET',
+                f'/lists/{self.audience_id}/members'
+                f'?status={status}&count={page_size}&offset={offset}',
+                timeout=60,
+            )
+            if resp is None:
+                log.error(f"Mailchimp members request failed: status={status}, offset={offset}")
+                return None
+
+            members = resp.get('members', [])
+            for m in members:
+                addr = m.get('email_address', '').lower().strip()
+                if addr:
+                    emails.append(addr)
+
+            total_items = resp.get('total_items', 0)
+            offset += len(members)
+
+            # Done when we've fetched all or got an empty page
+            if not members or offset >= total_items:
+                break
+
+            # Brief pause between pages to respect rate limits
+            time.sleep(0.2)
+
+        return emails
+
 
 # =============================================================================
 # THE SYSTEM PROMPT — Craft Hospitality's marketing DNA
