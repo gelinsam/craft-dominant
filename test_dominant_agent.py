@@ -22,6 +22,24 @@ class FakeDecisionEngine:
     def analyze_event(self, event_id):
         return self.values.get(event_id)
 
+    def analyze_portfolio(self):
+        """Simulate grouped portfolio: return all non-None pacing objects.
+
+        Sets event_id and constituent_event_ids on each pacing object
+        when not already present, mirroring what the real
+        analyze_portfolio() returns (EventPacing objects with those
+        fields populated).
+        """
+        result = []
+        for event_id, pacing in self.values.items():
+            if pacing is not None:
+                if not getattr(pacing, "event_id", ""):
+                    pacing.event_id = event_id
+                if not getattr(pacing, "constituent_event_ids", None):
+                    pacing.constituent_event_ids = [event_id]
+                result.append(pacing)
+        return result
+
 
 class FakeDB:
     def __init__(self):
@@ -41,15 +59,24 @@ class FakeDB:
 
 
 class FakePacingFull:
-    """Extended pacing stub that includes comparison_events for history checks."""
+    """Extended pacing stub that includes comparison_events for history checks.
+
+    Also carries event_id, event_name, and constituent_event_ids so that
+    analyze_portfolio() (which returns grouped EventPacing objects) can
+    be simulated in tests.
+    """
     def __init__(self, pace_vs_historical, tickets_sold, historical_median_at_point,
-                 days_until=30, urgency=5, comparison_events=None):
+                 days_until=30, urgency=5, comparison_events=None,
+                 event_id="", event_name="", constituent_event_ids=None):
         self.pace_vs_historical = pace_vs_historical
         self.tickets_sold = tickets_sold
         self.historical_median_at_point = historical_median_at_point
         self.days_until = days_until
         self.urgency = urgency
         self.comparison_events = comparison_events or []
+        self.event_id = event_id
+        self.event_name = event_name
+        self.constituent_event_ids = constituent_event_ids
 
 
 class Tests(unittest.TestCase):
@@ -488,6 +515,170 @@ class TestZeroOpportunityDiagnosis(unittest.TestCase):
             historical_median_at_point=1000,
         )
         self.assertFalse(OpportunityEngine._has_history(pacing))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Timed-entry grouping regression tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestTimedEntryGrouping(unittest.TestCase):
+    """Regression: V2 must consume the grouped portfolio from
+    analyze_portfolio() — the same path the existing dashboard uses —
+    rather than evaluating individual timed-entry slot IDs.
+
+    The dashboard groups multiple time-slot event IDs (e.g. six "DC
+    Coffee Festival" slots: 3 times × 2 days) into logical day-events
+    with aggregated tickets, capacity, and properly matched historical
+    comparisons.  Without grouping, individual slot IDs have no
+    cross-year match and report no history.
+    """
+
+    def setUp(self):
+        self.db = FakeDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        # Simulate three timed-entry slot IDs for one festival
+        for i, time in enumerate(["09:00", "10:00", "13:30"]):
+            eid = f"slot_{i}"
+            self.db.conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (eid, "DC Coffee Festival", "coffee", "Washington",
+                 f"{event_date}T{time}:00", 2000),
+            )
+            self.db.conn.executemany(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                [(f"o_{i}_a", eid, f"a{i}@example.com", 5, 250.0),
+                 (f"o_{i}_b", eid, f"b{i}@example.com", 3, 150.0)],
+            )
+        self.db.conn.commit()
+
+    def test_evaluate_all_uses_grouped_portfolio(self):
+        """evaluate_all() must use analyze_portfolio(), not raw slot IDs."""
+        # The grouped pacing (as dashboard would produce) has real history.
+        grouped_pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=750,
+            historical_median_at_point=1000,
+            comparison_events=["DC Coffee Festival 2025", "DC Coffee Festival 2024"],
+            event_id="grouped_dc_coffee_sat",
+            event_name="DC Coffee Festival - Saturday",
+            constituent_event_ids=["slot_0", "slot_1", "slot_2"],
+        )
+        # The decision engine's analyze_portfolio returns the grouped result.
+        de = FakeDecisionEngine({})
+        de.analyze_portfolio = lambda: [grouped_pacing]
+
+        engine = OpportunityEngine(self.db, de)
+        items = engine.evaluate_all()
+        self.assertEqual(len(items), 1)
+        self.assertIn("25% behind", items[0]["rationale"])
+
+    def test_grouped_ticket_price_sums_across_constituents(self):
+        """_avg_ticket_price_for_ids must aggregate across all slot IDs."""
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        # Total orders: slot_0(8 tickets, $400) + slot_1(8, $400) + slot_2(8, $400)
+        # = 24 tickets, $1200  →  avg = $50
+        price = engine._avg_ticket_price_for_ids(["slot_0", "slot_1", "slot_2"])
+        self.assertEqual(price, 50.0)
+
+    def test_grouped_opportunity_uses_correct_event_name(self):
+        """Opportunity from grouped pacing must carry the grouped name."""
+        grouped_pacing = FakePacingFull(
+            pace_vs_historical=-30.0, tickets_sold=700,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_id",
+            event_name="DC Coffee Festival - Saturday",
+            constituent_event_ids=["slot_0", "slot_1", "slot_2"],
+        )
+        de = FakeDecisionEngine({})
+        de.analyze_portfolio = lambda: [grouped_pacing]
+
+        engine = OpportunityEngine(self.db, de)
+        items = engine.evaluate_all()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["event_name"], "DC Coffee Festival - Saturday")
+
+    def test_command_summary_reports_grouped_events(self):
+        """command_summary() must report grouped events, not raw slot count."""
+        grouped = FakePacingFull(
+            pace_vs_historical=-20.0, tickets_sold=800,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition 2025"],
+            event_id="grouped_id",
+            event_name="DC Coffee Festival - Saturday",
+            constituent_event_ids=["slot_0", "slot_1", "slot_2"],
+        )
+        de = FakeDecisionEngine({})
+        de.analyze_portfolio = lambda: [grouped]
+
+        engine = OpportunityEngine(self.db, de)
+        summary = engine.command_summary()
+        dq = summary["data_quality"]
+        # Should report 1 grouped event, not 3 raw slots
+        self.assertEqual(dq["events_evaluated"], 1)
+        self.assertEqual(dq["events_with_history"], 1)
+        self.assertEqual(dq["events_without_history"], 0)
+        self.assertEqual(summary["opportunity_count"], 1)
+
+    def test_ungrouped_event_still_works(self):
+        """Non-timed-entry events (single slot) must still evaluate correctly."""
+        single_pacing = FakePacingFull(
+            pace_vs_historical=-15.0, tickets_sold=850,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="slot_0",
+            event_name="DC Coffee Festival",
+            constituent_event_ids=None,  # no constituent IDs → use event_id
+        )
+        de = FakeDecisionEngine({})
+        de.analyze_portfolio = lambda: [single_pacing]
+
+        engine = OpportunityEngine(self.db, de)
+        items = engine.evaluate_all()
+        self.assertEqual(len(items), 1)
+
+    def test_classify_pacing_with_grouped_event(self):
+        """_classify_pacing must work with grouped EventPacing objects."""
+        grouped = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=750,
+            historical_median_at_point=1000,
+            comparison_events=["Past 2025", "Past 2024"],
+            event_id="grouped_id",
+            event_name="DC Coffee Festival - Saturday",
+            constituent_event_ids=["slot_0", "slot_1", "slot_2"],
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        cls = engine._classify_pacing(grouped)
+        self.assertEqual(cls["classification"], "opportunity")
+
+    def test_classify_pacing_no_history(self):
+        """Grouped event with no history must be classified correctly."""
+        grouped = FakePacingFull(
+            pace_vs_historical=0, tickets_sold=500,
+            historical_median_at_point=0,
+            comparison_events=[],
+            event_id="grouped_id",
+            event_name="New Festival",
+            constituent_event_ids=["slot_0", "slot_1"],
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        cls = engine._classify_pacing(grouped)
+        self.assertEqual(cls["classification"], "no_history")
+
+    def test_evaluate_pacing_directly(self):
+        """evaluate_pacing must produce opportunities from pre-computed pacing."""
+        pacing = FakePacingFull(
+            pace_vs_historical=-29, tickets_sold=700,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_id",
+            event_name="Test Festival",
+            constituent_event_ids=["slot_0", "slot_1", "slot_2"],
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        items = engine.evaluate_pacing(pacing)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].event_name, "Test Festival")
+        self.assertEqual(items[0].event_id, "grouped_id")
 
 
 if __name__ == "__main__":

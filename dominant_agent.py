@@ -89,6 +89,27 @@ class OpportunityEngine:
         revenue = self._num(row["revenue"])
         return revenue / tickets if tickets > 0 else 0.0
 
+    def _avg_ticket_price_for_ids(self, event_ids: List[str]) -> float:
+        """Average ticket price across multiple event IDs.
+
+        Used for grouped timed-entry events whose constituent slot IDs
+        are real DB rows, while the grouped event_id is synthetic.
+        """
+        if not event_ids:
+            return 0.0
+        placeholders = ",".join("?" * len(event_ids))
+        row = self.db.conn.execute(
+            f"SELECT COALESCE(SUM(gross_amount),0) revenue, "
+            f"COALESCE(SUM(ticket_count),0) tickets "
+            f"FROM orders WHERE event_id IN ({placeholders})",
+            event_ids,
+        ).fetchone()
+        if not row:
+            return 0.0
+        tickets = self._num(row["tickets"])
+        revenue = self._num(row["revenue"])
+        return revenue / tickets if tickets > 0 else 0.0
+
     @staticmethod
     def _has_history(pacing) -> bool:
         """True only when pacing has real historical comparison data."""
@@ -159,6 +180,124 @@ class OpportunityEngine:
         return {"classification": "opportunity",
                 "detail": (f"{pace_delta:.1f}% behind, "
                            f"${revenue_at_risk:,.0f} at risk")}
+
+    def _classify_pacing(self, pacing) -> Dict[str, Any]:
+        """Classify a pre-computed EventPacing object (possibly grouped).
+
+        Same semantics as _classify_event but operates on an already-
+        resolved pacing result from analyze_portfolio(), so it never
+        calls analyze_event() itself.
+        """
+        event_ids = getattr(pacing, "constituent_event_ids", []) or []
+        if not event_ids:
+            event_ids = [pacing.event_id]
+
+        avg_price = self._avg_ticket_price_for_ids(event_ids)
+        if avg_price <= 0:
+            return {"classification": "no_ticket_price",
+                    "detail": "Average ticket price is zero or negative"}
+
+        comparisons = getattr(pacing, "comparison_events", []) or []
+        median = self._num(getattr(pacing, "historical_median_at_point", 0))
+        has_hist = self._has_history(pacing)
+
+        if not has_hist:
+            return {"classification": "no_history",
+                    "detail": (f"{len(comparisons)} past edition(s) found, "
+                               f"historical median at point = {median}")}
+
+        pace_delta = self._num(getattr(pacing, "pace_vs_historical", 0.0))
+        if pace_delta >= -3.0:
+            return {"classification": "on_pace",
+                    "detail": (f"Pacing {pace_delta:+.1f}% vs historical "
+                               f"median ({len(comparisons)} comparison(s))")}
+
+        sold = self._num(getattr(pacing, "tickets_sold", 0))
+        days_until = max(0, int(self._num(getattr(pacing, "days_until", 0))))
+        gap_tickets = max(0, int(median - sold))
+        revenue_at_risk = gap_tickets * avg_price
+        expected_revenue = revenue_at_risk * self._recoverable_share(days_until)
+
+        if expected_revenue < self.MIN_MODELED_VALUE:
+            return {"classification": "below_materiality",
+                    "detail": (f"Expected recovery ${expected_revenue:,.0f} "
+                               f"below ${self.MIN_MODELED_VALUE:,.0f} threshold")}
+
+        return {"classification": "opportunity",
+                "detail": (f"{pace_delta:.1f}% behind, "
+                           f"${revenue_at_risk:,.0f} at risk")}
+
+    def evaluate_pacing(self, pacing) -> List[Opportunity]:
+        """Evaluate a pre-computed EventPacing object for opportunities.
+
+        This is the grouped-event counterpart of evaluate_event().  It
+        receives an already-resolved pacing result (from analyze_portfolio)
+        so that timed-entry grouping and historical matching are done
+        exactly once, the same way the existing dashboard does it.
+        """
+        event_ids = getattr(pacing, "constituent_event_ids", []) or []
+        if not event_ids:
+            event_ids = [pacing.event_id]
+
+        avg_price = self._avg_ticket_price_for_ids(event_ids)
+        if avg_price <= 0:
+            return []
+
+        if not self._has_history(pacing):
+            return []
+
+        pace_delta = self._num(getattr(pacing, "pace_vs_historical", 0.0))
+        if pace_delta >= -3.0:
+            return []
+
+        sold = self._num(getattr(pacing, "tickets_sold", 0))
+        median = self._num(getattr(pacing, "historical_median_at_point", 0))
+        days_until = max(0, int(self._num(getattr(pacing, "days_until", 0))))
+        gap_tickets = max(0, int(median - sold))
+        revenue_at_risk = gap_tickets * avg_price
+        recoverable_share = self._recoverable_share(days_until)
+        expected_revenue = revenue_at_risk * recoverable_share
+
+        if expected_revenue < self.MIN_MODELED_VALUE:
+            return []
+
+        confidence = min(0.80, 0.50 + min(abs(pace_delta) / 100.0, 0.25))
+        urgency = max(1, min(10, int(getattr(pacing, "urgency", 5) or 5)))
+
+        event_id = pacing.event_id
+        event_name = getattr(pacing, "event_name", "")
+
+        evidence = {
+            "pace_delta_pct": round(pace_delta, 1),
+            "tickets_sold": int(sold),
+            "historical_median_at_point": round(median, 1),
+            "gap_tickets": gap_tickets,
+            "avg_ticket_price": round(avg_price, 2),
+            "days_until": days_until,
+            "recoverable_share_assumption": recoverable_share,
+        }
+
+        opportunity = Opportunity(
+            opportunity_id=self._opportunity_id(event_id, "pace_recovery", evidence),
+            event_id=event_id,
+            event_name=event_name,
+            opportunity_type="pace_recovery",
+            title="Recover pacing gap",
+            rationale=(
+                f"Event is {abs(pace_delta):.0f}% behind historical median pace, "
+                f"putting approximately ${revenue_at_risk:,.0f} of comparable-period revenue at risk."
+            ),
+            recommended_action="Investigate the cause and prepare a recovery plan for approval.",
+            revenue_at_risk=round(revenue_at_risk, 2),
+            expected_revenue=round(expected_revenue, 2),
+            expected_cost=0.0,
+            expected_net_value=round(expected_revenue, 2),
+            confidence=round(confidence, 2),
+            urgency=urgency,
+            evidence=evidence,
+            requires_approval=True,
+        )
+        return [opportunity]
 
     def evaluate_event(self, event_id: str) -> List[Opportunity]:
         event_row = self.db.get_event(event_id)
@@ -235,31 +374,49 @@ class OpportunityEngine:
         return [opportunity]
 
     def evaluate_all(self) -> List[Dict[str, Any]]:
+        """Evaluate all upcoming events using the same grouped portfolio
+        that the existing dashboard uses.
+
+        The dashboard's analyze_portfolio() groups timed-entry slots
+        (e.g. six "DC Coffee Festival" slot IDs) into logical day-events
+        with properly aggregated tickets, revenue, and historical pacing.
+        V2 now consumes that same grouped result so that historical
+        comparison operates on the correct aggregation level.
+        """
+        portfolio = self.decision_engine.analyze_portfolio()
         items = []
-        for event in self.db.get_events(upcoming_only=True):
-            items.extend(self.evaluate_event(event["event_id"]))
+        for pacing in portfolio:
+            items.extend(self.evaluate_pacing(pacing))
         items.sort(key=lambda item: item.expected_net_value * item.confidence, reverse=True)
         return [item.to_dict() for item in items]
 
     def command_summary(self) -> Dict[str, Any]:
-        events = self.db.get_events(upcoming_only=True)
-        items = self.evaluate_all()
+        portfolio = self.decision_engine.analyze_portfolio()
 
-        # --- Data quality diagnostics ---
+        items_raw = []
+        for pacing in portfolio:
+            items_raw.extend(self.evaluate_pacing(pacing))
+        items_raw.sort(
+            key=lambda item: item.expected_net_value * item.confidence,
+            reverse=True,
+        )
+        items = [item.to_dict() for item in items_raw]
+
+        # --- Data quality diagnostics (over grouped portfolio) ---
         classifications = {}
         event_details = []
-        for event in events:
-            cls = self._classify_event(event["event_id"])
+        for pacing in portfolio:
+            cls = self._classify_pacing(pacing)
             tag = cls["classification"]
             classifications[tag] = classifications.get(tag, 0) + 1
             event_details.append({
-                "event_id": event["event_id"],
-                "event_name": event.get("name", ""),
+                "event_id": pacing.event_id,
+                "event_name": getattr(pacing, "event_name", ""),
                 "classification": tag,
                 "detail": cls["detail"],
             })
 
-        total = len(events)
+        total = len(portfolio)
         no_history = classifications.get("no_history", 0)
         no_price = classifications.get("no_ticket_price", 0)
         errors = classifications.get("analysis_error", 0)
