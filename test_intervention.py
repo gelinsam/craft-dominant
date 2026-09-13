@@ -37,8 +37,10 @@ def _seed_valid_suppression_sentinel(db, row_count=1, source="test"):
     now = datetime.now(timezone.utc).isoformat()
     db.conn.execute(
         """INSERT OR REPLACE INTO v2_suppression_sync
-           (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
-        (now, row_count, source),
+           (id, last_synced_at, row_count, source,
+            last_full_refresh_at, last_full_refresh_source)
+           VALUES (1, ?, ?, ?, ?, ?)""",
+        (now, row_count, source, now, source),
     )
     db.conn.commit()
 
@@ -1524,16 +1526,31 @@ class TestSuppressionGuard(unittest.TestCase):
         db.conn = conn
         return db
 
-    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0):
-        """Seed a sentinel with configurable age."""
+    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0,
+                        set_full_refresh=True):
+        """Seed a sentinel with configurable age.
+
+        set_full_refresh: if True (default), also sets last_full_refresh_at to
+        the same timestamp. Set False to test "webhook-only, no full refresh"
+        scenarios where freshness gate should block.
+        """
         from datetime import datetime, timezone, timedelta as td
         db.conn.executescript(SENTINEL_TABLE_SCHEMA)
         synced_at = (datetime.now(timezone.utc) - td(hours=age_hours)).isoformat()
-        db.conn.execute(
-            """INSERT OR REPLACE INTO v2_suppression_sync
-               (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
-            (synced_at, row_count, source),
-        )
+        if set_full_refresh:
+            db.conn.execute(
+                """INSERT OR REPLACE INTO v2_suppression_sync
+                   (id, last_synced_at, row_count, source,
+                    last_full_refresh_at, last_full_refresh_source)
+                   VALUES (1, ?, ?, ?, ?, ?)""",
+                (synced_at, row_count, source, synced_at, source),
+            )
+        else:
+            db.conn.execute(
+                """INSERT OR REPLACE INTO v2_suppression_sync
+                   (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
+                (synced_at, row_count, source),
+            )
         db.conn.commit()
 
     def _acknowledge_empty(self, db, actor="admin", reason="legit empty", age_hours=0):
@@ -2285,15 +2302,25 @@ class TestAuthoritativeRefresh(unittest.TestCase):
         db.conn = conn
         return db
 
-    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0):
+    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0,
+                        set_full_refresh=True):
         from datetime import datetime, timezone, timedelta as td
         db.conn.executescript(SENTINEL_TABLE_SCHEMA)
         synced_at = (datetime.now(timezone.utc) - td(hours=age_hours)).isoformat()
-        db.conn.execute(
-            """INSERT OR REPLACE INTO v2_suppression_sync
-               (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
-            (synced_at, row_count, source),
-        )
+        if set_full_refresh:
+            db.conn.execute(
+                """INSERT OR REPLACE INTO v2_suppression_sync
+                   (id, last_synced_at, row_count, source,
+                    last_full_refresh_at, last_full_refresh_source)
+                   VALUES (1, ?, ?, ?, ?, ?)""",
+                (synced_at, row_count, source, synced_at, source),
+            )
+        else:
+            db.conn.execute(
+                """INSERT OR REPLACE INTO v2_suppression_sync
+                   (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
+                (synced_at, row_count, source),
+            )
         db.conn.commit()
 
     class FakeMailchimpClient:
@@ -2549,11 +2576,12 @@ class TestAuthoritativeRefresh(unittest.TestCase):
         mc = self.FakeMailchimpClient(["x@y.com"])
         guard.refresh_from_mailchimp(mc)
 
-        # Manually backdating sentinel to make it stale
+        # Manually backdating last_full_refresh_at to make it stale
+        # (freshness is now evaluated against last_full_refresh_at, not last_synced_at)
         from datetime import datetime, timezone, timedelta
         old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
         db.conn.execute(
-            "UPDATE v2_suppression_sync SET last_synced_at = ? WHERE id = 1",
+            "UPDATE v2_suppression_sync SET last_full_refresh_at = ? WHERE id = 1",
             (old_time,),
         )
         db.conn.commit()
@@ -2730,6 +2758,595 @@ class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             adapter.prepare_draft(intervention, {"avg_ticket_price": 50.0, "crm_champions": 5})
         self.assertIn("suppression", str(ctx.exception).lower())
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Endpoint security tests for POST /api/v2/suppressions/refresh
+# ─────────────────────────────────────────────────────────────────────
+
+class TestRefreshEndpointSecurity(unittest.TestCase):
+    """Security tests for the suppression refresh endpoint.
+
+    Verifies: auth rejection, no secret leakage in error responses,
+    no email addresses in success responses, proper status codes.
+    Uses real Flask test client with real require_command_auth decorator.
+    """
+
+    def setUp(self):
+        """Create a Flask test client with auth configured."""
+        os.environ["COMMAND_API_KEY"] = "test-secret-key-12345"
+        os.environ["DB_PATH"] = ":memory:"
+        # Don't configure Mailchimp by default — some tests check that path
+        os.environ.pop("MAILCHIMP_API_KEY", None)
+        os.environ.pop("MAILCHIMP_AUDIENCE_ID", None)
+
+        from craft_v2 import _build_app
+        self.app = _build_app()
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        os.environ.pop("COMMAND_API_KEY", None)
+        os.environ.pop("DB_PATH", None)
+        os.environ.pop("MAILCHIMP_API_KEY", None)
+        os.environ.pop("MAILCHIMP_AUDIENCE_ID", None)
+
+    def test_no_auth_header_returns_401(self):
+        """Request without Authorization header is rejected."""
+        resp = self.client.post("/api/v2/suppressions/refresh")
+        self.assertEqual(resp.status_code, 401)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "unauthorized")
+        # Must NOT leak the expected key
+        self.assertNotIn("test-secret-key", json.dumps(data))
+
+    def test_wrong_bearer_token_returns_401(self):
+        """Request with wrong Bearer token is rejected."""
+        resp = self.client.post(
+            "/api/v2/suppressions/refresh",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        self.assertEqual(resp.status_code, 401)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "unauthorized")
+        self.assertNotIn("test-secret-key", json.dumps(data))
+
+    def test_no_bearer_prefix_returns_401(self):
+        """Authorization header without 'Bearer ' prefix is rejected."""
+        resp = self.client.post(
+            "/api/v2/suppressions/refresh",
+            headers={"Authorization": "test-secret-key-12345"},
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_unconfigured_command_key_returns_503(self):
+        """If COMMAND_API_KEY is not set, endpoint returns 503."""
+        os.environ.pop("COMMAND_API_KEY", None)
+        from craft_v2 import _build_app
+        app = _build_app()
+        client = app.test_client()
+
+        resp = client.post(
+            "/api/v2/suppressions/refresh",
+            headers={"Authorization": "Bearer anything"},
+        )
+        self.assertEqual(resp.status_code, 503)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "command_api_not_configured")
+
+    def test_mailchimp_not_configured_returns_503(self):
+        """Valid auth but no Mailchimp credentials returns 503."""
+        resp = self.client.post(
+            "/api/v2/suppressions/refresh",
+            headers={"Authorization": "Bearer test-secret-key-12345"},
+        )
+        self.assertEqual(resp.status_code, 503)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "mailchimp_not_configured")
+        # Must NOT leak API key or any secrets
+        resp_text = json.dumps(data)
+        self.assertNotIn("test-secret-key", resp_text)
+        self.assertNotIn("COMMAND_API_KEY", resp_text)
+
+    def test_success_response_contains_no_email_addresses(self):
+        """Successful refresh response must never contain email addresses."""
+        os.environ["MAILCHIMP_API_KEY"] = "fake-key-us1"
+        os.environ["MAILCHIMP_AUDIENCE_ID"] = "list123"
+
+        from craft_v2 import _build_app
+        app = _build_app()
+        client = app.test_client()
+
+        # Monkey-patch the MailchimpClient to return test data
+        import craft_engine
+        original_init = craft_engine.MailchimpClient.__init__
+        original_get = None
+
+        class FakeMC:
+            def __init__(self, *args, **kwargs):
+                pass
+            def get_suppressed_members(self):
+                return ["secret_user@private.com", "another@hidden.org"]
+
+        import unittest.mock
+        with unittest.mock.patch("craft_engine.MailchimpClient", FakeMC):
+            # Re-build app with patched client
+            app2 = _build_app()
+            client2 = app2.test_client()
+            resp = client2.post(
+                "/api/v2/suppressions/refresh",
+                headers={"Authorization": "Bearer test-secret-key-12345"},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        resp_text = json.dumps(data)
+
+        # Response must contain count, not email addresses
+        self.assertEqual(data["row_count"], 2)
+        self.assertNotIn("secret_user", resp_text)
+        self.assertNotIn("private.com", resp_text)
+        self.assertNotIn("another@", resp_text)
+        self.assertNotIn("hidden.org", resp_text)
+
+        # Must include last_full_refresh_at (new dual-timestamp field)
+        self.assertIn("last_full_refresh_at", data)
+
+    def test_error_response_contains_no_secrets(self):
+        """Error responses must not leak MAILCHIMP_API_KEY or COMMAND_API_KEY."""
+        os.environ["MAILCHIMP_API_KEY"] = "mc-secret-key-abc123-us1"
+        os.environ["MAILCHIMP_AUDIENCE_ID"] = "list123"
+
+        import unittest.mock
+
+        class FailMC:
+            def __init__(self, *args, **kwargs):
+                pass
+            def get_suppressed_members(self):
+                return None  # Simulates incomplete data
+
+        with unittest.mock.patch("craft_engine.MailchimpClient", FailMC):
+            from craft_v2 import _build_app
+            app = _build_app()
+            client = app.test_client()
+            resp = client.post(
+                "/api/v2/suppressions/refresh",
+                headers={"Authorization": "Bearer test-secret-key-12345"},
+            )
+
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        resp_text = json.dumps(data)
+        self.assertNotIn("mc-secret-key", resp_text)
+        self.assertNotIn("test-secret-key", resp_text)
+        self.assertNotIn("COMMAND_API_KEY", resp_text)
+        self.assertNotIn("MAILCHIMP_API_KEY", resp_text)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Freshness semantics regression tests (dual-timestamp)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestFreshnessSemantics(unittest.TestCase):
+    """Regression tests for the dual-timestamp freshness model.
+
+    Core invariant: "A mutation is evidence of one event; a full refresh
+    is evidence of completeness. Never let the first masquerade as the
+    second."
+
+    The 24-hour freshness gate must evaluate against last_full_refresh_at
+    only. Webhook mutations must NOT extend the freshness window.
+    """
+
+    def _make_db(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE suppressions (email TEXT PRIMARY KEY)")
+        conn.commit()
+
+        class MinimalDB:
+            pass
+        db = MinimalDB()
+        db.conn = conn
+        return db
+
+    def _make_refresh_db(self):
+        """DB with production-schema suppressions."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("""CREATE TABLE IF NOT EXISTS suppressions (
+            email TEXT PRIMARY KEY,
+            reason TEXT DEFAULT 'unsubscribe',
+            suppressed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.commit()
+
+        class MinimalDB:
+            pass
+        db = MinimalDB()
+        db.conn = conn
+        return db
+
+    # --- Webhook alone must NOT bootstrap authoritative freshness ---
+
+    def test_webhook_only_no_full_refresh_blocks(self):
+        """Webhook mutations without any prior full refresh → NEVER_SYNCED.
+
+        A webhook proves one event was observed; it does not prove the
+        complete suppression set is known. Operations must block.
+        """
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Simulate webhook suppression write
+        db.conn.execute(
+            "INSERT INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("unsub@test.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+        self.assertIn("authoritative full refresh", details["reason"].lower())
+
+    def test_multiple_webhooks_still_no_freshness(self):
+        """Even many webhooks do NOT establish authoritative freshness."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        for i in range(10):
+            db.conn.execute(
+                "INSERT INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+                (f"user{i}@test.com",),
+            )
+            db.conn.commit()
+            guard.record_mutation(source="webhook_unsubscribe")
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+
+    # --- Stale full refresh + recent webhook → still STALE ---
+
+    def test_stale_full_refresh_plus_recent_webhook_is_stale(self):
+        """Full refresh 25h old + webhook just now → STALE.
+
+        The webhook keeps last_mutation_at current, but that must NOT
+        prevent the staleness check from firing on last_full_refresh_at.
+        """
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Do a full refresh
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com"]
+        guard.refresh_from_mailchimp(FakeMC())
+
+        # Backdate the full refresh to 25h ago
+        from datetime import datetime, timezone, timedelta
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        db.conn.execute(
+            "UPDATE v2_suppression_sync SET last_full_refresh_at = ? WHERE id = 1",
+            (old_time,),
+        )
+        db.conn.commit()
+
+        # Process a recent webhook — this updates last_mutation_at to NOW
+        db.conn.execute(
+            "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("new@t.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        # Despite the recent webhook, freshness gate must use last_full_refresh_at
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.STALE)
+        self.assertFalse(guard.is_valid())
+        self.assertIn("last_full_refresh_at", details)
+        self.assertIn("last_mutation_at", details)
+
+    # --- Fresh full refresh + webhook → HEALTHY ---
+
+    def test_fresh_full_refresh_plus_webhook_is_healthy(self):
+        """Full refresh 23h old + webhook → HEALTHY.
+
+        The full refresh is still within the 24h window.
+        """
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com"]
+        guard.refresh_from_mailchimp(FakeMC())
+
+        # Backdate full refresh to 23h ago (still fresh)
+        from datetime import datetime, timezone, timedelta
+        recent_time = (datetime.now(timezone.utc) - timedelta(hours=23)).isoformat()
+        db.conn.execute(
+            "UPDATE v2_suppression_sync SET last_full_refresh_at = ? WHERE id = 1",
+            (recent_time,),
+        )
+        db.conn.commit()
+
+        # Process webhook
+        db.conn.execute(
+            "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("b@t.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertTrue(guard.is_valid())
+
+    # --- record_mutation does NOT touch last_full_refresh_at ---
+
+    def test_record_mutation_preserves_full_refresh_timestamp(self):
+        """record_mutation must NOT update last_full_refresh_at."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        # Do a full refresh first
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com"]
+        guard.refresh_from_mailchimp(FakeMC())
+
+        # Record original full refresh timestamp
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        original_refresh_at = sentinel["last_full_refresh_at"]
+        self.assertIsNotNone(original_refresh_at)
+
+        # Process webhook mutation
+        import time
+        time.sleep(0.01)  # Ensure time advances
+        db.conn.execute(
+            "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("new@t.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        # Verify last_full_refresh_at is UNCHANGED
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        self.assertEqual(sentinel["last_full_refresh_at"], original_refresh_at)
+        # But last_mutation_at IS updated
+        self.assertIsNotNone(sentinel["last_mutation_at"])
+        self.assertEqual(sentinel["last_mutation_source"], "webhook_unsubscribe")
+
+    # --- refresh_from_mailchimp DOES set last_full_refresh_at ---
+
+    def test_refresh_sets_full_refresh_timestamp(self):
+        """refresh_from_mailchimp must set last_full_refresh_at."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com", "b@t.com"]
+
+        result = guard.refresh_from_mailchimp(FakeMC())
+        self.assertTrue(result["refreshed"])
+        self.assertIn("last_full_refresh_at", result)
+
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        self.assertIsNotNone(sentinel["last_full_refresh_at"])
+        self.assertEqual(sentinel["last_full_refresh_source"], "mailchimp_full_refresh")
+
+    # --- validate() diagnostics include both timestamps ---
+
+    def test_validate_diagnostics_include_both_timestamps(self):
+        """validate() details must include last_full_refresh_at and last_mutation_at."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com"]
+        guard.refresh_from_mailchimp(FakeMC())
+
+        db.conn.execute(
+            "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("b@t.com",),
+        )
+        db.conn.commit()
+        guard.record_mutation(source="webhook_unsubscribe")
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertIn("last_full_refresh_at", details)
+        self.assertIn("last_mutation_at", details)
+        self.assertIn("last_synced_at", details)
+
+    # --- Schema migration tests ---
+
+    def test_migration_legacy_full_refresh_sentinel_backfills(self):
+        """Legacy sentinel with source='mailchimp_full_refresh' gets
+        last_full_refresh_at backfilled from last_synced_at during migration.
+        """
+        db = self._make_refresh_db()
+        # Manually create old-schema sentinel (no dual-timestamp columns)
+        db.conn.execute("""CREATE TABLE IF NOT EXISTS v2_suppression_sync (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_synced_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            empty_acknowledged INTEGER NOT NULL DEFAULT 0,
+            acknowledged_by TEXT,
+            acknowledged_at TEXT,
+            acknowledged_reason TEXT
+        )""")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            "INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source) "
+            "VALUES (1, ?, 3, 'mailchimp_full_refresh')",
+            (now,),
+        )
+        db.conn.execute("INSERT INTO suppressions (email) VALUES (?)", ("a@t.com",))
+        db.conn.execute("INSERT INTO suppressions (email) VALUES (?)", ("b@t.com",))
+        db.conn.execute("INSERT INTO suppressions (email) VALUES (?)", ("c@t.com",))
+        db.conn.commit()
+
+        # SuppressionGuard init triggers migration + backfill
+        guard = SuppressionGuard(db)
+
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        # Backfilled from last_synced_at
+        self.assertEqual(sentinel["last_full_refresh_at"], now)
+        self.assertEqual(sentinel["last_full_refresh_source"], "mailchimp_full_refresh")
+
+        # Should validate as HEALTHY
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+
+    def test_migration_legacy_webhook_sentinel_does_not_backfill(self):
+        """Legacy sentinel with webhook source must NOT get
+        last_full_refresh_at backfilled — webhook freshness is not
+        authoritative freshness.
+        """
+        db = self._make_refresh_db()
+        # Create old-schema sentinel with webhook source
+        db.conn.execute("""CREATE TABLE IF NOT EXISTS v2_suppression_sync (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_synced_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            empty_acknowledged INTEGER NOT NULL DEFAULT 0,
+            acknowledged_by TEXT,
+            acknowledged_at TEXT,
+            acknowledged_reason TEXT
+        )""")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            "INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source) "
+            "VALUES (1, ?, 2, 'webhook_unsubscribe')",
+            (now,),
+        )
+        db.conn.execute("INSERT INTO suppressions (email) VALUES (?)", ("x@t.com",))
+        db.conn.execute("INSERT INTO suppressions (email) VALUES (?)", ("y@t.com",))
+        db.conn.commit()
+
+        # SuppressionGuard init triggers migration but NOT backfill
+        guard = SuppressionGuard(db)
+
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        self.assertIsNone(sentinel["last_full_refresh_at"])
+        self.assertIsNone(sentinel["last_full_refresh_source"])
+
+        # Should block — no authoritative refresh
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+
+    def test_migration_legacy_manual_sentinel_does_not_backfill(self):
+        """Legacy sentinel with source='manual' or 'test' must NOT
+        get last_full_refresh_at backfilled.
+        """
+        db = self._make_db()
+        db.conn.execute("""CREATE TABLE IF NOT EXISTS v2_suppression_sync (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_synced_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            empty_acknowledged INTEGER NOT NULL DEFAULT 0,
+            acknowledged_by TEXT,
+            acknowledged_at TEXT,
+            acknowledged_reason TEXT
+        )""")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            "INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source) "
+            "VALUES (1, ?, 1, 'manual')",
+            (now,),
+        )
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@t.com",))
+        db.conn.commit()
+
+        guard = SuppressionGuard(db)
+
+        sentinel = dict(db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone())
+        self.assertIsNone(sentinel["last_full_refresh_at"])
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+
+    def test_migration_no_existing_sentinel_skips_backfill(self):
+        """When no sentinel row exists yet, migration just adds columns."""
+        db = self._make_db()
+        guard = SuppressionGuard(db)
+
+        # No sentinel row → no backfill needed, no error
+        sentinel = db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone()
+        self.assertIsNone(sentinel)
+
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+
+    # --- get_suppressions_if_valid diagnostics ---
+
+    def test_get_suppressions_if_valid_includes_dual_timestamps(self):
+        """get_suppressions_if_valid diagnostics must include both timestamps."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        class FakeMC:
+            def get_suppressed_members(self):
+                return ["a@t.com"]
+        guard.refresh_from_mailchimp(FakeMC())
+
+        status, details, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertIn("last_full_refresh_at", details)
+        self.assertEqual(emails, {"a@t.com"})
+
+    # --- Fail-closed preserved ---
+
+    def test_fail_closed_no_sentinel_still_blocks(self):
+        """The dual-timestamp change must NOT weaken fail-closed: no sentinel → blocked."""
+        db = self._make_db()
+        guard = SuppressionGuard(db)
+        self.assertEqual(guard.validate()[0], SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+
+    def test_record_mutation_return_includes_mutation_timestamp(self):
+        """record_mutation() result includes last_mutation_at for audit."""
+        db = self._make_refresh_db()
+        guard = SuppressionGuard(db)
+
+        db.conn.execute(
+            "INSERT INTO suppressions (email, reason) VALUES (?, 'unsubscribe')",
+            ("a@t.com",),
+        )
+        db.conn.commit()
+        result = guard.record_mutation(source="webhook_unsubscribe")
+
+        self.assertTrue(result["updated"])
+        self.assertIn("last_mutation_at", result)
+        self.assertEqual(result["source"], "webhook_unsubscribe")
 
 
 if __name__ == "__main__":

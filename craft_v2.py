@@ -487,6 +487,7 @@ def _build_app():
             "row_count": result["row_count"],
             "source": result["source"],
             "last_synced_at": result["last_synced_at"],
+            "last_full_refresh_at": result["last_full_refresh_at"],
         })
 
     # ─────────────────────────────────────────────────────────────────────

@@ -38,9 +38,22 @@ CREATE TABLE IF NOT EXISTS v2_suppression_sync (
     empty_acknowledged INTEGER NOT NULL DEFAULT 0,
     acknowledged_by TEXT,
     acknowledged_at TEXT,
-    acknowledged_reason TEXT
+    acknowledged_reason TEXT,
+    last_full_refresh_at TEXT,
+    last_mutation_at TEXT,
+    last_full_refresh_source TEXT,
+    last_mutation_source TEXT
 );
 """
+
+# Columns added in the dual-timestamp freshness split.  _ensure_sentinel_table()
+# uses ALTER TABLE to add any that are missing on existing databases.
+_DUAL_TIMESTAMP_COLUMNS = [
+    ("last_full_refresh_at", "TEXT"),
+    ("last_mutation_at", "TEXT"),
+    ("last_full_refresh_source", "TEXT"),
+    ("last_mutation_source", "TEXT"),
+]
 
 
 class SuppressionStatus(Enum):
@@ -74,12 +87,60 @@ class SuppressionGuard:
         self._ensure_sentinel_table()
 
     def _ensure_sentinel_table(self) -> None:
-        """Create the sentinel table if it doesn't exist."""
+        """Create the sentinel table if it doesn't exist, and migrate schema.
+
+        Handles upgrades from pre-dual-timestamp schema by adding missing
+        columns via ALTER TABLE. If the existing sentinel has source
+        'mailchimp_full_refresh', backfills last_full_refresh_at from
+        last_synced_at. Webhook sources do NOT backfill authoritative
+        freshness — only a true full refresh establishes it.
+        """
         try:
             self.db.conn.executescript(SENTINEL_TABLE_SCHEMA)
             self.db.conn.commit()
         except Exception as e:
             log.error(f"Failed to create suppression sentinel table: {e}")
+            return
+
+        # Migrate: add dual-timestamp columns if absent
+        try:
+            existing = {
+                row[1] for row in
+                self.db.conn.execute("PRAGMA table_info(v2_suppression_sync)").fetchall()
+            }
+            for col_name, col_type in _DUAL_TIMESTAMP_COLUMNS:
+                if col_name not in existing:
+                    self.db.conn.execute(
+                        f"ALTER TABLE v2_suppression_sync ADD COLUMN {col_name} {col_type}"
+                    )
+                    log.info(f"_ensure_sentinel_table: added column {col_name}")
+            self.db.conn.commit()
+        except Exception as e:
+            log.error(f"Failed to migrate sentinel schema: {e}")
+            return
+
+        # Backfill: if legacy sentinel exists with source 'mailchimp_full_refresh',
+        # copy last_synced_at → last_full_refresh_at (only if not yet set)
+        try:
+            row = self.db.conn.execute(
+                "SELECT * FROM v2_suppression_sync WHERE id = 1"
+            ).fetchone()
+            if row is not None:
+                row = dict(row)
+                if (row.get("source") == "mailchimp_full_refresh"
+                        and row.get("last_full_refresh_at") is None
+                        and row.get("last_synced_at")):
+                    self.db.conn.execute(
+                        """UPDATE v2_suppression_sync SET
+                               last_full_refresh_at = last_synced_at,
+                               last_full_refresh_source = 'mailchimp_full_refresh'
+                           WHERE id = 1""",
+                    )
+                    self.db.conn.commit()
+                    log.info("_ensure_sentinel_table: backfilled last_full_refresh_at "
+                             "from legacy mailchimp_full_refresh sentinel")
+        except Exception as e:
+            log.error(f"Failed to backfill dual-timestamp columns: {e}")
 
     def _actual_suppression_count(self) -> int:
         """Read actual row count from the suppressions table.
@@ -124,23 +185,44 @@ class SuppressionGuard:
         empty_acknowledged = bool(row.get("empty_acknowledged", 0))
         acknowledged_at = row.get("acknowledged_at")
         source = row.get("source", "unknown")
+        last_full_refresh_at = row.get("last_full_refresh_at")
+        last_mutation_at = row.get("last_mutation_at")
 
-        # Step 2: Check freshness
+        # Step 2: Check authoritative freshness (last_full_refresh_at only)
+        # A webhook mutation alone must NOT satisfy the freshness requirement.
+        # If last_full_refresh_at is NULL, no authoritative refresh has ever
+        # completed — even if webhooks have been updating last_synced_at.
+        if last_full_refresh_at is None:
+            # Backward compat: if this is a pre-migration sentinel that was
+            # NOT a full refresh, we treat it as never authoritatively synced.
+            # Backfill in _ensure_sentinel_table handles the full-refresh case.
+            return SuppressionStatus.NEVER_SYNCED, {
+                "reason": "No authoritative full refresh has completed. "
+                          "Webhook mutations alone do not establish suppression completeness. "
+                          "Run POST /api/v2/suppressions/refresh to bootstrap.",
+                "last_synced_at": last_synced_at,
+                "last_mutation_at": last_mutation_at,
+            }
+
         try:
-            synced_dt = datetime.fromisoformat(last_synced_at)
+            refresh_dt = datetime.fromisoformat(last_full_refresh_at)
         except (ValueError, TypeError):
             return SuppressionStatus.UNAVAILABLE, {
-                "reason": f"Invalid last_synced_at timestamp: {last_synced_at!r}",
+                "reason": f"Invalid last_full_refresh_at timestamp: {last_full_refresh_at!r}",
+                "last_full_refresh_at": last_full_refresh_at,
                 "last_synced_at": last_synced_at,
             }
 
         max_age = timedelta(hours=_max_age_hours())
-        age = now - synced_dt
+        age = now - refresh_dt
         if age > max_age:
             return SuppressionStatus.STALE, {
-                "reason": f"Suppression data is {age.total_seconds() / 3600:.1f}h old "
-                          f"(threshold: {_max_age_hours()}h).",
+                "reason": f"Authoritative suppression refresh is {age.total_seconds() / 3600:.1f}h old "
+                          f"(threshold: {_max_age_hours()}h). "
+                          "Webhook mutations do not extend this window.",
+                "last_full_refresh_at": last_full_refresh_at,
                 "last_synced_at": last_synced_at,
+                "last_mutation_at": last_mutation_at,
                 "row_count": sentinel_count,
                 "age_hours": round(age.total_seconds() / 3600, 1),
             }
@@ -163,6 +245,8 @@ class SuppressionGuard:
                 "sentinel_row_count": sentinel_count,
                 "actual_row_count": actual_count,
                 "last_synced_at": last_synced_at,
+                "last_full_refresh_at": last_full_refresh_at,
+                "last_mutation_at": last_mutation_at,
                 "source": source,
             }
 
@@ -170,6 +254,8 @@ class SuppressionGuard:
         if sentinel_count > 0:
             return SuppressionStatus.HEALTHY, {
                 "last_synced_at": last_synced_at,
+                "last_full_refresh_at": last_full_refresh_at,
+                "last_mutation_at": last_mutation_at,
                 "row_count": sentinel_count,
                 "source": source,
             }
@@ -180,6 +266,8 @@ class SuppressionGuard:
                 "reason": "Suppression list is empty and has not been explicitly acknowledged. "
                           "This could indicate data loss after a restart.",
                 "last_synced_at": last_synced_at,
+                "last_full_refresh_at": last_full_refresh_at,
+                "last_mutation_at": last_mutation_at,
                 "row_count": 0,
             }
 
@@ -190,6 +278,8 @@ class SuppressionGuard:
             return SuppressionStatus.EMPTY_UNVERIFIED, {
                 "reason": "Empty-set acknowledgment has invalid timestamp.",
                 "last_synced_at": last_synced_at,
+                "last_full_refresh_at": last_full_refresh_at,
+                "last_mutation_at": last_mutation_at,
                 "row_count": 0,
             }
 
@@ -199,6 +289,8 @@ class SuppressionGuard:
                 "reason": f"Empty-set acknowledgment expired ({ack_age.total_seconds() / 3600:.1f}h ago). "
                           "Re-acknowledge if the empty suppression list is still correct.",
                 "last_synced_at": last_synced_at,
+                "last_full_refresh_at": last_full_refresh_at,
+                "last_mutation_at": last_mutation_at,
                 "row_count": 0,
                 "acknowledged_at": acknowledged_at,
                 "acknowledgment_age_hours": round(ack_age.total_seconds() / 3600, 1),
@@ -206,6 +298,8 @@ class SuppressionGuard:
 
         return SuppressionStatus.ACKNOWLEDGED_EMPTY, {
             "last_synced_at": last_synced_at,
+            "last_full_refresh_at": last_full_refresh_at,
+            "last_mutation_at": last_mutation_at,
             "row_count": 0,
             "acknowledged_by": row.get("acknowledged_by"),
             "acknowledged_at": acknowledged_at,
@@ -262,6 +356,11 @@ class SuppressionGuard:
         has been committed. Reads the actual current count from the
         suppressions table and writes it to the sentinel.
 
+        CRITICAL: Updates last_synced_at, last_mutation_at, and
+        last_mutation_source ONLY. Does NOT touch last_full_refresh_at.
+        A webhook mutation is evidence of one event — it must never
+        masquerade as evidence of completeness.
+
         If actual count > 0 and there was a prior empty-acknowledged
         state, clears the acknowledgment (real data invalidates it).
 
@@ -281,10 +380,12 @@ class SuppressionGuard:
         try:
             if actual_count > 0:
                 # Real rows exist — clear any acknowledgment state
+                # Note: last_full_refresh_at is deliberately NOT updated here
                 self.db.conn.execute(
                     """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason)
-                       VALUES (1, ?, ?, ?, 0, NULL, NULL, NULL)
+                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason,
+                           last_mutation_at, last_mutation_source)
+                       VALUES (1, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                            last_synced_at = excluded.last_synced_at,
                            row_count = excluded.row_count,
@@ -292,19 +393,24 @@ class SuppressionGuard:
                            empty_acknowledged = 0,
                            acknowledged_by = NULL,
                            acknowledged_at = NULL,
-                           acknowledged_reason = NULL""",
-                    (now, actual_count, source),
+                           acknowledged_reason = NULL,
+                           last_mutation_at = excluded.last_mutation_at,
+                           last_mutation_source = excluded.last_mutation_source""",
+                    (now, actual_count, source, now, source),
                 )
             else:
                 # Zero rows — preserve acknowledgment state, update count and time
                 self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source)
-                       VALUES (1, ?, 0, ?)
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                           last_mutation_at, last_mutation_source)
+                       VALUES (1, ?, 0, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                            last_synced_at = excluded.last_synced_at,
                            row_count = 0,
-                           source = excluded.source""",
-                    (now, source),
+                           source = excluded.source,
+                           last_mutation_at = excluded.last_mutation_at,
+                           last_mutation_source = excluded.last_mutation_source""",
+                    (now, source, now, source),
                 )
             self.db.conn.commit()
         except Exception as e:
@@ -320,6 +426,7 @@ class SuppressionGuard:
             "row_count": actual_count,
             "source": source,
             "last_synced_at": now,
+            "last_mutation_at": now,
         }
 
     def record_sync(self, row_count: int, source: str = "manual") -> None:
@@ -327,6 +434,9 @@ class SuppressionGuard:
 
         Replaces any existing sentinel. If row_count > 0, clears any
         prior empty-acknowledged state since real data replaced it.
+
+        This is a generic sync — it updates last_synced_at but does NOT
+        set last_full_refresh_at (only refresh_from_mailchimp does that).
         """
         now = datetime.now(timezone.utc).isoformat()
 
@@ -408,11 +518,13 @@ class SuppressionGuard:
                 )
 
             # Update sentinel — clear any acknowledgment if real rows exist
+            # CRITICAL: Set last_full_refresh_at — this IS the authoritative freshness
             if count > 0:
                 self.db.conn.execute(
                     """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason)
-                       VALUES (1, ?, ?, 'mailchimp_full_refresh', 0, NULL, NULL, NULL)
+                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason,
+                           last_full_refresh_at, last_full_refresh_source)
+                       VALUES (1, ?, ?, 'mailchimp_full_refresh', 0, NULL, NULL, NULL, ?, 'mailchimp_full_refresh')
                        ON CONFLICT(id) DO UPDATE SET
                            last_synced_at = excluded.last_synced_at,
                            row_count = excluded.row_count,
@@ -420,19 +532,24 @@ class SuppressionGuard:
                            empty_acknowledged = 0,
                            acknowledged_by = NULL,
                            acknowledged_at = NULL,
-                           acknowledged_reason = NULL""",
-                    (now, count),
+                           acknowledged_reason = NULL,
+                           last_full_refresh_at = excluded.last_full_refresh_at,
+                           last_full_refresh_source = 'mailchimp_full_refresh'""",
+                    (now, count, now),
                 )
             else:
                 # Zero suppressions from Mailchimp — preserve acknowledgment state
                 self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source)
-                       VALUES (1, ?, 0, 'mailchimp_full_refresh')
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                           last_full_refresh_at, last_full_refresh_source)
+                       VALUES (1, ?, 0, 'mailchimp_full_refresh', ?, 'mailchimp_full_refresh')
                        ON CONFLICT(id) DO UPDATE SET
                            last_synced_at = excluded.last_synced_at,
                            row_count = 0,
-                           source = 'mailchimp_full_refresh'""",
-                    (now,),
+                           source = 'mailchimp_full_refresh',
+                           last_full_refresh_at = excluded.last_full_refresh_at,
+                           last_full_refresh_source = 'mailchimp_full_refresh'""",
+                    (now, now),
                 )
 
             self.db.conn.commit()
@@ -451,6 +568,7 @@ class SuppressionGuard:
             "row_count": count,
             "source": "mailchimp_full_refresh",
             "last_synced_at": now,
+            "last_full_refresh_at": now,
         }
 
     def acknowledge_empty(self, actor: str, reason: str) -> Dict[str, Any]:
