@@ -51,6 +51,7 @@ class SuppressionStatus(Enum):
     STALE = "suppression_stale"
     EMPTY_UNVERIFIED = "suppression_empty_unverified"
     UNAVAILABLE = "suppression_unavailable"
+    COUNT_MISMATCH = "suppression_count_mismatch"
 
 
 def _max_age_hours() -> int:
@@ -80,11 +81,24 @@ class SuppressionGuard:
         except Exception as e:
             log.error(f"Failed to create suppression sentinel table: {e}")
 
+    def _actual_suppression_count(self) -> int:
+        """Read actual row count from the suppressions table.
+
+        Raises on query failure so callers can return UNAVAILABLE.
+        """
+        result = self.db.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM suppressions"
+        ).fetchone()
+        return result["cnt"] if result else 0
+
     def validate(self) -> Tuple[SuppressionStatus, Dict[str, Any]]:
         """Check suppression state. Returns (status, details).
 
         Only HEALTHY and ACKNOWLEDGED_EMPTY are safe to proceed.
         Everything else must block.
+
+        Cross-checks the sentinel's row_count against the actual
+        suppression table to detect silent data loss.
         """
         now = datetime.now(timezone.utc)
 
@@ -106,9 +120,10 @@ class SuppressionGuard:
 
         row = dict(row)
         last_synced_at = row.get("last_synced_at")
-        row_count = row.get("row_count", 0)
+        sentinel_count = row.get("row_count", 0)
         empty_acknowledged = bool(row.get("empty_acknowledged", 0))
         acknowledged_at = row.get("acknowledged_at")
+        source = row.get("source", "unknown")
 
         # Step 2: Check freshness
         try:
@@ -126,19 +141,40 @@ class SuppressionGuard:
                 "reason": f"Suppression data is {age.total_seconds() / 3600:.1f}h old "
                           f"(threshold: {_max_age_hours()}h).",
                 "last_synced_at": last_synced_at,
-                "row_count": row_count,
+                "row_count": sentinel_count,
                 "age_hours": round(age.total_seconds() / 3600, 1),
             }
 
-        # Step 3: Check row count
-        if row_count > 0:
-            return SuppressionStatus.HEALTHY, {
+        # Step 3: Verify actual suppression table count matches sentinel
+        try:
+            actual_count = self._actual_suppression_count()
+        except Exception as e:
+            return SuppressionStatus.UNAVAILABLE, {
+                "reason": f"Cannot read suppression table: {e}",
                 "last_synced_at": last_synced_at,
-                "row_count": row_count,
-                "source": row.get("source", "unknown"),
+                "sentinel_row_count": sentinel_count,
             }
 
-        # Step 4: row_count == 0 — check acknowledgment
+        if actual_count != sentinel_count:
+            return SuppressionStatus.COUNT_MISMATCH, {
+                "reason": f"Suppression sentinel says {sentinel_count} rows but "
+                          f"actual table has {actual_count} rows. "
+                          "This indicates data loss or an unsynchronized write.",
+                "sentinel_row_count": sentinel_count,
+                "actual_row_count": actual_count,
+                "last_synced_at": last_synced_at,
+                "source": source,
+            }
+
+        # Step 4: Check row count
+        if sentinel_count > 0:
+            return SuppressionStatus.HEALTHY, {
+                "last_synced_at": last_synced_at,
+                "row_count": sentinel_count,
+                "source": source,
+            }
+
+        # Step 5: sentinel_count == 0 — check acknowledgment
         if not empty_acknowledged:
             return SuppressionStatus.EMPTY_UNVERIFIED, {
                 "reason": "Suppression list is empty and has not been explicitly acknowledged. "
@@ -147,7 +183,7 @@ class SuppressionGuard:
                 "row_count": 0,
             }
 
-        # Step 5: Acknowledgment exists — check expiry (24h from acknowledgment)
+        # Step 6: Acknowledgment exists — check expiry (24h from acknowledgment)
         try:
             ack_dt = datetime.fromisoformat(acknowledged_at)
         except (ValueError, TypeError):
@@ -185,10 +221,17 @@ class SuppressionGuard:
         """Validate suppression state AND return the suppression set if valid.
 
         Returns (status, details, emails). emails is empty if status is not valid.
+
+        Post-fetch verification: after reading emails, verifies that
+        len(emails) matches the sentinel row_count. This catches races
+        where a mutation happens between validate() and the fetch.
         """
         status, details = self.validate()
         if status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             return status, details, set()
+
+        # Read sentinel row_count for post-fetch check
+        sentinel_count = details.get("row_count", 0)
 
         # Suppression state is valid — now read the actual emails
         try:
@@ -199,7 +242,85 @@ class SuppressionGuard:
                 "reason": f"Suppression query failed after valid sentinel: {e}",
             }, set()
 
+        # Post-fetch verification: fetched count must match sentinel
+        if len(emails) != sentinel_count:
+            return SuppressionStatus.COUNT_MISMATCH, {
+                "reason": f"Fetched {len(emails)} suppression emails but sentinel "
+                          f"says {sentinel_count}. Possible race or data corruption.",
+                "sentinel_row_count": sentinel_count,
+                "actual_row_count": len(emails),
+                "last_synced_at": details.get("last_synced_at"),
+                "source": details.get("source", "unknown"),
+            }, set()
+
         return status, details, emails
+
+    def record_mutation(self, source: str = "webhook") -> Dict[str, Any]:
+        """Update the sentinel after a successful suppression table mutation.
+
+        Must be called AFTER the underlying suppression INSERT/DELETE
+        has been committed. Reads the actual current count from the
+        suppressions table and writes it to the sentinel.
+
+        If actual count > 0 and there was a prior empty-acknowledged
+        state, clears the acknowledgment (real data invalidates it).
+
+        Returns details about the update for audit logging.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            actual_count = self._actual_suppression_count()
+        except Exception as e:
+            log.error(f"record_mutation: cannot count suppression rows: {e}")
+            return {
+                "error": f"Cannot count suppression rows: {e}",
+                "source": source,
+            }
+
+        try:
+            if actual_count > 0:
+                # Real rows exist — clear any acknowledgment state
+                self.db.conn.execute(
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason)
+                       VALUES (1, ?, ?, ?, 0, NULL, NULL, NULL)
+                       ON CONFLICT(id) DO UPDATE SET
+                           last_synced_at = excluded.last_synced_at,
+                           row_count = excluded.row_count,
+                           source = excluded.source,
+                           empty_acknowledged = 0,
+                           acknowledged_by = NULL,
+                           acknowledged_at = NULL,
+                           acknowledged_reason = NULL""",
+                    (now, actual_count, source),
+                )
+            else:
+                # Zero rows — preserve acknowledgment state, update count and time
+                self.db.conn.execute(
+                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source)
+                       VALUES (1, ?, 0, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           last_synced_at = excluded.last_synced_at,
+                           row_count = 0,
+                           source = excluded.source""",
+                    (now, source),
+                )
+            self.db.conn.commit()
+        except Exception as e:
+            log.error(f"record_mutation: cannot update sentinel: {e}")
+            return {
+                "error": f"Cannot update sentinel: {e}",
+                "source": source,
+                "actual_count": actual_count,
+            }
+
+        return {
+            "updated": True,
+            "row_count": actual_count,
+            "source": source,
+            "last_synced_at": now,
+        }
 
     def record_sync(self, row_count: int, source: str = "manual") -> None:
         """Record a successful suppression sync.

@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, date
 from typing import Optional, Dict, List, Any, Tuple
 from collections import defaultdict
 from contextlib import contextmanager
+from suppression_guard import SuppressionGuard
 
 log = logging.getLogger('craft.engine')
 
@@ -1142,19 +1143,27 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
     # ─────────────────────────────────────────────────────────
 
     def process_mailchimp_webhook(self, data: Dict) -> Dict:
-        """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity)."""
+        """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity).
+
+        After writing a suppression row, updates the suppression sentinel
+        via SuppressionGuard.record_mutation() so the fail-closed guard
+        stays in sync with actual table state.
+        """
         event_type = data.get('type', '')
         email = ''
+        suppression_written = False
         ts = datetime.now().isoformat()
 
         if event_type == 'unsubscribe':
             email = data.get('data', {}).get('email', '').lower()
             if email:
                 self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
+                suppression_written = True
         elif event_type == 'cleaned':
             email = data.get('data', {}).get('email', '').lower()
             if email:
                 self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
+                suppression_written = True
         elif event_type == 'campaign':
             # Campaign sent notification — we can pull reports
             mc_campaign_id = data.get('data', {}).get('id', '')
@@ -1171,6 +1180,17 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
             """, ('', event_type, email, ts, json.dumps(data)))
 
         self.db.conn.commit()
+
+        # Update suppression sentinel AFTER successful commit
+        if suppression_written:
+            try:
+                guard = SuppressionGuard(self.db)
+                guard.record_mutation(source=f"webhook_{event_type}")
+            except Exception as e:
+                log.error(f"Failed to update suppression sentinel after webhook: {e}")
+                # Do not fail the webhook — the suppression row is already committed.
+                # The sentinel mismatch will be caught on next validate() call.
+
         return {'processed': 1, 'type': event_type}
 
     def sync_campaign_stats(self, campaign_id: str) -> Optional[Dict]:

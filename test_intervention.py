@@ -1925,6 +1925,338 @@ class TestSuppressionGuard(unittest.TestCase):
         finally:
             os.environ.pop("SUPPRESSION_MAX_AGE_HOURS", None)
 
+    # --- Count-mismatch verification (PR #2 blocker fix) ---
+
+    def test_count_mismatch_sentinel_1_actual_0_blocks(self):
+        """Sentinel says 1 row but table is empty → COUNT_MISMATCH → blocked."""
+        db = self._make_db()
+        # Sentinel says 1 row, but no actual suppression rows
+        self._seed_sentinel(db, row_count=1)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertFalse(guard.is_valid())
+        self.assertEqual(details["sentinel_row_count"], 1)
+        self.assertEqual(details["actual_row_count"], 0)
+
+    def test_count_mismatch_sentinel_0_actual_1_blocks(self):
+        """Sentinel says 0 rows but table has 1 → COUNT_MISMATCH → blocked."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("unsub@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=0)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertFalse(guard.is_valid())
+        self.assertEqual(details["sentinel_row_count"], 0)
+        self.assertEqual(details["actual_row_count"], 1)
+
+    def test_count_mismatch_sentinel_5_actual_3_blocks(self):
+        """Sentinel says 5 rows but table has 3 → COUNT_MISMATCH → blocked."""
+        db = self._make_db()
+        for i in range(3):
+            db.conn.execute("INSERT INTO suppressions VALUES (?)", (f"u{i}@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=5)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertFalse(guard.is_valid())
+        self.assertEqual(details["sentinel_row_count"], 5)
+        self.assertEqual(details["actual_row_count"], 3)
+
+    def test_exact_count_match_allowed(self):
+        """Sentinel count matches actual table count → HEALTHY → allowed."""
+        db = self._make_db()
+        for i in range(3):
+            db.conn.execute("INSERT INTO suppressions VALUES (?)", (f"u{i}@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=3)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertTrue(guard.is_valid())
+
+    def test_post_fetch_count_mismatch_in_get_suppressions(self):
+        """get_suppressions_if_valid must re-verify count after fetching emails."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1)
+        guard = SuppressionGuard(db)
+
+        # validate() passes (count matches). Now insert another row
+        # AFTER validate() but before the fetch count check in get_suppressions_if_valid.
+        # We can't truly race in a single-threaded test, but we can test the
+        # post-fetch verification by manually making sentinel and table diverge
+        # after validate() would have passed.
+        #
+        # Instead, test the simpler invariant: if sentinel says 2 but table has 1,
+        # get_suppressions_if_valid returns COUNT_MISMATCH.
+        db2 = self._make_db()
+        db2.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db2.conn.commit()
+        self._seed_sentinel(db2, row_count=2)  # sentinel says 2, actual is 1
+        guard2 = SuppressionGuard(db2)
+        status, details, emails = guard2.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertEqual(emails, set())
+
+    # --- Acknowledged-empty + actual non-empty (PR #2 blocker fix) ---
+
+    def test_acknowledged_empty_but_actual_nonempty_blocks(self):
+        """CRITICAL: If someone acknowledged empty but table gained rows → COUNT_MISMATCH.
+
+        Scenario: admin acknowledges empty suppression list, then a webhook
+        adds a suppression row without updating the sentinel (shouldn't happen
+        with record_mutation wired, but defense-in-depth).
+        """
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db, actor="admin", reason="legit empty")
+        # Now manually insert a row WITHOUT updating sentinel
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("unsub@test.com",))
+        db.conn.commit()
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertFalse(guard.is_valid())
+        self.assertEqual(details["sentinel_row_count"], 0)
+        self.assertEqual(details["actual_row_count"], 1)
+
+    # --- record_mutation (PR #2 blocker fix) ---
+
+    def test_record_mutation_updates_sentinel_count(self):
+        """record_mutation reads actual table count and writes to sentinel."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("b@test.com",))
+        db.conn.commit()
+        guard = SuppressionGuard(db)
+        result = guard.record_mutation(source="webhook_unsubscribe")
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["row_count"], 2)
+        # Sentinel now matches
+        row = db.conn.execute("SELECT row_count FROM v2_suppression_sync WHERE id = 1").fetchone()
+        self.assertEqual(row["row_count"], 2)
+
+    def test_record_mutation_clears_acknowledgment(self):
+        """record_mutation with actual_count > 0 must clear empty acknowledgment."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db, actor="admin", reason="was empty")
+        # Verify acknowledgment is set
+        row = db.conn.execute("SELECT empty_acknowledged FROM v2_suppression_sync WHERE id = 1").fetchone()
+        self.assertEqual(row["empty_acknowledged"], 1)
+        # Now add a suppression and record mutation
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        guard = SuppressionGuard(db)
+        guard.record_mutation(source="webhook_unsubscribe")
+        # Acknowledgment must be cleared
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["empty_acknowledged"], 0)
+        self.assertIsNone(row["acknowledged_by"])
+
+    def test_record_mutation_failed_write_doesnt_crash(self):
+        """record_mutation must not crash if sentinel write fails."""
+        db = self._make_db()
+        # Don't create sentinel table — record_mutation should handle gracefully
+        guard = SuppressionGuard(db)  # This creates the sentinel table
+        # Drop sentinel table to simulate write failure
+        db.conn.execute("DROP TABLE v2_suppression_sync")
+        db.conn.commit()
+        result = guard.record_mutation(source="webhook_unsubscribe")
+        # Should return error dict, not raise
+        self.assertIn("error", result)
+
+    # --- Webhook integration (PR #2 blocker fix) ---
+
+    def _make_webhook_db(self):
+        """Create a DB with production-schema suppressions + email_events for webhook tests."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("""CREATE TABLE IF NOT EXISTS suppressions (
+            email TEXT PRIMARY KEY,
+            reason TEXT DEFAULT 'unsubscribe',
+            suppressed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS email_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mailchimp_campaign_id TEXT,
+            event_type TEXT,
+            email TEXT,
+            timestamp TEXT,
+            raw_payload TEXT
+        )""")
+        conn.commit()
+
+        class MinimalDB:
+            pass
+
+        db = MinimalDB()
+        db.conn = conn
+        return db
+
+    def test_webhook_unsubscribe_updates_sentinel(self):
+        """process_mailchimp_webhook must update sentinel after suppression write."""
+        from craft_engine import CraftCampaignEngine
+
+        db = self._make_webhook_db()
+        self._seed_sentinel(db, row_count=0)
+
+        engine = CraftCampaignEngine.__new__(CraftCampaignEngine)
+        engine.db = db
+        engine._claude = None
+        engine._mailchimp = None
+
+        # Process unsubscribe webhook
+        result = engine.process_mailchimp_webhook({
+            'type': 'unsubscribe',
+            'data': {'email': 'UNSUB@TEST.COM'},
+        })
+        self.assertEqual(result['processed'], 1)
+
+        # Sentinel should now reflect the 1 suppression row
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["row_count"], 1)
+        self.assertEqual(row["source"], "webhook_unsubscribe")
+
+    def test_webhook_cleaned_updates_sentinel(self):
+        """process_mailchimp_webhook must update sentinel after bounce suppression."""
+        from craft_engine import CraftCampaignEngine
+
+        db = self._make_webhook_db()
+        self._seed_sentinel(db, row_count=0)
+
+        engine = CraftCampaignEngine.__new__(CraftCampaignEngine)
+        engine.db = db
+        engine._claude = None
+        engine._mailchimp = None
+
+        result = engine.process_mailchimp_webhook({
+            'type': 'cleaned',
+            'data': {'email': 'bounced@test.com'},
+        })
+        self.assertEqual(result['processed'], 1)
+
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["row_count"], 1)
+        self.assertEqual(row["source"], "webhook_cleaned")
+
+    def test_webhook_campaign_event_does_not_update_sentinel(self):
+        """Campaign events don't write suppressions, so sentinel must not change."""
+        from craft_engine import CraftCampaignEngine
+
+        db = self._make_webhook_db()
+        self._seed_sentinel(db, row_count=0)
+
+        engine = CraftCampaignEngine.__new__(CraftCampaignEngine)
+        engine.db = db
+        engine._claude = None
+        engine._mailchimp = None
+
+        result = engine.process_mailchimp_webhook({
+            'type': 'campaign',
+            'data': {'id': 'mc_123'},
+        })
+        self.assertEqual(result['processed'], 1)
+
+        # Sentinel unchanged — still row_count=0 from seed
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["row_count"], 0)
+
+    # --- Restart/data-loss with count verification (PR #2 blocker fix) ---
+
+    def test_restart_data_loss_sentinel_survives_but_data_lost(self):
+        """CRITICAL: If sentinel survived restart but suppression data was lost,
+        count mismatch must block.
+
+        This is the exact production scenario: sentinel says 5 rows were synced
+        but the suppressions table is empty after restart.
+        """
+        db = self._make_db()
+        # Pre-restart: 5 suppressions exist
+        for i in range(5):
+            db.conn.execute("INSERT INTO suppressions VALUES (?)", (f"u{i}@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=5)
+
+        # Simulate restart: suppressions table recreated empty
+        db.conn.execute("DELETE FROM suppressions")
+        db.conn.commit()
+
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.COUNT_MISMATCH)
+        self.assertFalse(guard.is_valid())
+        self.assertEqual(details["sentinel_row_count"], 5)
+        self.assertEqual(details["actual_row_count"], 0)
+        self.assertIn("data loss", details["reason"].lower())
+
+    # --- Execution blocking with count-mismatch metadata in audit ---
+
+    def test_execution_blocked_by_count_mismatch_includes_metadata(self):
+        """Execution blocked by COUNT_MISMATCH must include count details in audit."""
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        db = FakeExecutionDB()
+        store = InterventionStore(db)
+        audit = AuditLogger(db)
+        db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "intv-cm", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        # Sentinel says 3 rows, but only 1 actual row
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        _seed_valid_suppression_sentinel(db, row_count=3)  # mismatch: 3 vs 1
+
+        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        i = Intervention(
+            id="intv-cm", opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", status=InterventionStatus.NEW,
+            campaign_draft_id="v2-d1", measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        store.save(i)
+
+        result = adapter.execute("intv-cm", actor="user")
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "suppression_count_mismatch")
+
+        # Verify state unchanged
+        loaded = store.get("intv-cm")
+        self.assertEqual(loaded.status, InterventionStatus.APPROVED)
+
+        # Verify audit entry
+        rows = db.conn.execute(
+            "SELECT * FROM intervention_audit_log WHERE intervention_id = ? AND action = 'execute_blocked'",
+            ("intv-cm",),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = dict(rows[0])
+        self.assertIn("count_mismatch", row.get("error", "").lower())
+
 
 class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
     """Regression tests for blocker-removal pass — campaign adapter side."""

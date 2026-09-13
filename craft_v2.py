@@ -387,6 +387,7 @@ def _build_app():
                 "no_campaign_draft": 422,
                 "campaign_draft_missing": 422,
                 "suppression_unavailable": 503,
+                "suppression_count_mismatch": 503,
                 "empty_audience": 422,
                 "execution_failed": 500,
             }.get(result["error"], 400)
