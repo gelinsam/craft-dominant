@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
 
 function money(value) {
   const number = Number(value || 0);
@@ -19,6 +19,31 @@ function badgeClass(type) {
       return 'bg-rose-50 text-rose-700 border-rose-200';
     default:
       return 'bg-slate-50 text-slate-700 border-slate-200';
+  }
+}
+
+function statusBadge(status) {
+  switch (status) {
+    case 'new':
+      return 'bg-slate-100 text-slate-600';
+    case 'investigated':
+      return 'bg-blue-50 text-blue-700';
+    case 'proposed':
+      return 'bg-amber-50 text-amber-700';
+    case 'approved':
+      return 'bg-emerald-50 text-emerald-700';
+    case 'executing':
+      return 'bg-indigo-50 text-indigo-700';
+    case 'measuring':
+      return 'bg-purple-50 text-purple-700';
+    case 'learned':
+      return 'bg-teal-50 text-teal-700';
+    case 'rejected':
+      return 'bg-rose-50 text-rose-700';
+    case 'cancelled':
+      return 'bg-slate-50 text-slate-400';
+    default:
+      return 'bg-slate-100 text-slate-600';
   }
 }
 
@@ -54,8 +79,184 @@ function Evidence({ evidence }) {
   );
 }
 
-function OpportunityCard({ item, rank }) {
+function RootCauseList({ causes }) {
+  if (!causes || causes.length === 0) return null;
+  return (
+    <div className="mt-4 space-y-2">
+      <div className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Root causes</div>
+      {causes.map((rc, i) => (
+        <div key={i} className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-slate-800">{rc.cause}</span>
+            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+              {Math.round(rc.confidence * 100)}% confidence
+            </span>
+          </div>
+          {rc.evidence && rc.evidence.length > 0 ? (
+            <ul className="mt-1.5 space-y-0.5">
+              {rc.evidence.map((e, j) => (
+                <li key={j} className="text-xs text-slate-500 pl-2 border-l-2 border-slate-200">{e}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DiagnosisSummary({ diagnosis }) {
+  if (!diagnosis) return null;
+  const d = diagnosis;
+  return (
+    <div className="mt-4 rounded-xl border border-indigo-100 bg-indigo-50/50 p-4">
+      <div className="text-xs font-semibold uppercase tracking-[0.16em] text-indigo-600">Diagnosis</div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="rounded-lg bg-white px-3 py-2 border border-indigo-100">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Sell-through</div>
+          <div className="mt-0.5 text-sm font-semibold text-slate-800">{d.sell_through_pct}%</div>
+        </div>
+        <div className="rounded-lg bg-white px-3 py-2 border border-indigo-100">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Recent velocity</div>
+          <div className="mt-0.5 text-sm font-semibold text-slate-800">
+            {d.recent_velocity != null ? `${d.recent_velocity} tix/day` : 'N/A'}
+          </div>
+        </div>
+        <div className="rounded-lg bg-white px-3 py-2 border border-indigo-100">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Meta spend</div>
+          <div className="mt-0.5 text-sm font-semibold text-slate-800">{money(d.meta_spend_total)}</div>
+        </div>
+        <div className="rounded-lg bg-white px-3 py-2 border border-indigo-100">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">CRM audience</div>
+          <div className="mt-0.5 text-sm font-semibold text-slate-800">{(d.crm_audience_total || 0).toLocaleString()}</div>
+        </div>
+      </div>
+
+      <RootCauseList causes={d.root_causes} />
+
+      {d.recommended_intervention ? (
+        <div className="mt-3 rounded-lg bg-emerald-50 border border-emerald-200 p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-emerald-600">Recommended intervention</div>
+          <div className="mt-1 text-sm font-medium text-emerald-900">
+            {String(d.recommended_intervention).replaceAll('_', ' ').toUpperCase()}
+          </div>
+          <div className="mt-1 text-xs text-emerald-700">{d.recommendation_rationale}</div>
+        </div>
+      ) : null}
+
+      {d.missing_data && d.missing_data.length > 0 ? (
+        <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-amber-600">Missing data</div>
+          <ul className="mt-1 space-y-0.5">
+            {d.missing_data.map((m, i) => (
+              <li key={i} className="text-xs text-amber-700">{m}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function InterventionBadge({ intervention }) {
+  if (!intervention) return null;
+  return (
+    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
+      <div className="flex items-center gap-2">
+        <div className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Intervention</div>
+        <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${statusBadge(intervention.status)}`}>
+          {String(intervention.status).toUpperCase()}
+        </span>
+      </div>
+      <div className="mt-2 text-sm text-slate-700">{intervention.rationale}</div>
+      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+        <div>
+          <div className="text-[10px] font-semibold uppercase text-slate-400">Expected revenue</div>
+          <div className="text-sm font-semibold text-slate-800">{money(intervention.expected_revenue)}</div>
+        </div>
+        <div>
+          <div className="text-[10px] font-semibold uppercase text-slate-400">Expected cost</div>
+          <div className="text-sm font-semibold text-slate-800">{money(intervention.expected_cost)}</div>
+        </div>
+        <div>
+          <div className="text-[10px] font-semibold uppercase text-slate-400">Net value</div>
+          <div className="text-sm font-semibold text-emerald-700">{money(intervention.expected_net_value)}</div>
+        </div>
+      </div>
+      {intervention.campaign_draft_id ? (
+        <div className="mt-2 text-xs text-slate-500">
+          Campaign draft: <span className="font-mono">{intervention.campaign_draft_id}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
+  const [diagnosis, setDiagnosis] = useState(null);
+  const [diagnosisLoading, setDiagnosisLoading] = useState(false);
+  const [diagnosisError, setDiagnosisError] = useState('');
+  const [showDiagnosis, setShowDiagnosis] = useState(false);
+
+  const [intervention, setIntervention] = useState(null);
+  const [prepareLoading, setPrepareLoading] = useState(false);
+  const [prepareError, setPrepareError] = useState('');
+
   const weighted = Number(item.confidence_weighted_value || item.expected_net_value * item.confidence || 0);
+
+  const headers = useMemo(() => ({
+    'Authorization': `Bearer ${authToken}`,
+    'Content-Type': 'application/json',
+  }), [authToken]);
+
+  const loadDiagnosis = useCallback(async () => {
+    if (diagnosis) {
+      setShowDiagnosis(!showDiagnosis);
+      return;
+    }
+    setDiagnosisLoading(true);
+    setDiagnosisError('');
+    try {
+      const res = await fetch(`${apiBase}/api/v2/opportunities/${item.event_id}/diagnosis`, { headers });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.message || body?.error || `Diagnosis failed: ${res.status}`);
+      setDiagnosis(body.diagnosis);
+      setShowDiagnosis(true);
+    } catch (err) {
+      setDiagnosisError(err?.message || 'Diagnosis failed');
+    } finally {
+      setDiagnosisLoading(false);
+    }
+  }, [diagnosis, showDiagnosis, item.event_id, apiBase, headers]);
+
+  const prepare = useCallback(async () => {
+    setPrepareLoading(true);
+    setPrepareError('');
+    try {
+      const res = await fetch(`${apiBase}/api/v2/opportunities/${item.opportunity_id}/prepare`, {
+        method: 'POST',
+        headers,
+      });
+      const body = await res.json();
+      if (res.status === 409) {
+        // Already has intervention — load it
+        setIntervention(body.intervention);
+        return;
+      }
+      if (!res.ok) throw new Error(body?.message || body?.error || `Prepare failed: ${res.status}`);
+      setIntervention(body.intervention);
+      // Also load diagnosis from the response if we didn't have it
+      if (!diagnosis && body.diagnosis_summary) {
+        setDiagnosis(body.diagnosis_summary);
+        setShowDiagnosis(true);
+      }
+    } catch (err) {
+      setPrepareError(err?.message || 'Prepare failed');
+    } finally {
+      setPrepareLoading(false);
+    }
+  }, [item.opportunity_id, apiBase, headers, diagnosis]);
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -83,6 +284,34 @@ function OpportunityCard({ item, rank }) {
             <div className="mt-1 text-sm font-medium text-slate-800">{item.recommended_action}</div>
             <Evidence evidence={item.evidence} />
           </div>
+
+          {/* V2 actions */}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              onClick={loadDiagnosis}
+              disabled={diagnosisLoading}
+              className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:opacity-50"
+            >
+              {diagnosisLoading ? 'Diagnosing…' : showDiagnosis ? 'Hide diagnosis' : 'Diagnose'}
+            </button>
+            <button
+              onClick={prepare}
+              disabled={prepareLoading || !!intervention}
+              className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
+            >
+              {prepareLoading ? 'Preparing…' : intervention ? 'Action prepared' : 'Prepare action'}
+            </button>
+          </div>
+
+          {diagnosisError ? (
+            <div className="mt-2 text-xs text-rose-600">{diagnosisError}</div>
+          ) : null}
+          {prepareError ? (
+            <div className="mt-2 text-xs text-rose-600">{prepareError}</div>
+          ) : null}
+
+          {showDiagnosis ? <DiagnosisSummary diagnosis={diagnosis} /> : null}
+          {intervention ? <InterventionBadge intervention={intervention} /> : null}
         </div>
 
         <div className="grid min-w-[260px] grid-cols-2 gap-3 lg:w-[340px]">
@@ -110,25 +339,48 @@ function OpportunityCard({ item, rank }) {
 
 export default function CommandPage() {
   const [data, setData] = useState(null);
+  const [interventions, setInterventions] = useState([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
 
-  async function load() {
+  // Read auth token from env or query param (never from URL path)
+  const apiBase = typeof window !== 'undefined'
+    ? (process.env.NEXT_PUBLIC_API_BASE || '')
+    : '';
+  const authToken = typeof window !== 'undefined'
+    ? (process.env.NEXT_PUBLIC_COMMAND_API_KEY || '')
+    : '';
+
+  const headers = useMemo(() => ({
+    'Authorization': `Bearer ${authToken}`,
+    'Content-Type': 'application/json',
+  }), [authToken]);
+
+  const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const response = await fetch('/api/command', { cache: 'no-store' });
-      const body = await response.json();
-      if (!response.ok) {
-        throw new Error(body?.message || body?.error || `Command API returned ${response.status}`);
+      const [commandRes, interventionsRes] = await Promise.all([
+        fetch(`${apiBase}/api/v2/command`, { headers, cache: 'no-store' }),
+        fetch(`${apiBase}/api/v2/interventions`, { headers, cache: 'no-store' }).catch(() => null),
+      ]);
+
+      const commandBody = await commandRes.json();
+      if (!commandRes.ok) {
+        throw new Error(commandBody?.message || commandBody?.error || `Command API returned ${commandRes.status}`);
       }
-      setData(body);
+      setData(commandBody);
+
+      if (interventionsRes && interventionsRes.ok) {
+        const intBody = await interventionsRes.json();
+        setInterventions(intBody.interventions || []);
+      }
     } catch (err) {
       setError(err?.message || 'Command Center could not load.');
     } finally {
       setLoading(false);
     }
-  }
+  }, [apiBase, headers]);
 
   useEffect(() => {
     load();
@@ -170,6 +422,24 @@ export default function CommandPage() {
           <Stat label="Opportunities" value={data?.opportunity_count ?? '—'} helper="Material interventions surfaced" />
         </section>
 
+        {/* Active interventions summary */}
+        {interventions.length > 0 ? (
+          <section className="mt-6">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Active interventions</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {interventions.map((intv) => (
+                <div key={intv.id} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusBadge(intv.status)}`}>
+                    {String(intv.status).toUpperCase()}
+                  </span>
+                  <span className="text-slate-700">{String(intv.intervention_type).replaceAll('_', ' ')}</span>
+                  <span className="font-mono text-[10px] text-slate-400">{intv.id?.slice(0, 8)}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
         <section className="mt-8 space-y-4">
           {loading && !data ? (
             <div className="rounded-2xl border border-slate-200 bg-white p-10 text-center text-slate-500 shadow-sm">
@@ -185,7 +455,14 @@ export default function CommandPage() {
           ) : null}
 
           {opportunities.map((item, index) => (
-            <OpportunityCard key={item.opportunity_id || `${item.event_id}-${item.opportunity_type}`} item={item} rank={index + 1} />
+            <OpportunityCard
+              key={item.opportunity_id || `${item.event_id}-${item.opportunity_type}`}
+              item={item}
+              rank={index + 1}
+              apiBase={apiBase}
+              authToken={authToken}
+              onRefresh={load}
+            />
           ))}
         </section>
       </div>
