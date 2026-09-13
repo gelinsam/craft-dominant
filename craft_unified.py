@@ -2604,7 +2604,7 @@ class DecisionEngine:
             high_value_targets=max(a.high_value_targets for a in day_analyses) if day_analyses else 0,
             reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
             historical_comparisons=historical_comparisons,
-            constituent_event_ids=[a.event_id for a in all_analyses_for_pattern],
+            constituent_event_ids=[a.event_id for a in day_analyses],
         )
     def analyze_portfolio(self) -> List[EventPacing]:
         """Analyze all upcoming events, grouping timed-entry events by day."""

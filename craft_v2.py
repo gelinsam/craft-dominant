@@ -108,8 +108,24 @@ def _build_app():
     @app.get("/api/v2/opportunities/<event_id>")
     @require_command_auth
     def event_opportunities(event_id: str):
-        if db.get_event(event_id) is None:
+        # Try raw DB lookup first; fall back to grouped portfolio lookup
+        resolved = opportunity_engine.resolve_event(event_id)
+        if resolved is None:
             return jsonify({"error": "event_not_found"}), 404
+        pacing, is_grouped = resolved
+        if is_grouped:
+            items = [item.to_dict() for item in opportunity_engine.evaluate_pacing(pacing)]
+            ctx = opportunity_engine.get_event_context(pacing)
+            return jsonify({
+                "event_id": event_id,
+                "is_grouped": True,
+                "logical_event_name": getattr(pacing, "event_name", ""),
+                "constituent_event_ids": getattr(pacing, "constituent_event_ids", []),
+                "event_date": getattr(pacing, "event_date", ""),
+                "city": ctx.get("city", ""),
+                "event_type": ctx.get("event_type", ""),
+                "opportunities": items,
+            })
         items = [item.to_dict() for item in opportunity_engine.evaluate_event(event_id)]
         return jsonify({"event_id": event_id, "opportunities": items})
 
@@ -121,10 +137,16 @@ def _build_app():
     @require_command_auth
     def event_diagnosis(event_id: str):
         """Inspect an event's opportunity and return a structured diagnosis."""
-        if db.get_event(event_id) is None:
+        resolved = opportunity_engine.resolve_event(event_id)
+        if resolved is None:
             return jsonify({"error": "event_not_found"}), 404
 
-        opps = opportunity_engine.evaluate_event(event_id)
+        pacing, is_grouped = resolved
+        if is_grouped:
+            opps = opportunity_engine.evaluate_pacing(pacing)
+        else:
+            opps = opportunity_engine.evaluate_event(event_id)
+
         if not opps:
             return jsonify({
                 "event_id": event_id,
@@ -132,11 +154,18 @@ def _build_app():
                 "message": "No material opportunity surfaced for this event.",
             })
 
-        # Use the top opportunity
         opp = opps[0]
         try:
-            diagnosis = diagnosis_engine.diagnose(event_id, opp.to_dict())
-            return jsonify({"event_id": event_id, "diagnosis": diagnosis.to_dict()})
+            if is_grouped:
+                ctx = opportunity_engine.get_event_context(pacing)
+                diagnosis = diagnosis_engine.diagnose_grouped(pacing, opp.to_dict(), ctx)
+            else:
+                diagnosis = diagnosis_engine.diagnose(event_id, opp.to_dict())
+            result = {"event_id": event_id, "diagnosis": diagnosis.to_dict()}
+            if is_grouped:
+                result["is_grouped"] = True
+                result["constituent_event_ids"] = getattr(pacing, "constituent_event_ids", [])
+            return jsonify(result)
         except Exception as e:
             log.error(f"Diagnosis failed for {event_id}: {e}")
             return jsonify({"error": "diagnosis_failed", "message": str(e)}), 500
@@ -173,27 +202,24 @@ def _build_app():
         """Create a draft intervention and campaign from an opportunity.
 
         This endpoint:
-        1. Finds the opportunity by scanning events
-        2. Runs diagnosis
+        1. Finds the opportunity via the grouped portfolio (handles both
+           raw Eventbrite IDs and grouped timed-entry logical IDs)
+        2. Runs diagnosis (grouped or standard)
         3. Creates an Intervention record (status: proposed)
         4. If CRM campaign is recommended, creates a draft campaign
         5. Returns the intervention with campaign details
 
         DOES NOT send anything externally.
         """
-        # Find the opportunity across all events
-        target_opp = None
-        for event in db.get_events(upcoming_only=True):
-            opps = opportunity_engine.evaluate_event(event["event_id"])
-            for opp in opps:
-                if opp.opportunity_id == opportunity_id:
-                    target_opp = opp
-                    break
-            if target_opp:
-                break
-
-        if not target_opp:
+        # Find the opportunity across the full grouped portfolio
+        found = opportunity_engine.find_opportunity(opportunity_id)
+        if not found:
             return jsonify({"error": "opportunity_not_found"}), 404
+        target_opp, target_pacing = found
+        is_grouped = target_pacing.event_id != target_opp.event_id or bool(
+            getattr(target_pacing, "constituent_event_ids", [])
+            and not db.get_event(target_pacing.event_id)
+        )
 
         # Check if intervention already exists for this opportunity
         existing = intervention_store.get_by_opportunity(opportunity_id)
@@ -209,7 +235,13 @@ def _build_app():
         opp_dict = target_opp.to_dict()
         event_id = target_opp.event_id
         try:
-            diagnosis = diagnosis_engine.diagnose(event_id, opp_dict)
+            if is_grouped:
+                ctx = opportunity_engine.get_event_context(target_pacing)
+                diagnosis = diagnosis_engine.diagnose_grouped(
+                    target_pacing, opp_dict, ctx
+                )
+            else:
+                diagnosis = diagnosis_engine.diagnose(event_id, opp_dict)
         except Exception as e:
             log.error(f"Diagnosis failed during prepare for {event_id}: {e}")
             return jsonify({"error": "diagnosis_failed", "message": str(e)}), 500
@@ -227,6 +259,30 @@ def _build_app():
             option = diagnosis.intervention_options[0]
             recommended_type = option.intervention_type
 
+        # Build evidence — include grouped identity data
+        intervention_evidence = {
+            "diagnosis_summary": {
+                "pace_delta_pct": diagnosis.pace_delta_pct,
+                "gap_tickets": diagnosis.gap_tickets,
+                "revenue_at_risk": diagnosis.revenue_at_risk,
+                "root_causes": [
+                    {"cause": rc.cause, "confidence": rc.confidence}
+                    for rc in diagnosis.root_causes[:3]
+                ],
+            },
+            "opportunity_id": opportunity_id,
+        }
+        if is_grouped:
+            ctx = opportunity_engine.get_event_context(target_pacing)
+            intervention_evidence["grouped_event"] = {
+                "logical_event_id": event_id,
+                "logical_event_name": getattr(target_pacing, "event_name", ""),
+                "constituent_event_ids": getattr(target_pacing, "constituent_event_ids", []),
+                "event_date": getattr(target_pacing, "event_date", ""),
+                "city": ctx.get("city", ""),
+                "event_type": ctx.get("event_type", ""),
+            }
+
         # Create intervention
         intervention = Intervention.create(
             opportunity_id=opportunity_id,
@@ -237,18 +293,7 @@ def _build_app():
             expected_cost=option.expected_cost if option else 0,
             expected_net_value=option.expected_net_value if option else 0,
             confidence=option.confidence if option else 0,
-            evidence={
-                "diagnosis_summary": {
-                    "pace_delta_pct": diagnosis.pace_delta_pct,
-                    "gap_tickets": diagnosis.gap_tickets,
-                    "revenue_at_risk": diagnosis.revenue_at_risk,
-                    "root_causes": [
-                        {"cause": rc.cause, "confidence": rc.confidence}
-                        for rc in diagnosis.root_causes[:3]
-                    ],
-                },
-                "opportunity_id": opportunity_id,
-            },
+            evidence=intervention_evidence,
         )
 
         # Advance through state machine: new → investigated → proposed
@@ -259,7 +304,16 @@ def _build_app():
         campaign_result = None
         if recommended_type == "crm_campaign":
             try:
-                campaign_result = campaign_adapter.prepare_draft(intervention, diagnosis_dict)
+                if is_grouped:
+                    campaign_result = campaign_adapter.prepare_draft_grouped(
+                        intervention, diagnosis_dict,
+                        getattr(target_pacing, "constituent_event_ids", []),
+                        opportunity_engine.get_event_context(target_pacing),
+                    )
+                else:
+                    campaign_result = campaign_adapter.prepare_draft(
+                        intervention, diagnosis_dict
+                    )
                 intervention.campaign_draft_id = campaign_result["campaign_draft_id"]
                 intervention.audience_definition = campaign_result.get("segment_description", "")
                 intervention.evidence["campaign_draft"] = {

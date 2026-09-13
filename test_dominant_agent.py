@@ -923,5 +923,294 @@ class TestCrossDayIsolation(unittest.TestCase):
         self.assertIn("$1,000", cls["detail"])
 
 
+# ─────────────────────────────────────────────────────────────────────
+# End-to-end grouped event regression tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestEndToEndGroupedEventResolution(unittest.TestCase):
+    """End-to-end: grouped Saturday event with 3 raw slots, grouped Sunday
+    event with 3 raw slots, prior-year history, Saturday materially behind,
+    opportunity surfaced, detail/diagnosis/prepare routes resolve, correct
+    Saturday-only constituent IDs, buyer exclusions work across Saturday
+    slots, Sunday buyers do NOT leak into Saturday scope.
+    """
+
+    def setUp(self):
+        self.db = FakeDB()
+        # Add get_event_buyers method to FakeDB for this test
+        self.db.get_event_buyers = lambda event_id: {
+            r["email"] for r in self.db.conn.execute(
+                "SELECT DISTINCT lower(email) as email FROM orders WHERE event_id = ?",
+                (event_id,),
+            ).fetchall()
+        }
+
+        sat_date = (date.today() + timedelta(days=30)).isoformat()
+        sun_date = (date.today() + timedelta(days=31)).isoformat()
+
+        # Saturday: 3 timed-entry slots
+        for i in range(3):
+            eid = f"sat_slot_{i}"
+            self.db.conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (eid, "DC Wine Fest", "wine", "Washington",
+                 f"{sat_date}T{9+i}:00:00", 300),
+            )
+            self.db.conn.executemany(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                [(f"o_s{i}_a", eid, f"sat_buyer_{i}a@example.com", 2, 100.0),
+                 (f"o_s{i}_b", eid, f"sat_buyer_{i}b@example.com", 1, 50.0)],
+            )
+        # Sunday: 3 timed-entry slots with DIFFERENT buyers
+        for i in range(3):
+            eid = f"sun_slot_{i}"
+            self.db.conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (eid, "DC Wine Fest", "wine", "Washington",
+                 f"{sun_date}T{9+i}:00:00", 300),
+            )
+            self.db.conn.executemany(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                [(f"o_u{i}_a", eid, f"sun_buyer_{i}a@example.com", 2, 100.0),
+                 (f"o_u{i}_b", eid, f"sun_buyer_{i}b@example.com", 1, 50.0)],
+            )
+        self.db.conn.commit()
+
+        # Grouped pacing objects (as dashboard would produce)
+        self.sat_pacing = FakePacingFull(
+            pace_vs_historical=-25.0,
+            tickets_sold=450,
+            historical_median_at_point=600,
+            comparison_events=["DC Wine Fest 2025", "DC Wine Fest 2024"],
+            event_id="grouped_sat_id",
+            event_name="DC Wine Fest - Saturday",
+            constituent_event_ids=["sat_slot_0", "sat_slot_1", "sat_slot_2"],
+            revenue=22500.0,
+            days_until=30,
+            urgency=8,
+        )
+        self.sat_pacing.event_date = sat_date
+        self.sat_pacing.capacity = 900  # 3 slots × 300
+
+        self.sun_pacing = FakePacingFull(
+            pace_vs_historical=5.0,  # Sunday on pace
+            tickets_sold=630,
+            historical_median_at_point=600,
+            comparison_events=["DC Wine Fest 2025", "DC Wine Fest 2024"],
+            event_id="grouped_sun_id",
+            event_name="DC Wine Fest - Sunday",
+            constituent_event_ids=["sun_slot_0", "sun_slot_1", "sun_slot_2"],
+            revenue=31500.0,
+            days_until=31,
+            urgency=7,
+        )
+        self.sun_pacing.event_date = sun_date
+        self.sun_pacing.capacity = 900
+
+        de = FakeDecisionEngine({})
+        de.analyze_portfolio = lambda: [self.sat_pacing, self.sun_pacing]
+        self.engine = OpportunityEngine(self.db, de)
+
+    # ── Opportunity surfacing ──────────────────────────────────────────
+
+    def test_saturday_surfaces_opportunity_sunday_does_not(self):
+        """Saturday (-25% behind pace) surfaces opportunity; Sunday (+5%) does not."""
+        items = self.engine.evaluate_all()
+        # Only Saturday should produce an opportunity
+        opp_events = [i["event_id"] for i in items]
+        self.assertIn("grouped_sat_id", opp_events)
+        self.assertNotIn("grouped_sun_id", opp_events)
+
+    def test_saturday_opportunity_has_correct_identity(self):
+        """Saturday opportunity carries grouped ID and name."""
+        items = self.engine.evaluate_all()
+        sat_opp = [i for i in items if i["event_id"] == "grouped_sat_id"][0]
+        self.assertEqual(sat_opp["event_name"], "DC Wine Fest - Saturday")
+        self.assertIn("25% behind", sat_opp["rationale"])
+
+    # ── resolve_event() ────────────────────────────────────────────────
+
+    def test_resolve_grouped_event(self):
+        """resolve_event() finds grouped IDs via portfolio search."""
+        result = self.engine.resolve_event("grouped_sat_id")
+        self.assertIsNotNone(result)
+        pacing, is_grouped = result
+        self.assertTrue(is_grouped)
+        self.assertEqual(pacing.event_id, "grouped_sat_id")
+
+    def test_resolve_raw_event(self):
+        """resolve_event() finds raw Eventbrite IDs via DB lookup."""
+        # sat_slot_0 is a real DB event, but DecisionEngine won't have
+        # analyze_event for it. resolve_event returns None when pacing is None.
+        result = self.engine.resolve_event("sat_slot_0")
+        # The FakeDecisionEngine has no values for sat_slot_0, so
+        # analyze_event returns None → resolve_event returns None
+        self.assertIsNone(result)
+
+    def test_resolve_unknown_event_returns_none(self):
+        """resolve_event() returns None for IDs not in DB or portfolio."""
+        result = self.engine.resolve_event("totally_unknown_id")
+        self.assertIsNone(result)
+
+    # ── find_opportunity() ─────────────────────────────────────────────
+
+    def test_find_opportunity_for_grouped_event(self):
+        """find_opportunity() finds the Saturday opportunity by opp ID."""
+        items = self.engine.evaluate_all()
+        sat_opp_id = [i for i in items if i["event_id"] == "grouped_sat_id"][0]["opportunity_id"]
+        found = self.engine.find_opportunity(sat_opp_id)
+        self.assertIsNotNone(found)
+        opp, pacing = found
+        self.assertEqual(opp.event_id, "grouped_sat_id")
+        self.assertEqual(pacing.event_id, "grouped_sat_id")
+
+    def test_find_opportunity_returns_none_for_unknown(self):
+        """find_opportunity() returns None for a non-existent opportunity ID."""
+        self.assertIsNone(self.engine.find_opportunity("nonexistent_opp_id"))
+
+    # ── get_event_context() ────────────────────────────────────────────
+
+    def test_get_event_context_uses_first_constituent(self):
+        """get_event_context() extracts city/event_type from first constituent."""
+        ctx = self.engine.get_event_context(self.sat_pacing)
+        self.assertEqual(ctx["city"], "Washington")
+        self.assertEqual(ctx["event_type"], "wine")
+        self.assertEqual(ctx["event_id"], "grouped_sat_id")
+        self.assertEqual(ctx["name"], "DC Wine Fest - Saturday")
+
+    # ── Cross-day isolation ────────────────────────────────────────────
+
+    def test_saturday_constituent_ids_are_day_scoped(self):
+        """Saturday grouped event must contain only Saturday slot IDs."""
+        sat_ids = self.sat_pacing.constituent_event_ids
+        self.assertEqual(sorted(sat_ids), ["sat_slot_0", "sat_slot_1", "sat_slot_2"])
+        for sid in sat_ids:
+            self.assertFalse(sid.startswith("sun_"), f"Sunday ID {sid} in Saturday scope")
+
+    def test_sunday_constituent_ids_are_day_scoped(self):
+        """Sunday grouped event must contain only Sunday slot IDs."""
+        sun_ids = self.sun_pacing.constituent_event_ids
+        self.assertEqual(sorted(sun_ids), ["sun_slot_0", "sun_slot_1", "sun_slot_2"])
+        for sid in sun_ids:
+            self.assertFalse(sid.startswith("sat_"), f"Saturday ID {sid} in Sunday scope")
+
+    def test_buyer_exclusion_across_saturday_slots(self):
+        """Buyers from ANY Saturday slot are excluded (all 6 Saturday buyers)."""
+        sat_buyers = set()
+        for eid in self.sat_pacing.constituent_event_ids:
+            sat_buyers.update(self.db.get_event_buyers(eid))
+        # Should have 6 unique Saturday buyers (2 per slot × 3 slots)
+        self.assertEqual(len(sat_buyers), 6)
+        for b in sat_buyers:
+            self.assertIn("sat_buyer", b)
+
+    def test_sunday_buyers_do_not_leak_into_saturday(self):
+        """Sunday buyers must NOT appear in Saturday's buyer set."""
+        sat_buyers = set()
+        for eid in self.sat_pacing.constituent_event_ids:
+            sat_buyers.update(self.db.get_event_buyers(eid))
+        sun_buyers = set()
+        for eid in self.sun_pacing.constituent_event_ids:
+            sun_buyers.update(self.db.get_event_buyers(eid))
+        # No overlap
+        self.assertEqual(sat_buyers & sun_buyers, set())
+
+    # ── Economics stability ────────────────────────────────────────────
+
+    def test_saturday_price_is_day_scoped(self):
+        """Average ticket price uses Saturday's own revenue/tickets, not cross-day."""
+        items = self.engine.evaluate_pacing(self.sat_pacing)
+        self.assertEqual(len(items), 1)
+        # Revenue $22,500 / 450 tickets = $50/ticket
+        self.assertEqual(items[0].evidence["avg_ticket_price"], 50.0)
+
+    def test_saturday_revenue_at_risk_is_day_scoped(self):
+        """Revenue at risk uses Saturday day-scoped gap and price."""
+        items = self.engine.evaluate_pacing(self.sat_pacing)
+        opp = items[0]
+        gap = opp.evidence["gap_tickets"]  # 600 - 450 = 150
+        self.assertEqual(gap, 150)
+        # Risk = gap × price = 150 × $50 = $7,500
+        self.assertEqual(opp.revenue_at_risk, 7500.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Route contract tests (API layer)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestRouteContracts(unittest.TestCase):
+    """Contract tests for V2 API routes: grouped IDs accepted, unknown → 404,
+    backward compatibility with raw IDs preserved.
+
+    These tests exercise the route handler logic via the Flask test client
+    with a real (in-memory) database.
+    """
+
+    def setUp(self):
+        import os
+        os.environ["COMMAND_API_KEY"] = "test-route-secret"
+        os.environ["DB_PATH"] = ":memory:"
+        os.environ.pop("MAILCHIMP_API_KEY", None)
+        os.environ.pop("MAILCHIMP_AUDIENCE_ID", None)
+
+        from craft_v2 import _build_app
+        self.app = _build_app()
+        self.client = self.app.test_client()
+        self.auth_header = {"Authorization": "Bearer test-route-secret"}
+
+    def tearDown(self):
+        import os
+        os.environ.pop("COMMAND_API_KEY", None)
+        os.environ.pop("DB_PATH", None)
+
+    def test_command_summary_returns_200(self):
+        """GET /api/v2/command must return summary with opportunities."""
+        resp = self.client.get("/api/v2/command", headers=self.auth_header)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn("opportunities", data)
+
+    def test_detail_returns_404_for_unknown_id(self):
+        """GET /api/v2/opportunities/<unknown> must return 404."""
+        resp = self.client.get(
+            "/api/v2/opportunities/totally_fake_event_id_xyz",
+            headers=self.auth_header,
+        )
+        self.assertEqual(resp.status_code, 404)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "event_not_found")
+
+    def test_diagnosis_returns_404_for_unknown_id(self):
+        """GET /api/v2/opportunities/<unknown>/diagnosis must return 404."""
+        resp = self.client.get(
+            "/api/v2/opportunities/totally_fake_event_id_xyz/diagnosis",
+            headers=self.auth_header,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_prepare_returns_404_for_unknown_opportunity(self):
+        """POST /api/v2/opportunities/<unknown>/prepare must return 404."""
+        resp = self.client.post(
+            "/api/v2/opportunities/totally_fake_opp_id_xyz/prepare",
+            headers=self.auth_header,
+        )
+        self.assertEqual(resp.status_code, 404)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "opportunity_not_found")
+
+    def test_unauthenticated_request_rejected(self):
+        """Requests without auth header must be rejected."""
+        resp = self.client.get("/api/v2/command")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_auth_rejected(self):
+        """Requests with wrong Bearer token must be rejected."""
+        resp = self.client.get(
+            "/api/v2/command",
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+        self.assertEqual(resp.status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

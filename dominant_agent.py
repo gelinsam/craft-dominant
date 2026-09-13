@@ -310,6 +310,66 @@ class OpportunityEngine:
         )
         return [opportunity]
 
+    # ─────────────────────────────────────────────────────────────────
+    # Grouped-event resolution
+    # ─────────────────────────────────────────────────────────────────
+
+    def resolve_event(self, event_id: str):
+        """Resolve an event_id to (EventPacing, is_grouped).
+
+        For raw Eventbrite IDs: returns (analyze_event() result, False).
+        For grouped logical IDs: searches analyze_portfolio() and
+        returns (grouped EventPacing, True).
+
+        Returns None if neither lookup finds the event.
+        """
+        if self.db.get_event(event_id) is not None:
+            pacing = self.decision_engine.analyze_event(event_id)
+            return (pacing, False) if pacing else None
+        # Try grouped portfolio lookup
+        portfolio = self.decision_engine.analyze_portfolio()
+        for p in portfolio:
+            if p.event_id == event_id:
+                return (p, True)
+        return None
+
+    def find_opportunity(self, opportunity_id: str):
+        """Find an opportunity by its ID across the full grouped portfolio.
+
+        Returns (Opportunity, EventPacing) or None.  This is the single
+        lookup path that correctly finds grouped opportunities produced by
+        evaluate_all() — unlike iterating db.get_events() + evaluate_event()
+        which misses grouped timed-entry events entirely.
+        """
+        portfolio = self.decision_engine.analyze_portfolio()
+        for pacing in portfolio:
+            opps = self.evaluate_pacing(pacing)
+            for opp in opps:
+                if opp.opportunity_id == opportunity_id:
+                    return (opp, pacing)
+        return None
+
+    def get_event_context(self, pacing):
+        """Extract event metadata (city, event_type, name) from a grouped
+        EventPacing's first constituent event.
+
+        Returns a dict with event-like keys, usable where downstream code
+        expects a db.get_event() row.
+        """
+        constituent_ids = getattr(pacing, "constituent_event_ids", []) or []
+        event = {}
+        for cid in constituent_ids:
+            row = self.db.get_event(cid)
+            if row:
+                event = dict(row)
+                break
+        # Override with grouped-level data
+        event["event_id"] = pacing.event_id
+        event["name"] = getattr(pacing, "event_name", event.get("name", ""))
+        event["capacity"] = getattr(pacing, "capacity", event.get("capacity", 0))
+        event["event_date"] = getattr(pacing, "event_date", event.get("event_date", ""))
+        return event
+
     def evaluate_event(self, event_id: str) -> List[Opportunity]:
         event_row = self.db.get_event(event_id)
         if not event_row:

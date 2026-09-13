@@ -147,6 +147,184 @@ class CampaignDraftAdapter:
             "subject_line": copy_result.get("subject_line", ""),
         }
 
+    def prepare_draft_grouped(
+        self,
+        intervention: Intervention,
+        diagnosis_data: Dict[str, Any],
+        constituent_event_ids: List[str],
+        event_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create a draft campaign for a grouped (timed-entry) opportunity.
+
+        Uses constituent_event_ids for buyer exclusion across all
+        day-scoped slots.  event_context supplies city/event_type/name.
+
+        NEVER sends.
+        """
+        event_id = intervention.event_id  # logical grouped ID
+        event = dict(event_context)
+
+        # Build audience with buyer exclusion across ALL constituent slots
+        audience_result = self._build_audience_grouped(
+            constituent_event_ids, event
+        )
+        audience_emails = audience_result["emails"]
+        audience_count = len(audience_emails)
+        segment_description = audience_result["description"]
+        segment_sql = audience_result["sql"]
+
+        # Conversion modeling — deterministic, no LLM
+        avg_price = diagnosis_data.get("avg_ticket_price", 0)
+        champions = diagnosis_data.get("crm_champions", 0)
+        gap_tickets = diagnosis_data.get("gap_tickets")
+        conversions = self._model_conversions(audience_count, champions)
+        if gap_tickets is not None and gap_tickets > 0:
+            conversions["expected_tickets"] = min(
+                conversions["expected_tickets"], gap_tickets
+            )
+        expected_revenue = conversions["expected_tickets"] * avg_price
+
+        campaign_id = f"v2-{str(uuid.uuid4())[:8]}"
+        copy_result = self._generate_copy(event, diagnosis_data)
+
+        # Save draft
+        try:
+            self._ensure_campaigns_table()
+            self.db.conn.execute(
+                """INSERT INTO campaigns
+                   (id, event_id, campaign_type, channel, phase, subject_line,
+                    preview_text, body_html, cta_text, cta_url,
+                    segment_name, segment_sql, audience_count,
+                    status, barrier_addressed, confidence_score,
+                    strategic_reasoning, predicted_open_rate,
+                    predicted_click_rate, predicted_revenue)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    campaign_id,
+                    event_id,
+                    "v2_recovery",
+                    "email",
+                    "recovery",
+                    copy_result.get("subject_line", f"{event.get('name', 'Event')} — limited availability"),
+                    copy_result.get("preview_text", ""),
+                    copy_result.get("body_html", "<p>Draft pending copy generation.</p>"),
+                    copy_result.get("cta_text", "Get Tickets"),
+                    f"https://www.eventbrite.com/e/{constituent_event_ids[0] if constituent_event_ids else event_id}",
+                    segment_description,
+                    segment_sql,
+                    audience_count,
+                    "draft",
+                    "pace_recovery",
+                    round(intervention.confidence, 2),
+                    intervention.rationale,
+                    EMAIL_OPEN_RATE,
+                    EMAIL_CLICK_RATE,
+                    round(expected_revenue, 2),
+                ),
+            )
+            self.db.conn.commit()
+        except Exception as e:
+            log.error(f"Failed to save grouped campaign draft: {e}")
+            raise
+
+        return {
+            "campaign_draft_id": campaign_id,
+            "event_id": event_id,
+            "event_name": event.get("name", ""),
+            "status": "draft",
+            "audience_count": audience_count,
+            "segment_description": segment_description,
+            "constituent_event_ids": constituent_event_ids,
+            "conversion_assumptions": {
+                "email_open_rate": EMAIL_OPEN_RATE,
+                "email_click_rate": EMAIL_CLICK_RATE,
+                "email_conversion_rate": EMAIL_CONVERSION_RATE,
+                "champion_multiplier": CHAMPION_MULTIPLIER,
+                "expected_opens": conversions["expected_opens"],
+                "expected_clicks": conversions["expected_clicks"],
+                "expected_tickets": conversions["expected_tickets"],
+                "expected_revenue": round(expected_revenue, 2),
+            },
+            "copy_source": copy_result.get("source", "template"),
+            "subject_line": copy_result.get("subject_line", ""),
+        }
+
+    def _build_audience_grouped(
+        self, constituent_event_ids: List[str], event: dict
+    ) -> Dict[str, Any]:
+        """Build audience excluding buyers from ALL constituent event slots."""
+        city = event.get("city", "")
+        event_type = event.get("event_type", "")
+
+        # Collect buyers across ALL constituent slots
+        buyer_set: set = set()
+        for eid in constituent_event_ids:
+            buyer_set.update(self.db.get_event_buyers(eid))
+
+        # Suppression check — fail-closed invariant
+        supp_status, supp_details, suppressed = (
+            self.suppression_guard.get_suppressions_if_valid()
+        )
+        if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
+            raise ValueError(
+                f"Suppression check failed ({supp_status.value}): "
+                f"{supp_details.get('reason', 'unknown')}. "
+                "Campaign draft blocked to prevent sending to unsubscribed contacts."
+            )
+
+        exclude = buyer_set | suppressed
+
+        emails: set = set()
+        description_parts = []
+
+        # Past attendees (use first constituent for lookup)
+        try:
+            first_eid = constituent_event_ids[0] if constituent_event_ids else ""
+            past = self.db.get_past_attendees_not_purchased(
+                first_eid, event.get("name", ""),
+                limit=50000,
+                current_buyer_emails=list(buyer_set),
+            )
+            past_emails = {c["email"] for c in past if c.get("email") not in exclude}
+            emails.update(past_emails)
+            description_parts.append(f"{len(past_emails)} past attendees")
+        except Exception as e:
+            log.warning(f"Past attendees lookup failed: {e}")
+
+        # City prospects
+        try:
+            if city:
+                city_prospects = self.db.get_city_prospects(
+                    city, exclude_emails=list(exclude | emails), limit=50000
+                )
+                city_emails = {c["email"] for c in city_prospects if c.get("email")}
+                emails.update(city_emails)
+                description_parts.append(f"{len(city_emails)} {city} prospects")
+        except Exception as e:
+            log.warning(f"City prospects lookup failed: {e}")
+
+        description = (
+            "Recovery audience: " + ", ".join(description_parts)
+            if description_parts
+            else "No audience segments available"
+        )
+
+        ids_str = ", ".join(f"'{eid}'" for eid in constituent_event_ids)
+        cty = city.replace("'", "''")
+        etype = event_type.replace("'", "''")
+        sql = f"""
+            SELECT DISTINCT c.email FROM customers c
+            WHERE (c.favorite_city = '{cty}' OR c.event_types LIKE '%{etype}%')
+            AND c.email NOT IN (SELECT email FROM orders WHERE event_id IN ({ids_str}))
+            AND c.email NOT IN (SELECT email FROM suppressions)
+        """
+
+        return {
+            "emails": list(emails),
+            "description": description,
+            "sql": sql.strip(),
+        }
+
     def _build_audience(self, event_id: str, event: dict) -> Dict[str, Any]:
         """Identify the most defensible audience, excluding current buyers and suppressions."""
         city = event.get("city", "")
