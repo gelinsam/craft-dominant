@@ -1193,6 +1193,9 @@ class PostgresV2StateRepository(V2StateRepository):
                 # Convert timestamp strings to datetimes for TIMESTAMPTZ columns
                 if col in ("acknowledged_at", "last_full_refresh_at", "last_mutation_at"):
                     val = self._to_utc(val)
+                # Convert int (0/1) to bool for Postgres BOOLEAN column
+                if col == "empty_acknowledged":
+                    val = bool(val)
                 vals.append(val)
                 set_parts.append(f"{col} = EXCLUDED.{col}")
 
