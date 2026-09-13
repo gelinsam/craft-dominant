@@ -687,6 +687,7 @@ class TestExecutionAdapter(unittest.TestCase):
     def setUp(self):
         from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         self.db = FakeExecutionDB()
         self.store = InterventionStore(self.db)
@@ -696,7 +697,8 @@ class TestExecutionAdapter(unittest.TestCase):
         self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
         self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
 
-        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+        self.v2_repo = SQLiteV2StateRepository(self.db)
+        self.adapter = ExecutionAdapter(self.db, self.v2_repo, campaign_engine=None)
 
         # Seed event
         event_date = (date.today() + timedelta(days=30)).isoformat()
@@ -864,13 +866,15 @@ class TestMeasurement(unittest.TestCase):
     def setUp(self):
         from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         self.db = FakeExecutionDB()
         self.store = InterventionStore(self.db)
         self.audit = AuditLogger(self.db)
         self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
         self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
-        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+        self.v2_repo = SQLiteV2StateRepository(self.db)
+        self.adapter = ExecutionAdapter(self.db, self.v2_repo, campaign_engine=None)
 
         # Seed event
         event_date = (date.today() + timedelta(days=30)).isoformat()
@@ -1028,13 +1032,15 @@ class TestAttributionWindowRegression(unittest.TestCase):
     def setUp(self):
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         self.db = FakeExecutionDB()
         self.store = InterventionStore(self.db)
         self.audit = AuditLogger(self.db)
         self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
         self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
-        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+        self.v2_repo = SQLiteV2StateRepository(self.db)
+        self.adapter = ExecutionAdapter(self.db, self.v2_repo, campaign_engine=None)
 
         from datetime import datetime, timezone, timedelta as td
 
@@ -1152,13 +1158,15 @@ class TestLearningRecord(unittest.TestCase):
     def setUp(self):
         from intervention_model import AuditLogger, LearningStore, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         self.db = FakeExecutionDB()
         self.store = InterventionStore(self.db)
         self.audit = AuditLogger(self.db)
         self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
         self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
-        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+        self.v2_repo = SQLiteV2StateRepository(self.db)
+        self.adapter = ExecutionAdapter(self.db, self.v2_repo, campaign_engine=None)
 
         # Seed event
         event_date = (date.today() + timedelta(days=30)).isoformat()
@@ -1232,13 +1240,15 @@ class TestCampaignSendsPersistence(unittest.TestCase):
     def setUp(self):
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         self.db = FakeExecutionDB()
         self.store = InterventionStore(self.db)
         self.audit = AuditLogger(self.db)
         self.db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
         self.db.conn.executescript(LEARNING_RECORD_SCHEMA)
-        self.adapter = ExecutionAdapter(self.db, self.store, self.audit, campaign_engine=None)
+        self.v2_repo = SQLiteV2StateRepository(self.db)
+        self.adapter = ExecutionAdapter(self.db, self.v2_repo, campaign_engine=None)
 
     def test_record_sends_persists_emails(self):
         emails = ["a@test.com", "b@test.com", "c@test.com"]
@@ -1447,6 +1457,7 @@ class TestNoExternalHTTPByDefault(unittest.TestCase):
         """Without V2_ENABLE_EXTERNAL_SEND, execute() returns dry-run, never calls Mailchimp."""
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         db = FakeExecutionDB()
         store = InterventionStore(db)
@@ -1476,7 +1487,8 @@ class TestNoExternalHTTPByDefault(unittest.TestCase):
         db.conn.commit()
         _seed_valid_suppression_sentinel(db, row_count=1)
 
-        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        v2_repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, v2_repo, campaign_engine=None)
 
         i = Intervention(
             id="test-intv",
@@ -1758,6 +1770,7 @@ class TestSuppressionGuard(unittest.TestCase):
         """ExecutionAdapter.execute must block when suppression state is invalid."""
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         db = FakeExecutionDB()
         store = InterventionStore(db)
@@ -1778,7 +1791,8 @@ class TestSuppressionGuard(unittest.TestCase):
         db.conn.commit()
         # No sentinel → NEVER_SYNCED
 
-        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        v2_repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, v2_repo, campaign_engine=None)
         i = Intervention(
             id="intv1", opportunity_id="opp1", event_id="evt1",
             intervention_type="crm_campaign", status=InterventionStatus.NEW,
@@ -1801,6 +1815,7 @@ class TestSuppressionGuard(unittest.TestCase):
         """Blocked execution must write an audit log entry."""
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         db = FakeExecutionDB()
         store = InterventionStore(db)
@@ -1821,7 +1836,8 @@ class TestSuppressionGuard(unittest.TestCase):
         db.conn.commit()
         # No sentinel → blocked
 
-        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        v2_repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, v2_repo, campaign_engine=None)
         i = Intervention(
             id="intv-audit", opportunity_id="opp1", event_id="evt1",
             intervention_type="crm_campaign", status=InterventionStatus.NEW,
@@ -1852,6 +1868,7 @@ class TestSuppressionGuard(unittest.TestCase):
         """
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         db = FakeExecutionDB()
         store = InterventionStore(db)
@@ -1872,7 +1889,8 @@ class TestSuppressionGuard(unittest.TestCase):
         db.conn.commit()
         # No sentinel → blocked before any HTTP could happen
 
-        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        v2_repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, v2_repo, campaign_engine=None)
         i = Intervention(
             id="intv-nohttp", opportunity_id="opp1", event_id="evt1",
             intervention_type="crm_campaign", status=InterventionStatus.NEW,
@@ -2130,6 +2148,7 @@ class TestSuppressionGuard(unittest.TestCase):
         engine.db = db
         engine._claude = None
         engine._mailchimp = None
+        engine._v2_repo = None
 
         # Process unsubscribe webhook
         result = engine.process_mailchimp_webhook({
@@ -2155,6 +2174,7 @@ class TestSuppressionGuard(unittest.TestCase):
         engine.db = db
         engine._claude = None
         engine._mailchimp = None
+        engine._v2_repo = None
 
         result = engine.process_mailchimp_webhook({
             'type': 'cleaned',
@@ -2178,6 +2198,7 @@ class TestSuppressionGuard(unittest.TestCase):
         engine.db = db
         engine._claude = None
         engine._mailchimp = None
+        engine._v2_repo = None
 
         result = engine.process_mailchimp_webhook({
             'type': 'campaign',
@@ -2224,6 +2245,7 @@ class TestSuppressionGuard(unittest.TestCase):
         """Execution blocked by COUNT_MISMATCH must include count details in audit."""
         from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
         from execution_adapter import ExecutionAdapter
+        from v2_state_repository import SQLiteV2StateRepository
 
         db = FakeExecutionDB()
         store = InterventionStore(db)
@@ -2246,7 +2268,8 @@ class TestSuppressionGuard(unittest.TestCase):
         db.conn.commit()
         _seed_valid_suppression_sentinel(db, row_count=3)  # mismatch: 3 vs 1
 
-        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        v2_repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, v2_repo, campaign_engine=None)
         i = Intervention(
             id="intv-cm", opportunity_id="opp1", event_id="evt1",
             intervention_type="crm_campaign", status=InterventionStatus.NEW,

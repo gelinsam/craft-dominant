@@ -609,9 +609,10 @@ class CraftCampaignEngine:
     queues for approval → sends via SendGrid → tracks performance → learns.
     """
 
-    def __init__(self, db, decision_engine=None):
+    def __init__(self, db, decision_engine=None, v2_repo=None):
         self.db = db
         self.decision_engine = decision_engine  # The existing DecisionEngine from craft_unified
+        self._v2_repo = v2_repo
         self._init_schema()
 
         # Initialize clients from env vars
@@ -1244,7 +1245,7 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         # Update suppression sentinel AFTER successful commit
         if suppression_written:
             try:
-                guard = SuppressionGuard(self.db)
+                guard = SuppressionGuard(self.db, v2_repo=self._v2_repo)
                 guard.record_mutation(source=f"webhook_{event_type}")
             except Exception as e:
                 log.error(f"Failed to update suppression sentinel after webhook: {e}")

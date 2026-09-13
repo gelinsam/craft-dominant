@@ -33,17 +33,18 @@ class CampaignDraftAdapter:
     The draft is saved locally for human review and approval.
     """
 
-    def __init__(self, db, campaign_engine=None):
+    def __init__(self, db, campaign_engine=None, v2_repo=None):
         """
         Args:
             db: Database instance (craft_unified.Database or compatible).
             campaign_engine: Optional CraftCampaignEngine.  Used for Claude-powered
                              copy generation if available; falls back to template
                              copy if not.
+            v2_repo: Optional V2StateRepository for sentinel routing.
         """
         self.db = db
         self.campaign_engine = campaign_engine
-        self.suppression_guard = SuppressionGuard(db)
+        self.suppression_guard = SuppressionGuard(db, v2_repo=v2_repo)
 
     def prepare_draft(
         self,

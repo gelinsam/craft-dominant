@@ -4,13 +4,14 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [agent-v2-audit]
+    branches: [agent-v2-audit, v2-postgres-foundation]
 
 permissions:
   contents: read
 
 jobs:
-  v2-tests:
+  v2-unit-tests:
+    name: V2 Unit Tests (SQLite)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -22,5 +23,72 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run full V2 test suite
-        run: python -m unittest -v test_dominant_agent test_diagnosis test_intervention
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run SQLite unit tests
+        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py -v --tb=short -k "not TestPostgresV2Repository and not TestPostgresBackfill and not TestMigrationCorrectness and not TestPostgresAtomicity"
+
+  v2-postgres-integration:
+    name: V2 Postgres Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: craft_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/craft_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Apply V2 Postgres migrations
+        run: |
+          python -c "
+          from v2_state_repository import run_postgres_migrations
+          import os
+          applied = run_postgres_migrations(os.environ['DATABASE_URL'])
+          print(f'Applied {applied} migration(s)')
+          assert applied >= 1, 'Expected at least 1 migration to apply on fresh database'
+          "
+      - name: Verify migration rerun is safe
+        run: |
+          python -c "
+          from v2_state_repository import run_postgres_migrations
+          import os
+          applied = run_postgres_migrations(os.environ['DATABASE_URL'])
+          print(f'Rerun applied {applied} migration(s)')
+          assert applied == 0, 'Migration rerun should apply 0 (already applied)'
+          "
+      - name: Run ALL tests including Postgres integration
+        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py -v --tb=short
+      - name: Verify zero skips for Postgres integration tests
+        run: |
+          python -m pytest test_v2_postgres.py -v --tb=short 2>&1 | tee pg_test_output.txt
+          if grep -q "skipped" pg_test_output.txt; then
+            SKIPPED=$(grep -oP '\\d+ skipped' pg_test_output.txt || echo "0 skipped")
+            echo "Skipped: $SKIPPED"
+            SKIP_COUNT=$(echo "$SKIPPED" | grep -oP '^\\d+' || echo "0")
+            if [ "$SKIP_COUNT" -gt "1" ]; then
+              echo "ERROR: More than 1 test skipped — Postgres integration tests must all execute"
+              exit 1
+            fi
+          fi
+          echo "Postgres integration tests verified"

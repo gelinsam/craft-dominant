@@ -23,12 +23,11 @@ from diagnosis_engine import DiagnosisEngine
 from dominant_agent import OpportunityEngine
 from execution_adapter import ExecutionAdapter
 from intervention_model import (
-    AuditLogger,
     IllegalTransition,
     Intervention,
     InterventionStatus,
-    InterventionStore,
 )
+from v2_backend import init_v2_backend
 
 log = logging.getLogger("craft.v2")
 
@@ -63,18 +62,19 @@ def _build_app():
     decision_engine = DecisionEngine(db)
     opportunity_engine = OpportunityEngine(db, decision_engine)
     diagnosis_engine = DiagnosisEngine(db, decision_engine)
-    intervention_store = InterventionStore(db)
-    audit_logger = AuditLogger(db)
-    campaign_adapter = CampaignDraftAdapter(db)
+    # V2 State Repository — backend selected by DATABASE_URL presence
+    v2_repo = init_v2_backend(db)
+
+    campaign_adapter = CampaignDraftAdapter(db, v2_repo=v2_repo)
     # Wire up CraftCampaignEngine for Mailchimp sends if available
     _campaign_engine = None
     try:
         from craft_engine import CraftCampaignEngine
         if os.environ.get("MAILCHIMP_API_KEY") and os.environ.get("MAILCHIMP_AUDIENCE_ID"):
-            _campaign_engine = CraftCampaignEngine(db)
+            _campaign_engine = CraftCampaignEngine(db, v2_repo=v2_repo)
     except Exception:
         pass
-    execution_adapter = ExecutionAdapter(db, intervention_store, audit_logger, _campaign_engine)
+    execution_adapter = ExecutionAdapter(db, v2_repo, _campaign_engine)
 
     def require_command_auth(fn):
         """Protect V2 business intelligence with a server-side bearer token."""
@@ -178,7 +178,7 @@ def _build_app():
     @require_command_auth
     def list_interventions():
         include_terminal = request.args.get("include_terminal", "false").lower() == "true"
-        items = intervention_store.list_all(include_terminal=include_terminal)
+        items = v2_repo.list_interventions(include_terminal=include_terminal)
         return jsonify({
             "count": len(items),
             "interventions": [i.to_dict() for i in items],
@@ -187,7 +187,7 @@ def _build_app():
     @app.get("/api/v2/interventions/<intervention_id>")
     @require_command_auth
     def get_intervention(intervention_id: str):
-        item = intervention_store.get(intervention_id)
+        item = v2_repo.get_intervention(intervention_id)
         if not item:
             return jsonify({"error": "intervention_not_found"}), 404
         return jsonify(item.to_dict())
@@ -222,7 +222,7 @@ def _build_app():
         )
 
         # Check if intervention already exists for this opportunity
-        existing = intervention_store.get_by_opportunity(opportunity_id)
+        existing = v2_repo.get_interventions_by_opportunity(opportunity_id)
         active_existing = [i for i in existing if not i.is_terminal]
         if active_existing:
             return jsonify({
@@ -326,9 +326,8 @@ def _build_app():
                 # Don't fail the whole prepare — the intervention is still useful
                 intervention.evidence["campaign_draft_error"] = str(e)
 
-        intervention_store.save(intervention)
-
-        audit_logger.log(
+        v2_repo.save_intervention_with_audit(
+            intervention,
             intervention.id, event_id,
             action="prepared",
             from_status="new",
@@ -363,7 +362,7 @@ def _build_app():
     @require_command_auth
     def approve_intervention(intervention_id: str):
         """Approve a proposed intervention. Does NOT trigger execution."""
-        item = intervention_store.get(intervention_id)
+        item = v2_repo.get_intervention(intervention_id)
         if not item:
             return jsonify({"error": "intervention_not_found"}), 404
 
@@ -371,7 +370,7 @@ def _build_app():
         try:
             item.transition_to(InterventionStatus.APPROVED)
         except IllegalTransition as e:
-            audit_logger.log(
+            v2_repo.append_audit(
                 intervention_id, item.event_id,
                 action="approve_rejected",
                 from_status=from_status,
@@ -380,8 +379,8 @@ def _build_app():
             )
             return jsonify({"error": "illegal_transition", "message": str(e)}), 409
 
-        intervention_store.save(item)
-        audit_logger.log(
+        v2_repo.save_intervention_with_audit(
+            item,
             intervention_id, item.event_id,
             action="approved",
             from_status=from_status,
@@ -394,7 +393,7 @@ def _build_app():
     @require_command_auth
     def reject_intervention(intervention_id: str):
         """Reject a proposed intervention."""
-        item = intervention_store.get(intervention_id)
+        item = v2_repo.get_intervention(intervention_id)
         if not item:
             return jsonify({"error": "intervention_not_found"}), 404
 
@@ -402,7 +401,7 @@ def _build_app():
         try:
             item.transition_to(InterventionStatus.REJECTED)
         except IllegalTransition as e:
-            audit_logger.log(
+            v2_repo.append_audit(
                 intervention_id, item.event_id,
                 action="reject_rejected",
                 from_status=from_status,
@@ -411,8 +410,8 @@ def _build_app():
             )
             return jsonify({"error": "illegal_transition", "message": str(e)}), 409
 
-        intervention_store.save(item)
-        audit_logger.log(
+        v2_repo.save_intervention_with_audit(
+            item,
             intervention_id, item.event_id,
             action="rejected",
             from_status=from_status,
@@ -482,11 +481,11 @@ def _build_app():
     @require_command_auth
     def intervention_audit_log(intervention_id: str):
         """Return the full audit trail for an intervention."""
-        item = intervention_store.get(intervention_id)
+        item = v2_repo.get_intervention(intervention_id)
         if not item:
             return jsonify({"error": "intervention_not_found"}), 404
 
-        entries = audit_logger.get_log(intervention_id)
+        entries = v2_repo.get_audit_log(intervention_id)
         return jsonify({
             "intervention_id": intervention_id,
             "count": len(entries),
@@ -527,7 +526,7 @@ def _build_app():
                 "message": str(e),
             }), 500
 
-        guard = SuppressionGuard(db)
+        guard = SuppressionGuard(db, v2_repo=v2_repo)
         result = guard.refresh_from_mailchimp(mc_client)
 
         if "error" in result:
@@ -552,13 +551,21 @@ def _build_app():
     def v2_health():
         try:
             db.conn.execute("SELECT 1").fetchone()
-            return jsonify({
-                "status": "ok",
-                "command_configured": bool(os.environ.get("COMMAND_API_KEY")),
-                "db_path_configured": bool(os.environ.get("DB_PATH")),
-            })
+            analytics_ok = True
         except Exception:
-            return jsonify({"status": "degraded"}), 503
+            analytics_ok = False
+
+        v2_health_info = v2_repo.health_check()
+
+        overall = "ok" if analytics_ok and v2_health_info.get("status") == "ok" else "degraded"
+        result = {
+            "status": overall,
+            "command_configured": bool(os.environ.get("COMMAND_API_KEY")),
+            "db_path_configured": bool(os.environ.get("DB_PATH")),
+            "analytics_backend": "ok" if analytics_ok else "degraded",
+            "v2_state_backend": v2_health_info,
+        }
+        return jsonify(result), 200 if overall == "ok" else 503
 
     return app
 
