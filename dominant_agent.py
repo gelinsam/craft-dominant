@@ -89,6 +89,77 @@ class OpportunityEngine:
         revenue = self._num(row["revenue"])
         return revenue / tickets if tickets > 0 else 0.0
 
+    @staticmethod
+    def _has_history(pacing) -> bool:
+        """True only when pacing has real historical comparison data."""
+        median = OpportunityEngine._num(
+            getattr(pacing, "historical_median_at_point", 0)
+        )
+        comparisons = getattr(pacing, "comparison_events", []) or []
+        return median > 0 and len(comparisons) > 0
+
+    def _classify_event(self, event_id: str) -> Dict[str, Any]:
+        """Return a diagnostic classification explaining why an event does
+        or does not produce an opportunity.
+
+        Classifications:
+          opportunity      — behind pace with material recovery value
+          on_pace          — has history, within or ahead of historical pace
+          no_history       — no usable historical comparisons
+          no_ticket_price  — average ticket price is zero or negative
+          below_materiality — behind pace but recovery below MIN_MODELED_VALUE
+          analysis_error   — DecisionEngine could not analyze
+          event_not_found  — event_id not in database
+        """
+        event_row = self.db.get_event(event_id)
+        if not event_row:
+            return {"classification": "event_not_found",
+                    "detail": "Event not in database"}
+        try:
+            pacing = self.decision_engine.analyze_event(event_id)
+        except Exception:
+            return {"classification": "analysis_error",
+                    "detail": "DecisionEngine raised an exception"}
+        if not pacing:
+            return {"classification": "analysis_error",
+                    "detail": "No pacing data returned"}
+
+        avg_price = self._avg_ticket_price(event_id)
+        if avg_price <= 0:
+            return {"classification": "no_ticket_price",
+                    "detail": "Average ticket price is zero or negative"}
+
+        comparisons = getattr(pacing, "comparison_events", []) or []
+        median = self._num(getattr(pacing, "historical_median_at_point", 0))
+        has_hist = self._has_history(pacing)
+
+        if not has_hist:
+            return {"classification": "no_history",
+                    "detail": (f"{len(comparisons)} past edition(s) found, "
+                               f"historical median at point = {median}")}
+
+        pace_delta = self._num(getattr(pacing, "pace_vs_historical", 0.0))
+        if pace_delta >= -3.0:
+            return {"classification": "on_pace",
+                    "detail": (f"Pacing {pace_delta:+.1f}% vs historical "
+                               f"median ({len(comparisons)} comparison(s))")}
+
+        # Behind pace — check materiality
+        sold = self._num(getattr(pacing, "tickets_sold", 0))
+        days_until = max(0, int(self._num(getattr(pacing, "days_until", 0))))
+        gap_tickets = max(0, int(median - sold))
+        revenue_at_risk = gap_tickets * avg_price
+        expected_revenue = revenue_at_risk * self._recoverable_share(days_until)
+
+        if expected_revenue < self.MIN_MODELED_VALUE:
+            return {"classification": "below_materiality",
+                    "detail": (f"Expected recovery ${expected_revenue:,.0f} "
+                               f"below ${self.MIN_MODELED_VALUE:,.0f} threshold")}
+
+        return {"classification": "opportunity",
+                "detail": (f"{pace_delta:.1f}% behind, "
+                           f"${revenue_at_risk:,.0f} at risk")}
+
     def evaluate_event(self, event_id: str) -> List[Opportunity]:
         event_row = self.db.get_event(event_id)
         if not event_row:
@@ -101,11 +172,21 @@ class OpportunityEngine:
         if not pacing:
             return []
 
-        # Existing DecisionEngine stores pace_vs_historical as a percentage delta:
-        # -29 means 29% behind median, +57 means 57% ahead.
-        pace_delta = self._num(getattr(pacing, "pace_vs_historical", 0.0))
+        # --- Separated filters (see _classify_event for semantics) ---
         avg_price = self._avg_ticket_price(event_id)
-        if pace_delta >= -3.0 or avg_price <= 0:
+        if avg_price <= 0:
+            return []
+
+        # Distinguish "no historical data" from "on pace".
+        # Without history, pace_vs_historical defaults to 0, which is
+        # semantically "unknown" — NOT "on pace".  The old compound
+        # filter (pace_delta >= -3.0 or avg_price <= 0) conflated the
+        # two cases, silently treating every first-year event as healthy.
+        if not self._has_history(pacing):
+            return []
+
+        pace_delta = self._num(getattr(pacing, "pace_vs_historical", 0.0))
+        if pace_delta >= -3.0:
             return []
 
         sold = self._num(getattr(pacing, "tickets_sold", 0))
@@ -161,7 +242,50 @@ class OpportunityEngine:
         return [item.to_dict() for item in items]
 
     def command_summary(self) -> Dict[str, Any]:
+        events = self.db.get_events(upcoming_only=True)
         items = self.evaluate_all()
+
+        # --- Data quality diagnostics ---
+        classifications = {}
+        event_details = []
+        for event in events:
+            cls = self._classify_event(event["event_id"])
+            tag = cls["classification"]
+            classifications[tag] = classifications.get(tag, 0) + 1
+            event_details.append({
+                "event_id": event["event_id"],
+                "event_name": event.get("name", ""),
+                "classification": tag,
+                "detail": cls["detail"],
+            })
+
+        total = len(events)
+        no_history = classifications.get("no_history", 0)
+        no_price = classifications.get("no_ticket_price", 0)
+        errors = classifications.get("analysis_error", 0)
+        with_history = total - no_history - no_price - errors - classifications.get("event_not_found", 0)
+
+        warnings = []
+        if no_history > 0:
+            warnings.append(
+                f"{no_history} of {total} events have no historical comparison "
+                f"data — opportunity detection requires at least one prior edition"
+            )
+        if no_price > 0:
+            warnings.append(f"{no_price} event(s) have no ticket price data")
+        if errors > 0:
+            warnings.append(f"{errors} event(s) failed analysis")
+
+        # Zero is trustworthy ONLY when every event had history and
+        # none were filtered for data-availability reasons.
+        zero_is_trustworthy = (
+            len(items) == 0
+            and total > 0
+            and no_history == 0
+            and no_price == 0
+            and errors == 0
+        )
+
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "opportunity_count": len(items),
@@ -170,4 +294,14 @@ class OpportunityEngine:
             "net_opportunity": round(sum(i["expected_net_value"] for i in items), 2),
             "confidence_weighted_net": round(sum(i["expected_net_value"] * i["confidence"] for i in items), 2),
             "opportunities": items,
+            "data_quality": {
+                "events_evaluated": total,
+                "events_with_history": with_history,
+                "events_without_history": no_history,
+                "coverage_pct": round(with_history / total * 100, 1) if total > 0 else 0,
+                "classifications": classifications,
+                "event_details": event_details,
+                "zero_is_trustworthy": zero_is_trustworthy,
+                "warnings": warnings,
+            },
         }
