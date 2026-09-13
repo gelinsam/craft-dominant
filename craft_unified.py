@@ -8,6 +8,7 @@ import hashlib
 import logging
 import statistics
 import re
+import threading
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
@@ -154,6 +155,8 @@ class EventPacing:
     historical_comparisons: List[dict] = field(default_factory=list)
     # For timed-entry groups: the real DB event_ids that make up this grouped event
     constituent_event_ids: List[str] = field(default_factory=list)
+    # Spend data status: current_has_spend, current_zero_spend, stale, no_records, unavailable
+    spend_status: str = "unknown"
 # =============================================================================
 # DATABASE - UNIFIED SCHEMA
 # =============================================================================
@@ -339,10 +342,11 @@ class Database:
     """Unified database for all Craft data."""
     def __init__(self, path: str = "craft_unified.db"):
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA busy_timeout = 30000")  # 30s retry on lock
         self._init_schema()
     def _init_schema(self):
         self.conn.executescript(UNIFIED_SCHEMA)
@@ -1160,6 +1164,54 @@ class Database:
                 (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks))
+    def save_ad_spend_batch(self, rows: list):
+        """Write many ad_spend rows in a single transaction.
+
+        Each row is a tuple: (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks).
+        Avoids holding the write lock across remote API calls.
+        """
+        if not rows:
+            return
+        with self.transaction() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO ad_spend
+                (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+    def get_spend_status(self, event_id: str) -> str:
+        """Determine the spend data status for an event.
+
+        Returns one of:
+            'current_has_spend'  - recent spend data exists with spend > 0
+            'current_zero_spend' - recent data exists but spend is $0
+            'stale'              - data exists but latest spend_date is old
+            'no_records'         - no ad_spend rows for this event
+            'unavailable'        - ad_spend table doesn't exist or query failed
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT MAX(spend_date) as latest_date, "
+                "       SUM(spend) as total_spend, "
+                "       COUNT(*) as cnt "
+                "FROM ad_spend WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if not row or int(row["cnt"]) == 0:
+                return "no_records"
+            latest_date_str = row["latest_date"]
+            if not latest_date_str:
+                return "no_records"
+            try:
+                latest_date = date.fromisoformat(str(latest_date_str))
+            except (ValueError, TypeError):
+                return "stale"
+            days_since = (date.today() - latest_date).days
+            if days_since > 3:
+                return "stale"
+            total = float(row["total_spend"] or 0)
+            return "current_has_spend" if total > 0 else "current_zero_spend"
+        except Exception:
+            return "unavailable"
     def get_event_spend(self, event_id: str) -> float:
         row = self.conn.execute(
             "SELECT COALESCE(SUM(spend), 0) as total FROM ad_spend WHERE event_id = ?",
@@ -2017,6 +2069,12 @@ class MetaAdsSync:
                     time.sleep(2 ** attempt)
         return None
 
+    @staticmethod
+    def _extract_year(text: str) -> Optional[int]:
+        """Extract a 4-digit year (2020-2039) from text, or None."""
+        m = re.search(r'\b(20[2-3]\d)\b', text)
+        return int(m.group(1)) if m else None
+
     def _clean_event_name(self, event_name: str) -> str:
         """Strip year, season, edition from event name and return lowercase cleaned version."""
         cleaned = re.sub(r'\b20\d{2}\b', '', event_name)
@@ -2037,54 +2095,82 @@ class MetaAdsSync:
                     break
         return abbrevs
 
-    def _campaign_matches_event(self, campaign_name: str, event_name: str) -> Optional[str]:
+    def _campaign_matches_event(self, campaign_name: str, event_name: str,
+                               event_year: Optional[int] = None) -> Optional[str]:
         """Determine if a Meta campaign belongs to a specific event.
 
         Uses strict matching to avoid cross-event contamination:
         1. Full cleaned event name appears in campaign name
         2. ALL content words from event name appear in campaign name
-        3. A known abbreviation appears as a whole word in campaign name
+        3. A known abbreviation appears as whole word in campaign name
         4. Reverse alias: campaign contains abbreviation that maps to this event
+
+        Year safety rule: if the campaign name contains a 4-digit year, it must
+        match the event's year.  If the campaign has no year but the event does,
+        name-matching proceeds but the caller decides edition preference.
 
         Returns the match reason string, or None if no match.
         """
         cleaned = self._clean_event_name(event_name)
         if not cleaned:
             return None
+
+        # --- Year gate ---
+        campaign_year = self._extract_year(campaign_name)
+        if campaign_year is not None and event_year is not None:
+            if campaign_year != event_year:
+                return None  # Hard reject: explicit year mismatch
+
         cname = campaign_name.lower()
         cname_clean = re.sub(r'[^\w\s]', '', cname)
 
+        match_reason = None
+
         # Strategy 1: Full cleaned name is substring of campaign name
         if cleaned in cname_clean:
-            return f"full name '{cleaned}'"
+            match_reason = f"full name '{cleaned}'"
 
         # Strategy 2: ALL content words present in campaign name
-        skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an', 'festival', 'fest'}
-        content_words = [w for w in cleaned.split() if w not in skip_words]
-        if len(content_words) >= 2:
-            cname_words_set = set(cname_clean.split())
-            if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
-                return f"all content words {content_words}"
+        if not match_reason:
+            skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an', 'festival', 'fest'}
+            content_words = [w for w in cleaned.split() if w not in skip_words]
+            if len(content_words) >= 2:
+                cname_words_set = set(cname_clean.split())
+                if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
+                    match_reason = f"all content words {content_words}"
 
         # Strategy 3: Known abbreviation appears as whole word in campaign
-        abbrevs = self._get_abbreviations(event_name)
-        cname_words = set(cname_clean.split())
-        for abbr in abbrevs:
-            if abbr in cname_words:
-                return f"abbreviation '{abbr}'"
+        if not match_reason:
+            abbrevs = self._get_abbreviations(event_name)
+            cname_words = set(cname_clean.split())
+            for abbr in abbrevs:
+                if abbr in cname_words:
+                    match_reason = f"abbreviation '{abbr}'"
+                    break
 
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
-        event_lower = event_name.lower()
-        for word in cname_words:
-            if word in self.EVENT_ALIASES:
-                for pattern in self.EVENT_ALIASES[word]:
-                    if pattern in event_lower or event_lower in pattern:
-                        return f"reverse alias '{word}'->'{pattern}'"
+        if not match_reason:
+            event_lower = event_name.lower()
+            cname_words = set(re.sub(r'[^\w\s]', '', cname).split())
+            for word in cname_words:
+                if word in self.EVENT_ALIASES:
+                    for pattern in self.EVENT_ALIASES[word]:
+                        if pattern in event_lower or event_lower in pattern:
+                            match_reason = f"reverse alias '{word}'->'{pattern}'"
+                            break
+                if match_reason:
+                    break
 
-        return None
+        return match_reason
 
-    def _find_campaigns(self, event_name: str):
-        """Find Meta campaigns matching an event name using strict matching."""
+    def _find_campaigns(self, event_name: str, event_year: Optional[int] = None):
+        """Find Meta campaigns matching an event name using strict matching.
+
+        Args:
+            event_name: The event name to match against.
+            event_year: The event's year (from event_date). Campaigns with an
+                        explicit year that differs are rejected.
+        """
         cleaned = self._clean_event_name(event_name)
         if not cleaned:
             return []
@@ -2099,10 +2185,12 @@ class MetaAdsSync:
             for campaign in data.get('data', []):
                 if campaign['id'] in seen_ids:
                     continue
-                match_reason = self._campaign_matches_event(campaign['name'], event_name)
+                match_reason = self._campaign_matches_event(
+                    campaign['name'], event_name, event_year=event_year)
                 if match_reason:
                     matched.append({'id': campaign['id'], 'name': campaign['name'],
-                                    'status': campaign.get('status')})
+                                    'status': campaign.get('status'),
+                                    'match_reason': match_reason})
                     seen_ids.add(campaign['id'])
                     log.info(f"  Matched campaign '{campaign['name']}' via {match_reason}")
             paging = data.get('paging', {})
@@ -2112,8 +2200,73 @@ class MetaAdsSync:
                 params = {}
             else:
                 break
-        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}'")
+        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}' (year={event_year})")
         return matched
+
+    def _fetch_all_campaigns(self):
+        """Fetch all campaigns from the Meta account (single API pagination series).
+
+        Returns a list of raw campaign dicts with id, name, status, objective.
+        Used by sync_all_events() to avoid re-fetching per event.
+        """
+        url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
+        params = {'fields': 'id,name,status,objective', 'limit': 200}
+        all_campaigns = []
+        seen_ids = set()
+        while url:
+            data = self._api_get(url, params)
+            if not data:
+                break
+            for campaign in data.get('data', []):
+                if campaign['id'] not in seen_ids:
+                    all_campaigns.append(campaign)
+                    seen_ids.add(campaign['id'])
+            paging = data.get('paging', {})
+            next_url = paging.get('next')
+            if next_url:
+                url = next_url
+                params = {}
+            else:
+                break
+        log.info(f"Fetched {len(all_campaigns)} total campaigns from Meta account")
+        return all_campaigns
+
+    @staticmethod
+    def _pick_closest_event(events, today):
+        """Given multiple tied events, pick the one closest to today.
+
+        Preference order:
+          1. Upcoming events (event_date >= today), nearest first
+          2. Past events, most recent first
+        If two events share the exact same date, returns None (truly ambiguous).
+        """
+        upcoming = []
+        past = []
+        for e in events:
+            try:
+                ed = datetime.fromisoformat(e['event_date']).date()
+            except Exception:
+                continue
+            if ed >= today:
+                upcoming.append((e, ed))
+            else:
+                past.append((e, ed))
+        # Prefer upcoming, nearest first
+        if upcoming:
+            upcoming.sort(key=lambda x: x[1])
+            if len(upcoming) > 1 and upcoming[0][1] == upcoming[1][1]:
+                return None  # Truly ambiguous — same date
+            return upcoming[0][0]
+        # Fall back to most recent past event
+        if past:
+            past.sort(key=lambda x: x[1], reverse=True)
+            if len(past) > 1 and past[0][1] == past[1][1]:
+                return None  # Truly ambiguous — same date
+            return past[0][0]
+        return None
+
+    # Match-reason strength ranking for dedup conflict resolution
+    _MATCH_RANK = {'full_name': 4, 'content_words': 3, 'abbreviation': 2, 'reverse_alias': 1}
 
     def _fetch_daily_insights(self, campaign_id: str, date_start: str, date_stop: str):
         """Fetch daily spend insights for a campaign."""
@@ -2139,16 +2292,34 @@ class MetaAdsSync:
             else:
                 break
         return insights
-    def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str):
-        """Sync ad spend from Meta for a single event."""
+    def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str,
+                         campaigns_override=None):
+        """Sync ad spend from Meta for a single event.
+
+        All API data is fetched first, then written to the database in a
+        single batch transaction.  This avoids holding the SQLite write lock
+        across remote API calls, which was the root cause of "database is
+        locked" errors in production.
+
+        Args:
+            campaigns_override: If provided (even if empty list), use these
+                pre-assigned campaigns instead of calling _find_campaigns().
+                This is how sync_all_events() enforces one-campaign-one-event.
+        """
         try:
             event_date = datetime.fromisoformat(event_date_str).date()
+            event_year = event_date.year
             today = date.today()
             date_start = (event_date - timedelta(days=300)).isoformat()
             date_stop = min(event_date, today).isoformat()
-            campaigns = self._find_campaigns(event_name)
+            if campaigns_override is not None:
+                campaigns = campaigns_override
+            else:
+                campaigns = self._find_campaigns(event_name, event_year=event_year)
             if not campaigns:
                 return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0, 'days_of_data': 0}
+            # Phase 1: Fetch all data from Meta API (no DB writes)
+            batch_rows = []
             total_spend = 0.0
             total_days = 0
             for campaign in campaigns:
@@ -2158,31 +2329,262 @@ class MetaAdsSync:
                     impressions = int(day_data.get('impressions', 0))
                     clicks = int(day_data.get('clicks', 0))
                     spend_date = day_data.get('date_start', '')
-                    self.db.save_ad_spend(
-                        event_id=event_id, campaign_id=campaign['id'],
-                        campaign_name=campaign['name'], spend_date=spend_date,
-                        spend=spend, impressions=impressions, clicks=clicks
-                    )
+                    batch_rows.append((
+                        event_id, campaign['id'], campaign['name'],
+                        spend_date, spend, impressions, clicks
+                    ))
                     total_spend += spend
                 total_days += len(insights)
-            log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns")
+            # Phase 2: Write all rows in a single transaction
+            self.db.save_ad_spend_batch(batch_rows)
+            log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns, {len(batch_rows)} rows")
             return {'event_id': event_id, 'total_spend': round(total_spend, 2),
-                    'campaigns_found': len(campaigns), 'days_of_data': total_days}
+                    'campaigns_found': len(campaigns), 'days_of_data': total_days,
+                    'rows_written': len(batch_rows)}
         except Exception as e:
             log.error(f"Meta sync error for {event_id}: {e}")
             return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0,
                     'days_of_data': 0, 'error': str(e)}
     def sync_all_events(self, events_list):
-        """Sync Meta ad spend for all events."""
-        results = {'total_events': len(events_list), 'successful': 0, 'total_spend': 0.0, 'event_results': []}
+        """Sync Meta ad spend with one-campaign-one-event attribution.
+
+        Architecture:
+          1. Fetch ALL campaigns from Meta once (single API pagination series).
+          2. For each campaign, match against all events and pick the single
+             best event.  Year gate rejects cross-year mismatches.  Ties are
+             broken by date proximity (upcoming > recent-past).  Truly
+             ambiguous campaigns are skipped and reported.
+          3. Sync each event with only its assigned campaigns.
+
+        This prevents the same campaign's spend from being written under
+        multiple event_ids — the root cause of cross-year double-counting.
+        """
+        import time as _time
+        sync_start = _time.monotonic()
+        today = date.today()
+
+        # --- Phase 1: Fetch all campaigns from Meta ---
+        all_campaigns = self._fetch_all_campaigns()
+
+        # --- Phase 2: Assign each campaign to at most one event ---
+        campaign_assignments = {}   # campaign_id -> {campaign, event, match_reason}
+        ambiguous_campaigns = []    # campaigns that tied and could not be resolved
+
+        for campaign in all_campaigns:
+            best_event = None
+            best_reason = None
+            best_rank = -1
+            tied_events = []
+
+            for event in events_list:
+                event_year = None
+                try:
+                    event_year = datetime.fromisoformat(event['event_date']).date().year
+                except Exception:
+                    pass
+
+                match_reason = self._campaign_matches_event(
+                    campaign['name'], event['name'], event_year=event_year)
+                if not match_reason:
+                    continue
+
+                rank = self._MATCH_RANK.get(match_reason, 0)
+
+                if rank > best_rank:
+                    best_event = event
+                    best_reason = match_reason
+                    best_rank = rank
+                    tied_events = [event]
+                elif rank == best_rank and best_event is not None:
+                    tied_events.append(event)
+
+            if best_event is None:
+                continue  # Campaign matched no event
+
+            if len(tied_events) > 1:
+                # Multiple events tied at the same match strength — resolve by date
+                resolved = self._pick_closest_event(tied_events, today)
+                if resolved is None:
+                    # Truly ambiguous — fail-safe: skip this campaign
+                    ambiguous_campaigns.append({
+                        'campaign_id': campaign['id'],
+                        'campaign_name': campaign['name'],
+                        'tied_events': [e['name'] for e in tied_events],
+                        'match_reason': best_reason,
+                    })
+                    log.warning(
+                        f"AMBIGUOUS: Campaign '{campaign['name']}' matched {len(tied_events)} "
+                        f"events equally ({best_reason}): "
+                        f"{[e['name'] for e in tied_events]} — skipping per fail-safe"
+                    )
+                    continue
+                best_event = resolved
+
+            campaign_assignments[campaign['id']] = {
+                'campaign': campaign,
+                'event': best_event,
+                'match_reason': best_reason,
+            }
+            log.info(
+                f"  Assigned campaign '{campaign['name']}' -> event "
+                f"'{best_event['name']}' via {best_reason}"
+            )
+
+        # --- Phase 3: Group assigned campaigns by event_id ---
+        event_campaigns = {}  # event_id -> [campaign dicts]
+        for cid, assignment in campaign_assignments.items():
+            eid = assignment['event']['event_id']
+            if eid not in event_campaigns:
+                event_campaigns[eid] = []
+            event_campaigns[eid].append({
+                'id': assignment['campaign']['id'],
+                'name': assignment['campaign']['name'],
+                'status': assignment['campaign'].get('status'),
+                'match_reason': assignment['match_reason'],
+            })
+
+        # --- Phase 4: Sync each event with its deduplicated campaigns ---
+        results = {
+            'total_events': len(events_list), 'successful': 0, 'failed': 0,
+            'total_spend': 0.0, 'total_rows': 0,
+            'matched_events': 0, 'unmatched_events': 0,
+            'total_campaigns_fetched': len(all_campaigns),
+            'campaigns_assigned': len(campaign_assignments),
+            'campaigns_ambiguous': len(ambiguous_campaigns),
+            'ambiguous_details': ambiguous_campaigns,
+            'event_results': [],
+        }
+
         for event in events_list:
-            result = self.sync_event_spend(event['event_id'], event['name'], event['event_date'])
+            eid = event['event_id']
+            assigned = event_campaigns.get(eid, [])
+            result = self.sync_event_spend(
+                eid, event['name'], event['event_date'],
+                campaigns_override=assigned
+            )
             results['event_results'].append(result)
             results['total_spend'] += result.get('total_spend', 0)
-            if not result.get('error'):
+            results['total_rows'] += result.get('rows_written', 0)
+            if result.get('error'):
+                results['failed'] += 1
+            else:
                 results['successful'] += 1
-        log.info(f"Meta sync complete: {results['successful']}/{results['total_events']} events, ${results['total_spend']:.2f}")
+                if result.get('campaigns_found', 0) > 0:
+                    results['matched_events'] += 1
+                else:
+                    results['unmatched_events'] += 1
+
+        elapsed = round(_time.monotonic() - sync_start, 1)
+        results['duration_seconds'] = elapsed
+        log.info(
+            f"Meta sync complete: {results['successful']}/{results['total_events']} events, "
+            f"${results['total_spend']:.2f} spend, {results['total_rows']} rows written, "
+            f"{results['matched_events']} matched / {results['unmatched_events']} unmatched, "
+            f"{results['failed']} failed, {elapsed}s elapsed, "
+            f"{results['campaigns_assigned']}/{results['total_campaigns_fetched']} campaigns assigned, "
+            f"{results['campaigns_ambiguous']} ambiguous"
+        )
+        # Post-sync verification: readback totals
+        try:
+            row = self.db.conn.execute(
+                "SELECT COUNT(DISTINCT event_id) as events, COUNT(*) as rows, "
+                "SUM(spend) as total FROM ad_spend"
+            ).fetchone()
+            if row:
+                log.info(
+                    f"Post-sync verification: {row['events']} events with spend data, "
+                    f"{row['rows']} total rows, ${float(row['total'] or 0):.2f} total spend in DB"
+                )
+        except Exception as e:
+            log.warning(f"Post-sync verification query failed: {e}")
         return results
+
+    @staticmethod
+    def reconcile_duplicate_attribution(db: 'Database', dry_run: bool = True) -> dict:
+        """Find campaigns that have spend recorded under multiple event_ids.
+
+        This detects historical double-counting that may have occurred before
+        the year-gate and one-campaign-one-event dedup were added.
+
+        Args:
+            db: Database instance to query.
+            dry_run: If True (default), only report duplicates. If False,
+                     delete the losing rows (keep the most recent event_id).
+
+        Returns:
+            dict with 'duplicates' (list of dicts with campaign_id, campaign_name,
+            event_ids, total_spend_each) and 'rows_deleted' (0 in dry_run mode).
+        """
+        rows = db.conn.execute("""
+            SELECT campaign_id, campaign_name, event_id,
+                   SUM(spend) as total_spend, COUNT(*) as row_count
+            FROM ad_spend
+            GROUP BY campaign_id, event_id
+        """).fetchall()
+
+        # Group by campaign_id
+        by_campaign = {}
+        for r in rows:
+            cid = r['campaign_id']
+            if cid not in by_campaign:
+                by_campaign[cid] = []
+            by_campaign[cid].append({
+                'event_id': r['event_id'],
+                'campaign_name': r['campaign_name'],
+                'total_spend': float(r['total_spend'] or 0),
+                'row_count': r['row_count'],
+            })
+
+        duplicates = []
+        rows_deleted = 0
+        for cid, entries in by_campaign.items():
+            if len(entries) <= 1:
+                continue
+            dup = {
+                'campaign_id': cid,
+                'campaign_name': entries[0]['campaign_name'],
+                'event_ids': [e['event_id'] for e in entries],
+                'spend_per_event': {e['event_id']: e['total_spend'] for e in entries},
+                'total_duplicate_spend': sum(e['total_spend'] for e in entries),
+            }
+            duplicates.append(dup)
+            log.warning(
+                f"DUPLICATE ATTRIBUTION: campaign '{dup['campaign_name']}' ({cid}) "
+                f"has spend under {len(entries)} events: "
+                f"{dup['spend_per_event']}"
+            )
+            if not dry_run:
+                # Keep the entry with the highest spend, delete others
+                entries.sort(key=lambda e: e['total_spend'], reverse=True)
+                keeper = entries[0]['event_id']
+                for entry in entries[1:]:
+                    db.conn.execute(
+                        "DELETE FROM ad_spend WHERE campaign_id = ? AND event_id = ?",
+                        (cid, entry['event_id'])
+                    )
+                    rows_deleted += entry['row_count']
+                    log.info(
+                        f"  Deleted {entry['row_count']} rows for campaign {cid} "
+                        f"under event {entry['event_id']} (kept {keeper})"
+                    )
+                db.conn.commit()
+
+        result = {
+            'duplicates_found': len(duplicates),
+            'duplicates': duplicates,
+            'rows_deleted': rows_deleted,
+            'dry_run': dry_run,
+        }
+        if duplicates:
+            log.warning(
+                f"Reconciliation {'(DRY RUN) ' if dry_run else ''}: "
+                f"{len(duplicates)} campaigns with duplicate attribution, "
+                f"{rows_deleted} rows deleted"
+            )
+        else:
+            log.info("Reconciliation: no duplicate campaign attribution found")
+        return result
+
 # =============================================================================
 # DECISION ENGINE
 # =============================================================================
@@ -2225,9 +2627,11 @@ class DecisionEngine:
         tickets = self.db.get_event_tickets(event_id)
         revenue = self.db.get_event_revenue(event_id)
         spend = self.db.get_event_spend(event_id)
+        spend_status = self.db.get_spend_status(event_id)
         capacity = event.get('capacity', 0)
         sell_through = (tickets / capacity * 100) if capacity > 0 else 0
-        cac = spend / tickets if tickets > 0 else 0
+        # CAC is only meaningful when spend data is current and > 0
+        cac = spend / tickets if tickets > 0 and spend > 0 and spend_status == 'current_has_spend' else 0
         # --- Find all past editions of this event pattern ---
         pattern = self._get_pattern(event['name'])
         all_events = self._get_all_events()
@@ -2306,7 +2710,8 @@ class DecisionEngine:
             confidence = 0.9 if len(projections) >= 3 else 0.75 if len(projections) >= 2 else 0.6
         # --- Decision ---
         decision, urgency, rationale, actions = self._decide(
-            tickets, pace, cac, days_until, hist_median, comparison_events
+            tickets, pace, cac, days_until, hist_median, comparison_events,
+            spend_status=spend_status
         )
         # Targeting
         high_value = len(self.db.get_high_value_customers(
@@ -2331,20 +2736,36 @@ class DecisionEngine:
             rationale=rationale, actions=actions,
             high_value_targets=high_value,
             reactivation_targets=at_risk,
-            historical_comparisons=historical_comparisons
+            historical_comparisons=historical_comparisons,
+            spend_status=spend_status,
         )
     def _decide(self, tickets: int, pace: float, cac: float, days_until: int,
-                hist_median: float, comparison_events: List[str]) -> Tuple[Decision, int, str, List[str]]:
+                hist_median: float, comparison_events: List[str],
+                spend_status: str = "unknown") -> Tuple[Decision, int, str, List[str]]:
         """Make decision based on ticket-count pace vs historical median.
 
         pace = ((current_tickets - median_historical_tickets) / median_historical_tickets) * 100
         hist_median = median ticket count at this days-out point across past editions
+        spend_status: one of 'current_has_spend', 'current_zero_spend', 'stale',
+                      'no_records', 'unavailable', 'unknown'
         """
         target_cac = 12.00
-        cac_ok = cac <= target_cac * 1.5 or cac == 0
+        # CAC is only trustworthy when we have current spend data
+        spend_known = spend_status == 'current_has_spend'
+        cac_ok = spend_known and cac > 0 and cac <= target_cac * 1.5
         has_history = hist_median > 0 and len(comparison_events) > 0
         context = f" vs median {int(hist_median)} tickets at this point" if has_history else ""
         basis = f"Based on {len(comparison_events)} past editions" if comparison_events else "No historical data"
+
+        # Build spend context string based on actual data status
+        if spend_known and cac > 0:
+            spend_context = f"CAC ${cac:.2f}"
+        elif spend_status == 'current_zero_spend':
+            spend_context = "No paid spend detected"
+        elif spend_status in ('stale', 'no_records', 'unavailable', 'unknown'):
+            spend_context = "CAC unavailable"
+        else:
+            spend_context = "Paid performance unavailable"
 
         # --- COAST: Clearly ahead ---
         if has_history and pace > 25:
@@ -2376,15 +2797,19 @@ class DecisionEngine:
             )
 
         # --- PUSH: Behind but recoverable ---
-        if has_history and pace < -15 and cac_ok and days_until > 7:
+        if has_history and pace < -15 and days_until > 7:
             urgency = 7 if days_until < 30 else 5
             bump = min(50, abs(pace))
+            if cac_ok:
+                push_rationale = f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. {spend_context}. {basis}."
+            else:
+                push_rationale = f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. {spend_context}. {basis}."
             return (
                 Decision.PUSH, urgency,
-                f"{tickets} tickets — {abs(pace):.0f}% behind historical{context}. CAC ${cac:.2f} acceptable. {basis}.",
+                push_rationale,
                 [
-                    f"Increase ad budget by {bump:.0f}%",
-                    "Expand lookalike audiences",
+                    f"Increase ad budget by {bump:.0f}%" if spend_known else "Review paid media setup",
+                    "Expand lookalike audiences" if spend_known else "Verify Meta ad account connection",
                     "Add urgency messaging",
                     "Email high-value past attendees",
                     "Increase retargeting frequency"
@@ -2395,9 +2820,9 @@ class DecisionEngine:
         if not has_history:
             return (
                 Decision.MAINTAIN, 5 if days_until < 30 else 3,
-                f"{tickets} tickets at {days_until}d out. {basis} — monitor manually.",
+                f"{tickets} tickets at {days_until}d out. {spend_context}. {basis} — monitor manually.",
                 [
-                    "Maintain current spend",
+                    "Maintain current spend" if spend_known else "Review paid media setup",
                     "Continue daily monitoring",
                     "Prepare final push for last 2 weeks"
                 ]
@@ -2408,11 +2833,28 @@ class DecisionEngine:
             Decision.MAINTAIN, 5 if days_until < 30 else 3,
             f"{tickets} tickets — tracking within historical norms{context}. {basis}.",
             [
-                "Maintain current spend",
+                "Maintain current spend" if spend_known else "Review paid media setup",
                 "Continue daily monitoring",
                 "Prepare final push for last 2 weeks"
             ]
         )
+    def _get_grouped_spend_status(self, event_ids: list) -> str:
+        """Get the best spend status across constituent event IDs.
+
+        If any constituent has 'current_has_spend', that wins.
+        Otherwise: current_zero_spend > stale > no_records > unavailable.
+        """
+        if not event_ids:
+            return "no_records"
+        priority = {'current_has_spend': 5, 'current_zero_spend': 4,
+                     'stale': 3, 'no_records': 2, 'unavailable': 1}
+        best = 'unavailable'
+        for eid in event_ids:
+            status = self.db.get_spend_status(eid)
+            if priority.get(status, 0) > priority.get(best, 0):
+                best = status
+        return best
+
     def _detect_timed_entry_groups(self, analyses):
         """Detect timed-entry events (same name, within 3 days of each other)."""
         by_pattern = defaultdict(list)
@@ -2450,7 +2892,11 @@ class DecisionEngine:
         max_capacity = total_capacity  # keep variable name for downstream compat
         total_spend = sum(a.ad_spend for a in day_analyses)
         sell_through = (total_tickets / max_capacity * 100) if max_capacity > 0 else 0
-        cac_val = (total_spend / total_tickets) if total_tickets > 0 else 0
+        # Compute grouped spend status from constituent event IDs
+        constituent_ids = [a.event_id for a in day_analyses]
+        grouped_spend_status = self._get_grouped_spend_status(constituent_ids)
+        # CAC only meaningful with current spend
+        cac_val = (total_spend / total_tickets) if total_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
         days_until = day_analyses[0].days_until
         best_urgency = max(a.urgency for a in day_analyses)
         best_decision = None
@@ -2583,7 +3029,8 @@ class DecisionEngine:
         grouped_decision, grouped_urgency, grouped_rationale, grouped_actions = self._decide(
             total_tickets, grouped_pace,
             cac_val, days_until, grouped_hist_median,
-            [c['event_name'] for c in historical_comparisons]
+            [c['event_name'] for c in historical_comparisons],
+            spend_status=grouped_spend_status
         )
         return EventPacing(
             event_id=eid, event_name=logical_name,
@@ -2605,6 +3052,7 @@ class DecisionEngine:
             reactivation_targets=max(a.reactivation_targets for a in day_analyses) if day_analyses else 0,
             historical_comparisons=historical_comparisons,
             constituent_event_ids=[a.event_id for a in day_analyses],
+            spend_status=grouped_spend_status,
         )
     def analyze_portfolio(self) -> List[EventPacing]:
         """Analyze all upcoming events, grouping timed-entry events by day."""
@@ -2651,6 +3099,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     engine = DecisionEngine(db)
     # Sync status tracking
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
+    _meta_sync_lock = threading.Lock()  # Serialize Meta sync writers
+    _meta_sync_running = False  # Single-flight guard for Meta sync
     _portfolio_cache = {'analyses': None, 'ts': 0}  # Cache portfolio analysis for 60s
     def _get_portfolio():
         """Get cached portfolio analysis (avoids re-analyzing on every targeting request)."""
@@ -2684,22 +3134,29 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
             meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
             if meta_token and meta_accounts:
-                try:
-                    log.info(f"Starting Meta ad spend sync for {len(meta_accounts)} account(s)...")
-                    all_events = db.get_events(upcoming_only=False)
-                    total_meta_spend = 0
-                    for acct_id in meta_accounts:
-                        log.info(f"  Syncing Meta account: {acct_id}")
-                        meta = MetaAdsSync(meta_token, acct_id, db)
-                        meta_result = meta.sync_all_events(all_events)
-                        total_meta_spend += meta_result.get('total_spend', 0)
-                        log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
-                                 f"${meta_result.get('total_spend', 0):.2f} spend")
-                    log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
-                    # Backfill ad spend into daily snapshots so historical comparisons work
-                    db.backfill_ad_spend_into_snapshots()
-                except Exception as me:
-                    log.error(f"Meta sync error: {me}")
+                if _meta_sync_running:
+                    log.info("Skipping Meta sync — already running from another source")
+                else:
+                    with _meta_sync_lock:
+                        _meta_sync_running = True
+                        try:
+                            log.info(f"Starting Meta ad spend sync for {len(meta_accounts)} account(s)...")
+                            all_events = db.get_events(upcoming_only=False)
+                            total_meta_spend = 0
+                            for acct_id in meta_accounts:
+                                log.info(f"  Syncing Meta account: {acct_id}")
+                                meta = MetaAdsSync(meta_token, acct_id, db)
+                                meta_result = meta.sync_all_events(all_events)
+                                total_meta_spend += meta_result.get('total_spend', 0)
+                                log.info(f"  Account {acct_id}: {meta_result.get('successful', 0)} events, "
+                                         f"${meta_result.get('total_spend', 0):.2f} spend")
+                            log.info(f"Meta sync complete: ${total_meta_spend:.2f} total across {len(meta_accounts)} account(s)")
+                            # Backfill ad spend into daily snapshots so historical comparisons work
+                            db.backfill_ad_spend_into_snapshots()
+                        except Exception as me:
+                            log.error(f"Meta sync error: {me}")
+                        finally:
+                            _meta_sync_running = False
             # Check for milestones and generate auto-exports
             _check_milestones_and_export()
             # Check and send alerts
@@ -2895,7 +3352,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         return jsonify({'status': 'started', 'message': 'Sync started in background. Poll /api/sync-status for progress.'})
     @app.route('/api/meta-sync')
     def meta_sync_endpoint():
-        """Trigger Meta ad spend sync for all events."""
+        """Trigger Meta ad spend sync for all events.
+
+        Single-flight: rejects if a Meta sync is already running from any
+        source (background or manual).  Uses _meta_sync_lock to serialize
+        writes so overlapping threads can't corrupt the SQLite WAL.
+        """
+        nonlocal _meta_sync_running
+        if _meta_sync_running:
+            return jsonify({'status': 'already_running', 'message': 'Meta sync is already in progress'}), 409
         meta_token = os.environ.get('META_ACCESS_TOKEN')
         meta_accounts_str = os.environ.get('META_AD_ACCOUNT_ID', '')
         meta_accounts = [a.strip() for a in meta_accounts_str.split(',') if a.strip()]
@@ -2905,17 +3370,22 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 'setup': 'Set these environment variables in Railway to enable Meta ad spend tracking'
             }), 400
         def _do_meta_sync():
-            try:
-                all_events = db.get_events(upcoming_only=False)
-                for acct_id in meta_accounts:
-                    log.info(f"Manual Meta sync for account: {acct_id}")
-                    meta = MetaAdsSync(meta_token, acct_id, db)
-                    result = meta.sync_all_events(all_events)
-                    log.info(f"Manual Meta sync complete for {acct_id}: {result}")
-                # Backfill ad spend into daily snapshots
-                db.backfill_ad_spend_into_snapshots()
-            except Exception as e:
-                log.error(f"Manual Meta sync error: {e}")
+            nonlocal _meta_sync_running
+            with _meta_sync_lock:
+                _meta_sync_running = True
+                try:
+                    all_events = db.get_events(upcoming_only=False)
+                    for acct_id in meta_accounts:
+                        log.info(f"Manual Meta sync for account: {acct_id}")
+                        meta = MetaAdsSync(meta_token, acct_id, db)
+                        result = meta.sync_all_events(all_events)
+                        log.info(f"Manual Meta sync complete for {acct_id}: {result}")
+                    # Backfill ad spend into daily snapshots
+                    db.backfill_ad_spend_into_snapshots()
+                except Exception as e:
+                    log.error(f"Manual Meta sync error: {e}")
+                finally:
+                    _meta_sync_running = False
         threading.Thread(target=_do_meta_sync, daemon=True).start()
         return jsonify({'status': 'started', 'message': f'Meta ad spend sync started for {len(meta_accounts)} account(s)'})
     @app.route('/api/meta-status')
@@ -3095,7 +3565,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 'total_capacity': total_capacity,
                 'total_revenue': total_revenue,
                 'total_spend': total_spend,
-                'portfolio_cac': total_spend / total_tickets if total_tickets > 0 else 0,
+                'portfolio_cac': total_spend / total_tickets if total_tickets > 0 and total_spend > 0 and any(getattr(a, 'spend_status', 'unknown') == 'current_has_spend' for a in analyses) else 0,
                 'event_count': len(analyses)
             },
             'decisions': decisions,
@@ -4893,6 +5363,10 @@ Then:
 # =============================================================================
 # gunicorn craft_unified:app will use this.
 # auto_sync=True starts Eventbrite sync in background immediately.
-app = create_app_with_db(auto_sync=True)
+# Skip when imported under test to avoid side effects.
+if os.environ.get('TESTING') != '1':
+    app = create_app_with_db(auto_sync=True)
+else:
+    app = None
 if __name__ == "__main__":
     main()
