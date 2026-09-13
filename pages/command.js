@@ -193,7 +193,7 @@ function InterventionBadge({ intervention }) {
   );
 }
 
-function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
+function OpportunityCard({ item, rank, onRefresh }) {
   const [diagnosis, setDiagnosis] = useState(null);
   const [diagnosisLoading, setDiagnosisLoading] = useState(false);
   const [diagnosisError, setDiagnosisError] = useState('');
@@ -205,11 +205,6 @@ function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
 
   const weighted = Number(item.confidence_weighted_value || item.expected_net_value * item.confidence || 0);
 
-  const headers = useMemo(() => ({
-    'Authorization': `Bearer ${authToken}`,
-    'Content-Type': 'application/json',
-  }), [authToken]);
-
   const loadDiagnosis = useCallback(async () => {
     if (diagnosis) {
       setShowDiagnosis(!showDiagnosis);
@@ -218,7 +213,9 @@ function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
     setDiagnosisLoading(true);
     setDiagnosisError('');
     try {
-      const res = await fetch(`${apiBase}/api/v2/opportunities/${item.event_id}/diagnosis`, { headers });
+      const res = await fetch(`/api/v2/opportunities/${item.event_id}/diagnosis`, {
+        cache: 'no-store',
+      });
       const body = await res.json();
       if (!res.ok) throw new Error(body?.message || body?.error || `Diagnosis failed: ${res.status}`);
       setDiagnosis(body.diagnosis);
@@ -228,25 +225,22 @@ function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
     } finally {
       setDiagnosisLoading(false);
     }
-  }, [diagnosis, showDiagnosis, item.event_id, apiBase, headers]);
+  }, [diagnosis, showDiagnosis, item.event_id]);
 
   const prepare = useCallback(async () => {
     setPrepareLoading(true);
     setPrepareError('');
     try {
-      const res = await fetch(`${apiBase}/api/v2/opportunities/${item.opportunity_id}/prepare`, {
+      const res = await fetch(`/api/v2/opportunities/${item.opportunity_id}/prepare`, {
         method: 'POST',
-        headers,
       });
       const body = await res.json();
       if (res.status === 409) {
-        // Already has intervention — load it
         setIntervention(body.intervention);
         return;
       }
       if (!res.ok) throw new Error(body?.message || body?.error || `Prepare failed: ${res.status}`);
       setIntervention(body.intervention);
-      // Also load diagnosis from the response if we didn't have it
       if (!diagnosis && body.diagnosis_summary) {
         setDiagnosis(body.diagnosis_summary);
         setShowDiagnosis(true);
@@ -256,7 +250,7 @@ function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
     } finally {
       setPrepareLoading(false);
     }
-  }, [item.opportunity_id, apiBase, headers, diagnosis]);
+  }, [item.opportunity_id, diagnosis]);
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -285,7 +279,7 @@ function OpportunityCard({ item, rank, apiBase, authToken, onRefresh }) {
             <Evidence evidence={item.evidence} />
           </div>
 
-          {/* V2 actions */}
+          {/* V2 actions — all calls go through server-side proxy */}
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               onClick={loadDiagnosis}
@@ -343,26 +337,13 @@ export default function CommandPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
 
-  // Read auth token from env or query param (never from URL path)
-  const apiBase = typeof window !== 'undefined'
-    ? (process.env.NEXT_PUBLIC_API_BASE || '')
-    : '';
-  const authToken = typeof window !== 'undefined'
-    ? (process.env.NEXT_PUBLIC_COMMAND_API_KEY || '')
-    : '';
-
-  const headers = useMemo(() => ({
-    'Authorization': `Bearer ${authToken}`,
-    'Content-Type': 'application/json',
-  }), [authToken]);
-
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
       const [commandRes, interventionsRes] = await Promise.all([
-        fetch(`${apiBase}/api/v2/command`, { headers, cache: 'no-store' }),
-        fetch(`${apiBase}/api/v2/interventions`, { headers, cache: 'no-store' }).catch(() => null),
+        fetch('/api/command', { cache: 'no-store' }),
+        fetch('/api/v2/interventions', { cache: 'no-store' }).catch(() => null),
       ]);
 
       const commandBody = await commandRes.json();
@@ -380,7 +361,7 @@ export default function CommandPage() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, headers]);
+  }, []);
 
   useEffect(() => {
     load();
@@ -459,8 +440,6 @@ export default function CommandPage() {
               key={item.opportunity_id || `${item.event_id}-${item.opportunity_type}`}
               item={item}
               rank={index + 1}
-              apiBase={apiBase}
-              authToken={authToken}
               onRefresh={load}
             />
           ))}

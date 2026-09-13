@@ -548,5 +548,57 @@ class TestCampaignAdapter(unittest.TestCase):
                         "Champion conversions should be smaller with conversion_rate included")
 
 
+class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
+    """Regression tests for blocker-removal pass — campaign adapter side."""
+
+    def setUp(self):
+        self.db = FakeCampaignDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt_br", "Blocker Regression", "coffee", "Philadelphia", event_date, 2000),
+        )
+        # Buyers
+        for i in range(10):
+            self.db.conn.execute(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                (f"o{i}", "evt_br", f"buyer{i}@example.com", 1, 50.0),
+            )
+        self.db.conn.commit()
+
+    def test_audience_dedup_excludes_past_attendees_from_city(self):
+        """Blocker 2: city_prospects must not overlap with past_attendees."""
+        # Insert people who are BOTH past attendees and Philadelphia city prospects
+        for i in range(40):
+            self.db.conn.execute(
+                "INSERT INTO customers VALUES (?,?,?,?)",
+                (f"overlap{i}@example.com", "Philadelphia", "coffee", "regular"),
+            )
+        self.db.conn.commit()
+
+        adapter = CampaignDraftAdapter(self.db)
+        event = self.db.get_event("evt_br")
+        result = adapter._build_audience("evt_br", event)
+
+        # All emails should be unique
+        email_list = result["emails"]
+        self.assertEqual(len(email_list), len(set(email_list)),
+                         "Audience must contain unique emails only")
+
+    def test_suppression_invariant_preserved(self):
+        """Suppression hard invariant must still block on failure."""
+        self.db.conn.execute("DROP TABLE suppressions")
+        self.db.conn.commit()
+
+        adapter = CampaignDraftAdapter(self.db)
+        intervention = Intervention.create(
+            opportunity_id="opp_br", event_id="evt_br",
+            intervention_type="crm_campaign", confidence=0.55,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            adapter.prepare_draft(intervention, {"avg_ticket_price": 50.0, "crm_champions": 5})
+        self.assertIn("suppression", str(ctx.exception).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

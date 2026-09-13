@@ -67,7 +67,7 @@ class Diagnosis:
     current_buyers_count: int
     # Historical
     historical_editions: List[Dict[str, Any]]
-    historical_campaigns_sent: int
+    current_event_campaigns_sent: int
     # Warnings
     missing_data: List[str]
     # Analysis
@@ -132,7 +132,7 @@ class DiagnosisEngine:
 
         # ── Historical editions ─────────────────────────────────────────
         historical_editions = self._get_historical_editions(event_id, event)
-        historical_campaigns = self._count_historical_campaigns(event_id)
+        historical_campaigns = self._count_current_event_campaigns(event_id)
 
         # ── Missing data warnings ───────────────────────────────────────
         missing = self._detect_missing_data(
@@ -198,7 +198,7 @@ class DiagnosisEngine:
             crm_city_prospects=audience["city_prospects"],
             current_buyers_count=audience["current_buyers"],
             historical_editions=historical_editions,
-            historical_campaigns_sent=historical_campaigns,
+            current_event_campaigns_sent=historical_campaigns,
             missing_data=missing,
             root_causes=root_causes,
             intervention_options=intervention_options,
@@ -271,20 +271,51 @@ class DiagnosisEngine:
             log.warning(f"Meta spend lookup failed for {event_id}: {e}")
         return total, spend_7d, impressions_7d, clicks_7d
 
-    def _check_meta_data_status(self, event_id: str) -> str:
-        """Check if Meta ad spend data is available for this event.
+    # Data is "current" if the most recent spend_date is within this many days
+    META_FRESHNESS_THRESHOLD_DAYS = 3
 
-        Returns:
-            'has_data'   - ad_spend table has rows for this event
-            'no_records' - ad_spend table exists but no rows for this event
-            'unavailable' - ad_spend table doesn't exist or query failed
+    def _check_meta_data_status(self, event_id: str) -> str:
+        """Check Meta ad spend data freshness for this event.
+
+        Returns one of:
+            'current_has_spend'  - recent data exists with spend > 0
+            'current_zero_spend' - recent data exists but all spend is $0
+            'stale'              - data exists but latest spend_date is too old
+            'no_records'         - ad_spend table exists but no rows for this event
+            'unavailable'        - ad_spend table doesn't exist or query failed
         """
         try:
             row = self.db.conn.execute(
-                "SELECT COUNT(*) as cnt FROM ad_spend WHERE event_id = ?",
+                "SELECT MAX(spend_date) as latest_date, "
+                "       SUM(spend) as total_spend, "
+                "       COUNT(*) as cnt "
+                "FROM ad_spend WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
-            return "has_data" if row and int(row["cnt"]) > 0 else "no_records"
+            if not row or int(row["cnt"]) == 0:
+                return "no_records"
+
+            latest_date_str = row["latest_date"]
+            if not latest_date_str:
+                return "no_records"
+
+            # Check freshness: is the most recent data point within threshold?
+            try:
+                latest_date = date.fromisoformat(str(latest_date_str))
+            except (ValueError, TypeError):
+                # Can't parse the date — treat as stale
+                return "stale"
+
+            days_since_latest = (date.today() - latest_date).days
+            if days_since_latest > self.META_FRESHNESS_THRESHOLD_DAYS:
+                return "stale"
+
+            # Data is current — check if there's actual spend
+            total_spend = self._num(row["total_spend"])
+            if total_spend > 0:
+                return "current_has_spend"
+            else:
+                return "current_zero_spend"
         except Exception:
             return "unavailable"
 
@@ -304,7 +335,12 @@ class DiagnosisEngine:
             return 0.0
 
     def _compute_audience(self, event_id: str, event: dict) -> Dict[str, int]:
-        """Count available CRM segments, excluding current buyers."""
+        """Count available CRM segments, excluding current buyers.
+
+        past_attendees and city_prospects are deduplicated by email:
+        city_prospects excludes both current buyers AND past attendee emails
+        so the total is a true unique count.
+        """
         result = {
             "total": 0,
             "past_attendees": 0,
@@ -321,6 +357,7 @@ class DiagnosisEngine:
             past_attendees = self.db.get_past_attendees_not_purchased(
                 event_id, event["name"], limit=50000, current_buyer_emails=buyers
             )
+            past_attendee_emails = {c.get("email") for c in past_attendees if c.get("email")}
             result["past_attendees"] = len(past_attendees)
             result["champions"] = len([
                 c for c in past_attendees
@@ -333,8 +370,10 @@ class DiagnosisEngine:
 
             city = event.get("city", "")
             if city:
+                # Exclude both current buyers AND past attendees to prevent double-counting
+                exclude_emails = list(buyer_set | past_attendee_emails)
                 city_prospects = self.db.get_city_prospects(
-                    city, exclude_emails=buyers, limit=50000
+                    city, exclude_emails=exclude_emails, limit=50000
                 )
                 result["city_prospects"] = len(city_prospects)
 
@@ -370,7 +409,7 @@ class DiagnosisEngine:
             log.warning(f"Historical editions lookup failed for {event_id}: {e}")
         return editions
 
-    def _count_historical_campaigns(self, event_id: str) -> int:
+    def _count_current_event_campaigns(self, event_id: str) -> int:
         """Count campaigns actually sent for this event (excludes drafts)."""
         try:
             row = self.db.conn.execute(
@@ -393,16 +432,27 @@ class DiagnosisEngine:
         meta_data_status: str = "unknown",
     ) -> List[str]:
         warnings = []
-        if meta_total <= 0:
-            if meta_data_status == "unavailable":
-                warnings.append(
-                    "Meta ad spend data is unavailable (possible expired token, sync failure, "
-                    "or missing ad_spend table) — cannot assess paid performance."
-                )
-            else:
-                warnings.append(
-                    "No Meta ad spend recorded for this event — cannot assess paid performance."
-                )
+        if meta_data_status == "unavailable":
+            warnings.append(
+                "Meta ad spend data is unavailable (possible expired token, sync failure, "
+                "or missing ad_spend table) — cannot assess paid performance."
+            )
+        elif meta_data_status == "stale":
+            warnings.append(
+                "Meta ad spend data is stale (last sync is more than "
+                f"{self.META_FRESHNESS_THRESHOLD_DAYS} days old) — "
+                "paid performance assessment may be outdated."
+            )
+        elif meta_data_status == "no_records":
+            warnings.append(
+                "No Meta ad spend recorded for this event — cannot assess paid performance."
+            )
+        elif meta_data_status == "current_zero_spend":
+            warnings.append(
+                "Meta ad spend data is current but all recorded spend is $0 — "
+                "no active paid campaigns detected."
+            )
+        # current_has_spend → no warning needed
         if recent_velocity is None:
             warnings.append("Insufficient snapshot data to compute recent ticket velocity.")
         if historical_velocity is None:
@@ -450,8 +500,8 @@ class DiagnosisEngine:
                 confidence=min(0.85, 0.6 + (1.0 - min(recent_velocity, 1.0)) * 0.25),
             ))
 
-        # 2. Paid underperformance
-        if meta_total > 0:
+        # 2. Paid underperformance — only assess when data is current
+        if meta_data_status == "current_has_spend" and meta_total > 0:
             if meta_7d_spend > 0 and meta_7d_clicks < 5:
                 causes.append(RootCause(
                     cause="Paid ads are spending without driving clicks",
@@ -470,8 +520,8 @@ class DiagnosisEngine:
                     ],
                     confidence=0.60,
                 ))
-        elif meta_total <= 0 and days_until > 14:
-            # Distinguish: is Meta data unavailable, or is there genuinely no spend?
+        elif days_until > 14:
+            # Distinguish status-aware root causes for missing/stale/zero spend
             if meta_data_status == "unavailable":
                 causes.append(RootCause(
                     cause="Meta ad spend data is unavailable",
@@ -481,22 +531,42 @@ class DiagnosisEngine:
                     ],
                     confidence=0.40,
                 ))
-            else:
+            elif meta_data_status == "stale":
+                causes.append(RootCause(
+                    cause="Meta ad spend data is stale",
+                    evidence=[
+                        f"Last spend data is more than {self.META_FRESHNESS_THRESHOLD_DAYS} days old — "
+                        "cannot determine current paid advertising status",
+                        f"{days_until} days of runway remain",
+                    ],
+                    confidence=0.40,
+                ))
+            elif meta_data_status == "current_zero_spend":
+                # Only claim "no paid advertising" when we have current data confirming $0
                 causes.append(RootCause(
                     cause="No paid advertising detected",
                     evidence=[
-                        "No Meta ad spend records found for this event",
+                        "Current Meta data confirms no active ad spend for this event",
                         f"{days_until} days of runway remain",
                     ],
                     confidence=0.50,
                 ))
+            elif meta_data_status == "no_records":
+                causes.append(RootCause(
+                    cause="No paid advertising data for this event",
+                    evidence=[
+                        "No Meta ad spend records found for this event",
+                        f"{days_until} days of runway remain",
+                    ],
+                    confidence=0.45,
+                ))
 
-        # 3. Under-marketed (few campaigns sent)
+        # 3. Under-marketed (few campaigns sent for current event)
         if historical_campaigns < 2 and days_until > 7:
             causes.append(RootCause(
                 cause="Event may be under-marketed",
                 evidence=[
-                    f"Only {historical_campaigns} campaign(s) sent so far",
+                    f"Only {historical_campaigns} campaign(s) sent for this event",
                     f"{days_until} days until event",
                 ],
                 confidence=0.55,
@@ -591,28 +661,25 @@ class DiagnosisEngine:
                 prerequisites=["Mailchimp configured", "Audience data available"],
             ))
 
-        # Option 2: Ad budget reallocation (only if we have spend data)
+        # Option 2: Paid media review (non-financial — flags for human review only)
+        # We do NOT model incremental tickets or revenue from ad optimization because
+        # any such projection would be fabricated — we have no causal model linking
+        # spend changes to ticket outcomes.
         if meta_total > 0 and blended_ad_spend_per_ticket > 0 and days_until > 7:
-            # Model: what if we could reduce blended spend/ticket by 20% through better targeting?
-            improved_cost = blended_ad_spend_per_ticket * 0.80
-            additional_budget = min(meta_total * 0.25, gap_tickets * improved_cost)
-            additional_tickets = int(additional_budget / improved_cost) if improved_cost > 0 else 0
-            additional_tickets = min(additional_tickets, gap_tickets)
-            expected_rev = additional_tickets * avg_price
-
             options.append(InterventionOption(
-                intervention_type="ad_budget_shift",
-                label="Paid ad optimization / budget shift",
+                intervention_type="paid_media_review",
+                label="Review paid media performance",
                 rationale=(
-                    f"Current blended ad spend is ${blended_ad_spend_per_ticket:.2f}/ticket. "
-                    f"Reallocating or optimizing ${additional_budget:.0f} in ad spend could "
-                    f"yield ~{additional_tickets} additional tickets at improved targeting."
+                    f"Current blended ad spend is ${blended_ad_spend_per_ticket:.2f}/ticket "
+                    f"(total spend ${meta_total:.0f}). A manual review of targeting, creative, "
+                    f"and budget allocation may identify improvements. No automated financial "
+                    f"projection is made — this requires human judgment."
                 ),
-                expected_revenue=round(expected_rev, 2),
-                expected_cost=round(additional_budget, 2),
-                expected_net_value=round(expected_rev - additional_budget, 2),
-                confidence=0.40,
-                risk="medium",
+                expected_revenue=0.0,
+                expected_cost=0.0,
+                expected_net_value=0.0,
+                confidence=0.0,
+                risk="low",
                 prerequisites=["Meta Ads access", "Active ad account"],
             ))
 

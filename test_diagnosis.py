@@ -567,7 +567,7 @@ class TestDiagnosisRootCauses(unittest.TestCase):
         }
         diagnosis = engine.diagnose("evt3", opp)
         # Should count only the 1 sent campaign, not all 3
-        self.assertEqual(diagnosis.historical_campaigns_sent, 1)
+        self.assertEqual(diagnosis.current_event_campaigns_sent, 1)
 
     def test_root_cause_uses_blended_spend_label(self):
         """Regression: root cause text should say 'Blended ad spend' not 'CAC'."""
@@ -601,6 +601,206 @@ class TestDiagnosisRootCauses(unittest.TestCase):
             self.assertNotIn("CAC", rc.cause)
             for e in rc.evidence:
                 self.assertNotIn("CAC is", e)
+
+
+class TestBlockerRegressions(unittest.TestCase):
+    """Regression tests for blocker-removal pass."""
+
+    def setUp(self):
+        self.db = FakeDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt_br", "Blocker Regression Event", "coffee", "Philadelphia", event_date, 2000),
+        )
+        self.db.conn.commit()
+
+    def _make_opp(self, **overrides):
+        base = {
+            "opportunity_id": "blocker_test",
+            "evidence": {
+                "days_until": 30, "tickets_sold": 200,
+                "pace_delta_pct": -20, "gap_tickets": 200,
+                "avg_ticket_price": 60.0,
+            },
+        }
+        base.update(overrides)
+        return base
+
+    # ── Blocker 2: Audience double-counting ─────────────────────────
+    def test_audience_dedup_past_attendees_and_city_prospects(self):
+        """city_prospects must exclude past_attendee emails — no double counting."""
+        # Insert customers who are BOTH past attendees and Philly city prospects
+        for i in range(50):
+            self.db.conn.execute(
+                "INSERT INTO customers VALUES (?,?,?,?)",
+                (f"overlap{i}@example.com", "Philadelphia", "coffee", "champion" if i < 10 else "regular"),
+            )
+        # Insert 30 Philly-only prospects (not past attendees in this test's stub,
+        # but since FakeDB.get_past_attendees returns ALL customers not in buyers,
+        # these overlap too — the dedup must handle it)
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+
+        # Total must equal past_attendees + city_prospects (disjoint sets)
+        self.assertEqual(
+            diagnosis.crm_audience_total,
+            diagnosis.crm_past_attendees + diagnosis.crm_city_prospects,
+        )
+        # city_prospects should be 0 because all Philly customers are already past_attendees
+        self.assertEqual(diagnosis.crm_city_prospects, 0)
+
+    # ── Blocker 3: Meta data freshness ──────────────────────────────
+    def test_meta_freshness_current_has_spend(self):
+        """Recent spend data should return current_has_spend."""
+        today = date.today().isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", today, 100.0, 5000, 50),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        status = engine._check_meta_data_status("evt_br")
+        self.assertEqual(status, "current_has_spend")
+
+    def test_meta_freshness_current_zero_spend(self):
+        """Recent data with $0 spend should return current_zero_spend."""
+        today = date.today().isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", today, 0.0, 0, 0),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        status = engine._check_meta_data_status("evt_br")
+        self.assertEqual(status, "current_zero_spend")
+
+    def test_meta_freshness_stale(self):
+        """Spend data older than threshold should return stale."""
+        old_date = (date.today() - timedelta(days=10)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", old_date, 100.0, 5000, 50),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        status = engine._check_meta_data_status("evt_br")
+        self.assertEqual(status, "stale")
+
+    def test_meta_freshness_no_records(self):
+        """No ad_spend rows should return no_records."""
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        status = engine._check_meta_data_status("evt_br")
+        self.assertEqual(status, "no_records")
+
+    def test_meta_freshness_unavailable(self):
+        """Missing ad_spend table should return unavailable."""
+        self.db.conn.execute("DROP TABLE ad_spend")
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        status = engine._check_meta_data_status("evt_br")
+        self.assertEqual(status, "unavailable")
+
+    def test_stale_data_does_not_claim_no_advertising(self):
+        """Stale Meta data must NOT produce 'No paid advertising detected' root cause."""
+        old_date = (date.today() - timedelta(days=10)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", old_date, 100.0, 5000, 50),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+
+        no_ad_detected = [rc for rc in diagnosis.root_causes if "No paid advertising detected" in rc.cause]
+        self.assertEqual(len(no_ad_detected), 0, "Stale data must not claim 'no paid advertising detected'")
+
+        stale = [rc for rc in diagnosis.root_causes if "stale" in rc.cause.lower()]
+        self.assertGreater(len(stale), 0, "Should flag stale Meta data")
+
+    def test_current_zero_spend_claims_no_advertising(self):
+        """Current data with $0 spend SHOULD produce 'No paid advertising detected'."""
+        today = date.today().isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", today, 0.0, 0, 0),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+        no_ad = [rc for rc in diagnosis.root_causes if "No paid advertising detected" in rc.cause]
+        self.assertGreater(len(no_ad), 0, "Current zero spend should confirm no advertising")
+
+    def test_missing_data_warns_on_stale(self):
+        """Missing data warnings should include staleness."""
+        old_date = (date.today() - timedelta(days=10)).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+            ("evt_br", "c1", old_date, 100.0, 5000, 50),
+        )
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+        stale_warnings = [m for m in diagnosis.missing_data if "stale" in m.lower()]
+        self.assertGreater(len(stale_warnings), 0, "Should warn about stale Meta data")
+
+    # ── Blocker 4: Campaign-history naming ──────────────────────────
+    def test_field_is_current_event_campaigns_sent(self):
+        """Regression: field is current_event_campaigns_sent, not historical_campaigns_sent."""
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+        self.assertTrue(hasattr(diagnosis, "current_event_campaigns_sent"))
+        self.assertFalse(hasattr(diagnosis, "historical_campaigns_sent"))
+        d = diagnosis.to_dict()
+        self.assertIn("current_event_campaigns_sent", d)
+        self.assertNotIn("historical_campaigns_sent", d)
+
+    # ── Blocker 5: Paid-media revenue model disabled ────────────────
+    def test_no_ad_budget_shift_intervention(self):
+        """ad_budget_shift intervention type must not exist anywhere."""
+        # Add spend data so paid media review is triggered
+        for d in range(7):
+            spend_date = (date.today() - timedelta(days=d)).isoformat()
+            self.db.conn.execute(
+                "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+                ("evt_br", "camp1", spend_date, 500.0, 5000, 50),
+            )
+        self.db.conn.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?)",
+            ("o1", "evt_br", "buyer1@example.com", 1, 60.0),
+        )
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+        ad_shift = [o for o in diagnosis.intervention_options if o.intervention_type == "ad_budget_shift"]
+        self.assertEqual(len(ad_shift), 0, "ad_budget_shift intervention must not exist")
+
+    def test_paid_media_review_is_non_financial(self):
+        """paid_media_review must have zero expected_revenue and zero expected_cost."""
+        for d in range(7):
+            spend_date = (date.today() - timedelta(days=d)).isoformat()
+            self.db.conn.execute(
+                "INSERT INTO ad_spend VALUES (?,?,?,?,?,?)",
+                ("evt_br", "camp1", spend_date, 500.0, 5000, 50),
+            )
+        self.db.conn.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?)",
+            ("o1", "evt_br", "buyer1@example.com", 1, 60.0),
+        )
+        self.db.conn.commit()
+
+        engine = DiagnosisEngine(self.db, FakeDecisionEngine())
+        diagnosis = engine.diagnose("evt_br", self._make_opp())
+        pmr = [o for o in diagnosis.intervention_options if o.intervention_type == "paid_media_review"]
+        self.assertGreater(len(pmr), 0, "paid_media_review should appear when spend data exists")
+        for opt in pmr:
+            self.assertEqual(opt.expected_revenue, 0.0)
+            self.assertEqual(opt.expected_cost, 0.0)
+            self.assertEqual(opt.expected_net_value, 0.0)
+            self.assertEqual(opt.confidence, 0.0)
 
 
 if __name__ == "__main__":
