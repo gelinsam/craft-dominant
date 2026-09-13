@@ -443,11 +443,52 @@ def _build_app():
                 "suppression_count_mismatch": 503,
                 "empty_audience": 422,
                 "execution_failed": 500,
+                "duplicate_claim": 409,
+                "attempt_in_progress": 409,
+                "already_sent": 409,
+                "reconciliation_required": 409,
             }.get(result["error"], 400)
             return jsonify(result), status_code
 
         # external_send_disabled is a 200 — it's not an error, just a gate
         return jsonify(result)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Reconcile
+    # ─────────────────────────────────────────────────────────────────────
+
+    @app.post("/api/v2/interventions/<intervention_id>/reconcile")
+    @require_command_auth
+    def reconcile_intervention(intervention_id: str):
+        """Reconcile an ambiguous send attempt by querying the provider.
+
+        Only callable when a send attempt is in 'ambiguous' state.
+        Queries Mailchimp for the actual campaign status and resolves
+        to reconciled_sent or reconciled_not_sent.
+        """
+        result = execution_adapter.reconcile_send_attempt(
+            intervention_id, actor="user"
+        )
+        if "error" in result:
+            status_code = {
+                "intervention_not_found": 404,
+                "no_ambiguous_attempt": 404,
+                "no_provider_campaign_id": 422,
+                "mailchimp_not_configured": 503,
+                "provider_query_failed": 502,
+            }.get(result["error"], 400)
+            return jsonify(result), status_code
+        return jsonify(result)
+
+    @app.get("/api/v2/interventions/<intervention_id>/send-attempts")
+    @require_command_auth
+    def intervention_send_attempts(intervention_id: str):
+        """Return all send attempts for an intervention."""
+        attempts = v2_repo.get_send_attempts(intervention_id)
+        return jsonify({
+            "intervention_id": intervention_id,
+            "send_attempts": [a.to_dict() for a in attempts],
+        })
 
     # ─────────────────────────────────────────────────────────────────────
     # Measure

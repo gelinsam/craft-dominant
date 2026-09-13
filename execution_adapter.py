@@ -5,6 +5,18 @@ Actual external sends are gated behind V2_ENABLE_EXTERNAL_SEND=1.
 Without that flag, execution produces a dry-run/preflight result with
 no external HTTP side effects.
 
+Phase 2 invariant:
+    ONE INTERVENTION MAY PRODUCE AT MOST ONE SUCCESSFUL EXTERNAL SEND
+    ATTEMPT FOR A GIVEN EXECUTION GENERATION.  If the provider outcome
+    is uncertain, STOP and RECONCILE.  Never blindly retry.
+
+The claim-checkpoint-send pattern:
+    1. Create a durable DB claim BEFORE any provider mutation.
+    2. After each irreversible provider step, checkpoint state to DB.
+    3. If the send outcome is ambiguous (timeout, crash, unknown), mark
+       the attempt 'ambiguous' — do NOT retry automatically.
+    4. Reconciliation queries the provider for campaign/send state.
+
 Measurement uses deterministic attribution: orders placed by sent recipients
 within the attribution window are counted as attributed_revenue (not causal lift).
 """
@@ -21,12 +33,27 @@ from intervention_model import (
     Intervention,
     InterventionStatus,
 )
+from send_attempt_model import (
+    SendAttempt,
+    SendAttemptStatus,
+    DuplicateClaimError,
+    AudienceHashMismatch,
+    compute_audience_hash,
+    compute_idempotency_key,
+    ACTIVE_ATTEMPT_STATES,
+    SUCCESSFUL_SEND_STATES,
+    TERMINAL_ATTEMPT_STATES,
+)
 from suppression_guard import SuppressionGuard, SuppressionStatus
 
 log = logging.getLogger("craft.execution")
 
 # Default attribution window in days
 ATTRIBUTION_WINDOW_DAYS = 7
+
+# Phase 2: single execution generation for now.
+# New generation requires explicit future human action.
+EXECUTION_GENERATION = 1
 
 
 class ExecutionAdapter:
@@ -149,8 +176,17 @@ class ExecutionAdapter:
         # ── Gate 5: check external send flag ───────────────────────────
         external_send_enabled = os.environ.get("V2_ENABLE_EXTERNAL_SEND", "0") == "1"
 
+        # Compute audience hash and idempotency key (stable, deterministic)
+        audience_hash = compute_audience_hash(audience_emails)
+        idempotency_key = compute_idempotency_key(
+            intervention_id, EXECUTION_GENERATION,
+            intervention.campaign_draft_id, audience_hash,
+        )
+
         if not external_send_enabled:
-            # Dry-run: record what would happen, but do not make any external HTTP calls
+            # Dry-run: record what would happen, but do not make any
+            # external HTTP calls.  Dry-run does NOT create a durable
+            # claim that blocks future real execution.
             self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_dry_run",
@@ -158,6 +194,8 @@ class ExecutionAdapter:
                 actor=actor,
                 metadata={
                     "audience_count": len(audience_emails),
+                    "audience_hash": audience_hash,
+                    "idempotency_key": idempotency_key,
                     "campaign_draft_id": intervention.campaign_draft_id,
                     "reason": "V2_ENABLE_EXTERNAL_SEND is not set",
                 },
@@ -167,6 +205,8 @@ class ExecutionAdapter:
                 "message": "External sending is disabled. Set V2_ENABLE_EXTERNAL_SEND=1 to enable.",
                 "dry_run": {
                     "audience_count": len(audience_emails),
+                    "audience_hash": audience_hash,
+                    "idempotency_key": idempotency_key,
                     "campaign_draft_id": intervention.campaign_draft_id,
                     "subject_line": campaign.get("subject_line", ""),
                     "suppressed_count": len(suppressed),
@@ -174,36 +214,117 @@ class ExecutionAdapter:
                 },
             }
 
-        # ── Execute: send via Mailchimp ────────────────────────────────
+        # ── Phase 2: Check for existing send attempt ──────────────────
+        # Before creating a new claim, check if one already exists for
+        # this intervention + execution generation.
+        existing_attempt = self.v2_repo.get_active_send_attempt(
+            intervention_id, EXECUTION_GENERATION,
+        )
+        if existing_attempt:
+            if existing_attempt.requires_reconciliation:
+                # Ambiguous attempt exists — cannot retry, must reconcile
+                return {
+                    "error": "reconciliation_required",
+                    "message": (
+                        f"Send attempt {existing_attempt.id} is in state "
+                        f"'ambiguous'. Reconcile before retrying."
+                    ),
+                    "send_attempt": existing_attempt.to_dict(),
+                }
+            if existing_attempt.is_active:
+                # An in-progress attempt exists — return its state
+                return {
+                    "error": "attempt_in_progress",
+                    "message": (
+                        f"Send attempt {existing_attempt.id} is already in "
+                        f"progress (state: {existing_attempt.attempt_status.value})."
+                    ),
+                    "send_attempt": existing_attempt.to_dict(),
+                }
+
+        # Check for successful previous attempt (already sent)
+        all_attempts = self.v2_repo.get_send_attempts(intervention_id)
+        for prev in all_attempts:
+            if (prev.execution_generation == EXECUTION_GENERATION
+                    and prev.is_successful and not prev.is_dry_run):
+                return {
+                    "error": "already_sent",
+                    "message": (
+                        f"Intervention {intervention_id} was already "
+                        f"successfully sent (attempt {prev.id})."
+                    ),
+                    "send_attempt": prev.to_dict(),
+                }
+
+        # ── Phase 2: Claim-before-send ────────────────────────────────
+        # Create durable claim BEFORE any provider mutation.
+        attempt = SendAttempt(
+            id=None,
+            intervention_id=intervention_id,
+            execution_generation=EXECUTION_GENERATION,
+            attempt_status=SendAttemptStatus.CLAIMED,
+            idempotency_key=idempotency_key,
+            audience_hash=audience_hash,
+            audience_count=len(audience_emails),
+            is_dry_run=False,
+        )
         try:
-            send_result = self._send_via_mailchimp(
-                intervention, campaign, audience_emails, actor
+            attempt = self.v2_repo.create_send_attempt(attempt)
+        except DuplicateClaimError as e:
+            log.warning(f"Duplicate claim for {intervention_id}: {e}")
+            return {
+                "error": "duplicate_claim",
+                "message": str(e),
+            }
+
+        self.v2_repo.append_audit(
+            intervention_id, intervention.event_id,
+            action="send_attempt_claimed",
+            from_status=intervention.status.value,
+            actor=actor,
+            metadata={
+                "send_attempt_id": attempt.id,
+                "idempotency_key": idempotency_key,
+                "audience_hash": audience_hash,
+                "audience_count": len(audience_emails),
+                "execution_generation": EXECUTION_GENERATION,
+            },
+        )
+
+        # Stage recipients BEFORE provider send
+        self.v2_repo.stage_attempt_recipients(attempt.id, audience_emails)
+
+        # ── Execute: checkpointed send via Mailchimp ──────────────────
+        try:
+            send_result = self._send_via_mailchimp_checkpointed(
+                attempt, intervention, campaign, audience_emails, actor,
             )
         except Exception as e:
+            # If we get here, the attempt has been checkpointed at each
+            # step. The attempt status tells us exactly where it failed.
             log.error(f"Execution failed for {intervention_id}: {e}")
-            self.v2_repo.append_audit(
-                intervention_id, intervention.event_id,
-                action="execute_failed",
-                from_status=intervention.status.value,
-                actor=actor,
-                error=str(e),
-            )
-            # Do NOT advance state on failure
-            intervention.evidence["execution_error"] = str(e)
-            self.v2_repo.save_intervention(intervention)
-            return {"error": "execution_failed", "message": str(e)}
+            return {
+                "error": "execution_failed",
+                "message": str(e),
+                "send_attempt": attempt.to_dict(),
+            }
 
         # ── Transition: approved → executing → measuring ───────────────
         from_status = intervention.status.value
         intervention.transition_to(InterventionStatus.EXECUTING)
         intervention.transition_to(InterventionStatus.MEASURING)
         intervention.sent_count = len(audience_emails)
-        intervention.evidence["execution_result"] = send_result
+        intervention.evidence["execution_result"] = {
+            "send_attempt_id": attempt.id,
+            "mailchimp_campaign_id": attempt.provider_campaign_id,
+        }
         intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
         self.v2_repo.save_intervention(intervention)
 
-        # Record sends for attribution
-        self._record_sends(intervention_id, intervention.campaign_draft_id, audience_emails)
+        # Promote staged recipients to v2_campaign_sends for attribution
+        self.v2_repo.promote_attempt_recipients(
+            attempt.id, intervention_id, intervention.campaign_draft_id,
+        )
 
         self.v2_repo.append_audit(
             intervention_id, intervention.event_id,
@@ -212,9 +333,10 @@ class ExecutionAdapter:
             to_status=intervention.status.value,
             actor=actor,
             metadata={
+                "send_attempt_id": attempt.id,
                 "sent_count": len(audience_emails),
                 "campaign_draft_id": intervention.campaign_draft_id,
-                "mailchimp_campaign_id": send_result.get("mailchimp_campaign_id", ""),
+                "mailchimp_campaign_id": attempt.provider_campaign_id,
                 "measurement_window_days": ATTRIBUTION_WINDOW_DAYS,
                 "measurement_ends_at": intervention.measurement_ends_at,
             },
@@ -226,6 +348,7 @@ class ExecutionAdapter:
             "sent_count": len(audience_emails),
             "measurement_window_days": ATTRIBUTION_WINDOW_DAYS,
             "measurement_ends_at": intervention.measurement_ends_at,
+            "send_attempt": attempt.to_dict(),
             "intervention": intervention.to_dict(),
         }
 
@@ -375,43 +498,299 @@ class ExecutionAdapter:
 
         return list(emails)
 
-    def _send_via_mailchimp(
-        self, intervention: Intervention, campaign: Dict[str, Any],
-        audience_emails: List[str], actor: str,
+    def _send_via_mailchimp_checkpointed(
+        self,
+        attempt: SendAttempt,
+        intervention: Intervention,
+        campaign: Dict[str, Any],
+        audience_emails: List[str],
+        actor: str,
     ) -> Dict[str, Any]:
-        """Send the campaign through Mailchimp. Raises on failure."""
+        """Checkpointed send through Mailchimp.
+
+        Each irreversible provider step is persisted to the DB BEFORE
+        proceeding to the next.  If the process crashes at any point,
+        the attempt state tells us exactly where we were and what
+        provider resources were created.
+
+        State progression:
+            claimed → provider_campaign_created → audience_configured
+            → send_requested → confirmed_sent | ambiguous
+        """
         if not self.campaign_engine or not self.campaign_engine.mailchimp:
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = "Mailchimp not configured"
+            self.v2_repo.update_send_attempt(attempt)
             raise RuntimeError("Mailchimp not configured — cannot send")
 
         mc = self.campaign_engine.mailchimp
         tag_name = f"v2-{intervention.id}"
 
-        # Push audience to Mailchimp
-        member_stats = mc.ensure_members(audience_emails, tag=tag_name)
+        # ── Step 1: Push audience to Mailchimp ────────────────────────
+        try:
+            member_stats = mc.ensure_members(audience_emails, tag=tag_name)
+        except Exception as e:
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = f"ensure_members failed: {e}"
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(f"Mailchimp audience push failed: {e}") from e
 
-        # Get segment for tag
-        segment_id = mc.get_tag_segment_id(tag_name)
+        # ── Step 2: Get segment ID ────────────────────────────────────
+        try:
+            segment_id = mc.get_tag_segment_id(tag_name)
+        except Exception as e:
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = f"get_tag_segment_id failed: {e}"
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(f"Mailchimp segment lookup failed: {e}") from e
 
-        # Create campaign
-        mc_campaign_id = mc.create_campaign(
-            subject=campaign.get("subject_line", ""),
-            preview_text=campaign.get("preview_text", ""),
-            html=campaign.get("body_html", ""),
-            segment_id=segment_id,
-        )
+        # ── Step 3: Create campaign (IRREVERSIBLE) ────────────────────
+        try:
+            mc_campaign_id = mc.create_campaign(
+                subject=campaign.get("subject_line", ""),
+                preview_text=campaign.get("preview_text", ""),
+                html=campaign.get("body_html", ""),
+                segment_id=segment_id,
+            )
+        except Exception as e:
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = f"create_campaign exception: {e}"
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(f"Mailchimp campaign creation exception: {e}") from e
+
         if not mc_campaign_id:
-            raise RuntimeError("Mailchimp campaign creation failed")
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = "create_campaign returned None"
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError("Mailchimp campaign creation failed (returned None)")
 
-        # Send
-        sent_ok = mc.send_campaign(mc_campaign_id)
+        # CHECKPOINT: campaign created — persist provider_campaign_id
+        attempt.provider_campaign_id = mc_campaign_id
+        attempt.provider_tag = tag_name
+        attempt.provider_segment_id = segment_id
+        attempt.transition_to(SendAttemptStatus.PROVIDER_CAMPAIGN_CREATED)
+        self.v2_repo.update_send_attempt(attempt)
+        log.info(f"Checkpoint: campaign {mc_campaign_id} created for attempt {attempt.id}")
+
+        # CHECKPOINT: audience configured
+        attempt.transition_to(SendAttemptStatus.AUDIENCE_CONFIGURED)
+        self.v2_repo.update_send_attempt(attempt)
+
+        # ── Step 4: Send campaign (CRITICAL — THE DANGER ZONE) ────────
+        # After this point, the provider may have accepted the send.
+        # We transition to send_requested BEFORE calling send, so that
+        # if we crash during the call, we know we were in the danger zone.
+        attempt.transition_to(SendAttemptStatus.SEND_REQUESTED)
+        self.v2_repo.update_send_attempt(attempt)
+        log.info(f"Checkpoint: send_requested for attempt {attempt.id}, "
+                 f"campaign {mc_campaign_id}")
+
+        try:
+            sent_ok = mc.send_campaign(mc_campaign_id)
+        except Exception as e:
+            # Network timeout, connection reset, or crash around send.
+            # We do NOT know if the send succeeded — mark AMBIGUOUS.
+            log.error(f"AMBIGUOUS: send_campaign exception for attempt "
+                      f"{attempt.id}: {e}")
+            attempt.transition_to(SendAttemptStatus.AMBIGUOUS)
+            attempt.error_message = f"send_campaign exception: {e}"
+            self.v2_repo.update_send_attempt(attempt)
+            self.v2_repo.append_audit(
+                intervention.id, intervention.event_id,
+                action="send_attempt_ambiguous",
+                actor=actor,
+                metadata={
+                    "send_attempt_id": attempt.id,
+                    "provider_campaign_id": mc_campaign_id,
+                    "error": str(e),
+                },
+                error="Provider outcome uncertain — reconciliation required",
+            )
+            raise RuntimeError(
+                f"Send outcome uncertain for campaign {mc_campaign_id}. "
+                f"Attempt {attempt.id} marked ambiguous — reconcile before "
+                f"retrying."
+            ) from e
+
         if not sent_ok:
-            raise RuntimeError(f"Mailchimp send failed for campaign {mc_campaign_id}")
+            # Provider explicitly returned failure (not ambiguous — the
+            # API responded, and said it failed).  The campaign was
+            # created but not sent.
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = f"send_campaign returned False for {mc_campaign_id}"
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(
+                f"Mailchimp send explicitly failed for campaign {mc_campaign_id}"
+            )
+
+        # CHECKPOINT: confirmed sent
+        attempt.transition_to(SendAttemptStatus.CONFIRMED_SENT)
+        self.v2_repo.update_send_attempt(attempt)
+        log.info(f"Checkpoint: confirmed_sent for attempt {attempt.id}, "
+                 f"campaign {mc_campaign_id}")
+
+        self.v2_repo.append_audit(
+            intervention.id, intervention.event_id,
+            action="send_attempt_confirmed",
+            actor=actor,
+            metadata={
+                "send_attempt_id": attempt.id,
+                "provider_campaign_id": mc_campaign_id,
+                "audience_count": len(audience_emails),
+                "member_stats": member_stats,
+            },
+        )
 
         return {
+            "send_attempt_id": attempt.id,
             "mailchimp_campaign_id": mc_campaign_id,
             "member_stats": member_stats,
             "tag_name": tag_name,
         }
+
+    def reconcile_send_attempt(
+        self, intervention_id: str, actor: str = "system",
+    ) -> Dict[str, Any]:
+        """Reconcile an ambiguous send attempt by querying the provider.
+
+        Queries Mailchimp for the campaign status using the stored
+        provider_campaign_id.  If the campaign was sent, transitions
+        to reconciled_sent and promotes recipients.  If not, transitions
+        to reconciled_not_sent.
+
+        This is the ONLY path from ambiguous to a terminal state.
+        """
+        intervention = self.v2_repo.get_intervention(intervention_id)
+        if not intervention:
+            return {"error": "intervention_not_found"}
+
+        # Find the ambiguous attempt
+        attempts = self.v2_repo.get_send_attempts(intervention_id)
+        ambiguous = None
+        for a in attempts:
+            if (a.execution_generation == EXECUTION_GENERATION
+                    and a.attempt_status == SendAttemptStatus.AMBIGUOUS
+                    and not a.is_dry_run):
+                ambiguous = a
+                break
+
+        if not ambiguous:
+            return {
+                "error": "no_ambiguous_attempt",
+                "message": f"No ambiguous send attempt found for {intervention_id}",
+            }
+
+        if not ambiguous.provider_campaign_id:
+            # Cannot reconcile without a provider campaign ID
+            return {
+                "error": "no_provider_campaign_id",
+                "message": (
+                    "Cannot reconcile: no provider_campaign_id recorded. "
+                    "Campaign may not have been created."
+                ),
+                "send_attempt": ambiguous.to_dict(),
+            }
+
+        # Query provider for campaign status
+        if not self.campaign_engine or not self.campaign_engine.mailchimp:
+            return {
+                "error": "mailchimp_not_configured",
+                "message": "Cannot reconcile: Mailchimp not configured",
+            }
+
+        mc = self.campaign_engine.mailchimp
+        provider_result = mc._request(
+            'GET', f'/campaigns/{ambiguous.provider_campaign_id}'
+        )
+
+        if provider_result is None:
+            return {
+                "error": "provider_query_failed",
+                "message": (
+                    f"Could not query Mailchimp for campaign "
+                    f"{ambiguous.provider_campaign_id}. Try again later."
+                ),
+                "send_attempt": ambiguous.to_dict(),
+            }
+
+        campaign_status = provider_result.get("status", "unknown")
+        ambiguous.reconciliation_detail = {
+            "provider_status": campaign_status,
+            "emails_sent": provider_result.get("emails_sent"),
+            "send_time": provider_result.get("send_time"),
+            "query_time": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if campaign_status == "sent":
+            # Provider confirms: campaign was sent
+            ambiguous.transition_to(SendAttemptStatus.RECONCILED_SENT)
+            ambiguous.reconciled_by = actor
+            self.v2_repo.update_send_attempt(ambiguous)
+
+            # Advance intervention state and promote recipients
+            if intervention.status == InterventionStatus.APPROVED:
+                from_status = intervention.status.value
+                intervention.transition_to(InterventionStatus.EXECUTING)
+                intervention.transition_to(InterventionStatus.MEASURING)
+                intervention.sent_count = ambiguous.audience_count
+                intervention.evidence["execution_result"] = {
+                    "send_attempt_id": ambiguous.id,
+                    "mailchimp_campaign_id": ambiguous.provider_campaign_id,
+                    "reconciled": True,
+                }
+                intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
+                self.v2_repo.save_intervention(intervention)
+
+                self.v2_repo.promote_attempt_recipients(
+                    ambiguous.id, intervention_id,
+                    intervention.campaign_draft_id,
+                )
+
+                self.v2_repo.append_audit(
+                    intervention_id, intervention.event_id,
+                    action="send_attempt_reconciled_sent",
+                    from_status=from_status,
+                    to_status=intervention.status.value,
+                    actor=actor,
+                    metadata={
+                        "send_attempt_id": ambiguous.id,
+                        "provider_campaign_id": ambiguous.provider_campaign_id,
+                        "provider_status": campaign_status,
+                    },
+                )
+
+            return {
+                "status": "reconciled_sent",
+                "message": "Provider confirms campaign was sent.",
+                "send_attempt": ambiguous.to_dict(),
+                "intervention": intervention.to_dict(),
+            }
+        else:
+            # Provider says campaign was NOT sent (status is 'save',
+            # 'paused', 'schedule', or something else — not 'sent')
+            ambiguous.transition_to(SendAttemptStatus.RECONCILED_NOT_SENT)
+            ambiguous.reconciled_by = actor
+            self.v2_repo.update_send_attempt(ambiguous)
+
+            self.v2_repo.append_audit(
+                intervention_id, intervention.event_id,
+                action="send_attempt_reconciled_not_sent",
+                actor=actor,
+                metadata={
+                    "send_attempt_id": ambiguous.id,
+                    "provider_campaign_id": ambiguous.provider_campaign_id,
+                    "provider_status": campaign_status,
+                },
+            )
+
+            return {
+                "status": "reconciled_not_sent",
+                "message": (
+                    f"Provider says campaign status is '{campaign_status}' "
+                    f"(not 'sent'). Safe to retry."
+                ),
+                "send_attempt": ambiguous.to_dict(),
+            }
 
     def _record_sends(self, intervention_id: str, campaign_draft_id: str,
                        emails: List[str]) -> None:
