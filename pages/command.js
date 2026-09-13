@@ -32,6 +32,28 @@ function Stat({ label, value, helper }) {
   );
 }
 
+function Evidence({ evidence }) {
+  if (!evidence) return null;
+  const rows = [
+    ['Pace', `${Math.abs(Number(evidence.pace_delta_pct || 0)).toFixed(0)}% behind`],
+    ['Ticket gap', Number(evidence.gap_tickets || 0).toLocaleString()],
+    ['Avg ticket', money(evidence.avg_ticket_price)],
+    ['Runway', `${Number(evidence.days_until || 0)} days`],
+    ['Recovery assumption', percent(evidence.recoverable_share_assumption)],
+  ];
+
+  return (
+    <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+      {rows.map(([label, value]) => (
+        <div key={label} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</div>
+          <div className="mt-0.5 text-sm font-semibold text-slate-800">{value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function OpportunityCard({ item, rank }) {
   const weighted = Number(item.confidence_weighted_value || item.expected_net_value * item.confidence || 0);
 
@@ -47,6 +69,9 @@ function OpportunityCard({ item, rank }) {
             <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
               URGENCY {item.urgency}/10
             </span>
+            {item.opportunity_id ? (
+              <span className="font-mono text-[10px] text-slate-400">{item.opportunity_id}</span>
+            ) : null}
           </div>
 
           <h2 className="mt-4 text-2xl font-semibold tracking-tight text-slate-950">{item.event_name}</h2>
@@ -56,12 +81,17 @@ function OpportunityCard({ item, rank }) {
           <div className="mt-4 rounded-xl bg-slate-50 p-4">
             <div className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recommended action</div>
             <div className="mt-1 text-sm font-medium text-slate-800">{item.recommended_action}</div>
+            <Evidence evidence={item.evidence} />
           </div>
         </div>
 
-        <div className="grid min-w-[260px] grid-cols-2 gap-3 lg:w-[320px]">
+        <div className="grid min-w-[260px] grid-cols-2 gap-3 lg:w-[340px]">
+          <div className="rounded-xl bg-rose-50 p-4">
+            <div className="text-xs font-semibold uppercase tracking-wide text-rose-700">Revenue at risk</div>
+            <div className="mt-1 text-xl font-semibold text-rose-950">{money(item.revenue_at_risk)}</div>
+          </div>
           <div className="rounded-xl bg-emerald-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700">Gross upside</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700">Modeled recovery</div>
             <div className="mt-1 text-xl font-semibold text-emerald-950">{money(item.expected_revenue)}</div>
           </div>
           <div className="rounded-xl bg-indigo-50 p-4">
@@ -71,10 +101,6 @@ function OpportunityCard({ item, rank }) {
           <div className="rounded-xl bg-slate-50 p-4">
             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Confidence</div>
             <div className="mt-1 text-xl font-semibold text-slate-950">{percent(item.confidence)}</div>
-          </div>
-          <div className="rounded-xl bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Approval</div>
-            <div className="mt-1 text-xl font-semibold text-slate-950">{item.requires_approval ? 'Required' : 'Automatic'}</div>
           </div>
         </div>
       </div>
@@ -118,7 +144,7 @@ export default function CommandPage() {
             <div className="text-xs font-bold uppercase tracking-[0.22em] text-indigo-600">Craft Dominant V2</div>
             <h1 className="mt-2 text-4xl font-semibold tracking-tight text-slate-950">Command Center</h1>
             <p className="mt-2 max-w-2xl text-slate-600">
-              Ranked economic opportunities across upcoming events. Read-only by design until the system proves it can predict value reliably.
+              Ranked economic interventions across upcoming events. Revenue at risk is separated from modeled recoverable value so the system does not confuse exposure with expected lift.
             </p>
           </div>
           <button
@@ -138,14 +164,10 @@ export default function CommandPage() {
         ) : null}
 
         <section className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <Stat label="Gross opportunity" value={money(data?.gross_opportunity)} helper="Total modeled upside" />
+          <Stat label="Revenue at risk" value={money(data?.revenue_at_risk)} helper="Historical pacing gap exposure" />
+          <Stat label="Modeled recovery" value={money(data?.gross_opportunity)} helper="Conservative recoverable portion" />
           <Stat label="Confidence-weighted" value={money(data?.confidence_weighted_net)} helper="Expected value after confidence" />
-          <Stat label="Opportunities" value={data?.opportunity_count ?? '—'} helper="Ranked actions currently surfaced" />
-          <Stat
-            label="Last generated"
-            value={data?.generated_at ? new Date(data.generated_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '—'}
-            helper="Live from current Craft data"
-          />
+          <Stat label="Opportunities" value={data?.opportunity_count ?? '—'} helper="Material interventions surfaced" />
         </section>
 
         <section className="mt-8 space-y-4">
@@ -163,7 +185,7 @@ export default function CommandPage() {
           ) : null}
 
           {opportunities.map((item, index) => (
-            <OpportunityCard key={`${item.event_id}-${item.opportunity_type}`} item={item} rank={index + 1} />
+            <OpportunityCard key={item.opportunity_id || `${item.event_id}-${item.opportunity_type}`} item={item} rank={index + 1} />
           ))}
         </section>
       </div>
