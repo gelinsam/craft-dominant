@@ -61,13 +61,14 @@ class FakeDB:
 class FakePacingFull:
     """Extended pacing stub that includes comparison_events for history checks.
 
-    Also carries event_id, event_name, and constituent_event_ids so that
-    analyze_portfolio() (which returns grouped EventPacing objects) can
-    be simulated in tests.
+    Also carries event_id, event_name, revenue, and constituent_event_ids
+    so that analyze_portfolio() (which returns grouped EventPacing objects)
+    can be simulated in tests.
     """
     def __init__(self, pace_vs_historical, tickets_sold, historical_median_at_point,
                  days_until=30, urgency=5, comparison_events=None,
-                 event_id="", event_name="", constituent_event_ids=None):
+                 event_id="", event_name="", constituent_event_ids=None,
+                 revenue=0.0):
         self.pace_vs_historical = pace_vs_historical
         self.tickets_sold = tickets_sold
         self.historical_median_at_point = historical_median_at_point
@@ -77,6 +78,7 @@ class FakePacingFull:
         self.event_id = event_id
         self.event_name = event_name
         self.constituent_event_ids = constituent_event_ids
+        self.revenue = revenue
 
 
 class Tests(unittest.TestCase):
@@ -679,6 +681,246 @@ class TestTimedEntryGrouping(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].event_name, "Test Festival")
         self.assertEqual(items[0].event_id, "grouped_id")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Pre-merge audit regression tests (PR #3)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestGroupedPriceScopeFix(unittest.TestCase):
+    """Audit §1: Verify avg ticket price uses day-scoped revenue/tickets
+    from the pacing object, not cross-day constituent IDs.
+
+    Background: constituent_event_ids in _create_day_event() contains ALL
+    event IDs across ALL days of a multi-day festival, while tickets_sold
+    and revenue on the grouped EventPacing are scoped to ONE logical day.
+    The price computation must match the gap scope (day-scoped).
+    """
+
+    def setUp(self):
+        self.db = FakeDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        # Saturday slots: expensive VIP-heavy
+        for i in range(3):
+            eid = f"sat_slot_{i}"
+            self.db.conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (eid, "Wine Fest", "wine", "DC", event_date, 500),
+            )
+            self.db.conn.execute(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                (f"o_sat_{i}", eid, f"sat{i}@example.com", 2, 200.0),
+            )
+        # Sunday slots: cheap GA-heavy
+        sun_date = (date.today() + timedelta(days=31)).isoformat()
+        for i in range(3):
+            eid = f"sun_slot_{i}"
+            self.db.conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (eid, "Wine Fest", "wine", "DC", sun_date, 500),
+            )
+            self.db.conn.execute(
+                "INSERT INTO orders VALUES (?,?,?,?,?)",
+                (f"o_sun_{i}", eid, f"sun{i}@example.com", 10, 100.0),
+            )
+        self.db.conn.commit()
+
+    def test_price_uses_day_scoped_revenue_not_cross_day_ids(self):
+        """Price must come from pacing.revenue/tickets_sold (day-scoped),
+        not from querying orders across all-day constituent IDs.
+
+        Saturday: 6 tickets, $600 → $100/ticket (day-scoped)
+        Sunday: 30 tickets, $300 → $10/ticket (day-scoped)
+        All-days DB query: 36 tickets, $900 → $25/ticket (WRONG for either day)
+        """
+        saturday_pacing = FakePacingFull(
+            pace_vs_historical=-30.0, tickets_sold=6,
+            historical_median_at_point=20,
+            comparison_events=["Past Edition"],
+            event_id="grouped_sat",
+            event_name="Wine Fest - Saturday",
+            # constituent_event_ids spans BOTH days (as _create_day_event does)
+            constituent_event_ids=["sat_slot_0", "sat_slot_1", "sat_slot_2",
+                                   "sun_slot_0", "sun_slot_1", "sun_slot_2"],
+            revenue=600.0,  # day-scoped: Saturday only
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        items = engine.evaluate_pacing(saturday_pacing)
+        self.assertEqual(len(items), 1)
+        # Price should be $100 (Saturday day-scoped), NOT $25 (cross-day)
+        self.assertEqual(items[0].evidence["avg_ticket_price"], 100.0)
+
+    def test_weighted_avg_not_unweighted(self):
+        """Regression: unweighted average of per-slot averages would be wrong.
+
+        Imagine two slots with very different economics:
+        Slot A: 20 tickets at $200ea → $100/ticket avg
+        Slot B: 100 tickets at $10ea → $10/ticket avg
+        Unweighted average of ($100, $10) = $55 — WRONG
+        Weighted (correct): $3000/120 = $25
+        Day-scoped pacing revenue/tickets gives the right answer.
+        """
+        pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=120,
+            historical_median_at_point=200,
+            comparison_events=["Past Edition"],
+            event_id="grouped_mixed",
+            event_name="Mixed Pricing Fest",
+            constituent_event_ids=["sat_slot_0"],  # doesn't matter, pacing.revenue used
+            revenue=3000.0,  # 120 tickets, $3000 total → $25/ticket
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        items = engine.evaluate_pacing(pacing)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].evidence["avg_ticket_price"], 25.0)
+
+    def test_fallback_to_db_when_no_revenue(self):
+        """When pacing has no revenue field, falls back to DB query."""
+        pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=6,
+            historical_median_at_point=20,
+            comparison_events=["Past Edition"],
+            event_id="sat_slot_0",
+            event_name="Wine Fest Slot",
+            constituent_event_ids=None,
+            revenue=0.0,  # no revenue on pacing → fallback
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        items = engine.evaluate_pacing(pacing)
+        self.assertEqual(len(items), 1)
+        # Should use DB query for sat_slot_0: 2 tickets, $200 → $100
+        self.assertEqual(items[0].evidence["avg_ticket_price"], 100.0)
+
+
+class TestCrossDayIsolation(unittest.TestCase):
+    """Audit §4/§5: Saturday and Sunday logical events must have
+    independent economics, classifications, and opportunity IDs.
+    """
+
+    def setUp(self):
+        self.db = FakeDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        # Need at least one DB event for FakeDB
+        self.db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("placeholder", "Placeholder", "wine", "DC", event_date, 100),
+        )
+        self.db.conn.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?)",
+            ("o_p", "placeholder", "p@example.com", 1, 50.0),
+        )
+        self.db.conn.commit()
+
+    def test_saturday_sunday_different_opportunity_ids(self):
+        """Saturday and Sunday must produce different opportunity IDs."""
+        sat_pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_sat_id",
+            event_name="DC Wine Fest - Saturday",
+            revenue=25000.0,
+        )
+        sun_pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_sun_id",
+            event_name="DC Wine Fest - Sunday",
+            revenue=25000.0,
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        sat_items = engine.evaluate_pacing(sat_pacing)
+        sun_items = engine.evaluate_pacing(sun_pacing)
+        self.assertEqual(len(sat_items), 1)
+        self.assertEqual(len(sun_items), 1)
+        self.assertNotEqual(sat_items[0].opportunity_id, sun_items[0].opportunity_id)
+        self.assertNotEqual(sat_items[0].event_id, sun_items[0].event_id)
+
+    def test_same_event_different_city_different_ids(self):
+        """Same event name in different cities → different opportunity IDs."""
+        dc_pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_dc_id",
+            event_name="Coffee Festival - Saturday",
+            revenue=25000.0,
+        )
+        philly_pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="grouped_philly_id",
+            event_name="Coffee Festival - Saturday",
+            revenue=25000.0,
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        dc_items = engine.evaluate_pacing(dc_pacing)
+        philly_items = engine.evaluate_pacing(philly_pacing)
+        # event_ids are different (synthetic MD5 includes city in name normally)
+        # but in this test the event_names are the same — only event_ids differ
+        self.assertNotEqual(dc_items[0].opportunity_id, philly_items[0].opportunity_id)
+
+    def test_opportunity_id_independent_of_constituent_order(self):
+        """Opportunity ID must be the same regardless of constituent ID order,
+        because it depends on the synthetic event_id (name+date), not on
+        the constituent list."""
+        pacing_a = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="same_grouped_id",
+            event_name="Wine Fest - Saturday",
+            constituent_event_ids=["slot_1", "slot_2", "slot_3"],
+            revenue=25000.0,
+        )
+        pacing_b = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="same_grouped_id",
+            event_name="Wine Fest - Saturday",
+            constituent_event_ids=["slot_3", "slot_1", "slot_2"],  # different order
+            revenue=25000.0,
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        items_a = engine.evaluate_pacing(pacing_a)
+        items_b = engine.evaluate_pacing(pacing_b)
+        self.assertEqual(items_a[0].opportunity_id, items_b[0].opportunity_id)
+
+    def test_opportunity_id_stable_across_runs(self):
+        """Same inputs → same opportunity ID across repeated evaluations."""
+        pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=500,
+            historical_median_at_point=1000,
+            comparison_events=["Past Edition"],
+            event_id="stable_test_id",
+            event_name="Stability Test",
+            revenue=25000.0,
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        first = engine.evaluate_pacing(pacing)[0].opportunity_id
+        second = engine.evaluate_pacing(pacing)[0].opportunity_id
+        third = engine.evaluate_pacing(pacing)[0].opportunity_id
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+
+    def test_classify_pacing_uses_day_scoped_price(self):
+        """_classify_pacing must use pacing.revenue/tickets for price."""
+        pacing = FakePacingFull(
+            pace_vs_historical=-25.0, tickets_sold=10,
+            historical_median_at_point=20,
+            comparison_events=["Past Edition"],
+            event_id="classify_test",
+            event_name="Price Scope Test",
+            revenue=1000.0,  # $100/ticket
+        )
+        engine = OpportunityEngine(self.db, FakeDecisionEngine({}))
+        cls = engine._classify_pacing(pacing)
+        self.assertEqual(cls["classification"], "opportunity")
+        # gap=10, price=$100, risk=$1000
+        self.assertIn("$1,000", cls["detail"])
 
 
 if __name__ == "__main__":

@@ -110,6 +110,25 @@ class OpportunityEngine:
         revenue = self._num(row["revenue"])
         return revenue / tickets if tickets > 0 else 0.0
 
+    def _avg_price_from_pacing(self, pacing) -> float:
+        """Compute average ticket price from a pacing object.
+
+        Prefers the pacing object's own revenue/tickets_sold (day-scoped
+        for grouped timed-entry events) over querying the DB across
+        constituent_event_ids.  The latter spans ALL days of a multi-day
+        festival, while tickets_sold and revenue on the grouped pacing
+        are scoped to ONE logical day — matching the gap calculation.
+        """
+        tickets = self._num(getattr(pacing, "tickets_sold", 0))
+        revenue = self._num(getattr(pacing, "revenue", 0))
+        if tickets > 0 and revenue > 0:
+            return revenue / tickets
+        # Fallback: query DB using constituent IDs (or event_id)
+        event_ids = getattr(pacing, "constituent_event_ids", []) or []
+        if not event_ids:
+            event_ids = [pacing.event_id]
+        return self._avg_ticket_price_for_ids(event_ids)
+
     @staticmethod
     def _has_history(pacing) -> bool:
         """True only when pacing has real historical comparison data."""
@@ -188,11 +207,7 @@ class OpportunityEngine:
         resolved pacing result from analyze_portfolio(), so it never
         calls analyze_event() itself.
         """
-        event_ids = getattr(pacing, "constituent_event_ids", []) or []
-        if not event_ids:
-            event_ids = [pacing.event_id]
-
-        avg_price = self._avg_ticket_price_for_ids(event_ids)
+        avg_price = self._avg_price_from_pacing(pacing)
         if avg_price <= 0:
             return {"classification": "no_ticket_price",
                     "detail": "Average ticket price is zero or negative"}
@@ -235,11 +250,7 @@ class OpportunityEngine:
         so that timed-entry grouping and historical matching are done
         exactly once, the same way the existing dashboard does it.
         """
-        event_ids = getattr(pacing, "constituent_event_ids", []) or []
-        if not event_ids:
-            event_ids = [pacing.event_id]
-
-        avg_price = self._avg_ticket_price_for_ids(event_ids)
+        avg_price = self._avg_price_from_pacing(pacing)
         if avg_price <= 0:
             return []
 
