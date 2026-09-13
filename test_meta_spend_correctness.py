@@ -204,13 +204,13 @@ class TestDecideSpendAwareness(unittest.TestCase):
         self.assertIn("CAC $5.00", rationale)
 
     def test_decide_stale_spend(self):
-        """When spend is stale, rationale should indicate unavailability."""
+        """When spend is stale, rationale should indicate CAC unavailable."""
         decision, urgency, rationale, actions = self.engine._decide(
             tickets=50, pace=-20.0, cac=0, days_until=30,
             hist_median=100, comparison_events=["Past Event"],
             spend_status="stale",
         )
-        self.assertIn("stale", rationale.lower())
+        self.assertIn("CAC unavailable", rationale)
 
 
 class TestGroupedSpendStatus(unittest.TestCase):
@@ -343,6 +343,397 @@ class TestEventPacingSpendStatus(unittest.TestCase):
             ad_spend=500, cac=5.0, spend_status="current_has_spend",
         )
         self.assertEqual(pacing.spend_status, "current_has_spend")
+
+
+class TestYearExtraction(unittest.TestCase):
+    """Test MetaAdsSync._extract_year() static method."""
+
+    def test_extracts_4digit_year(self):
+        self.assertEqual(MetaAdsSync._extract_year("Austin Coffee Festival 2026"), 2026)
+
+    def test_extracts_year_at_start(self):
+        self.assertEqual(MetaAdsSync._extract_year("2025 Spring Campaign"), 2025)
+
+    def test_no_year(self):
+        self.assertIsNone(MetaAdsSync._extract_year("Austin Coffee Festival"))
+
+    def test_year_boundary_low(self):
+        self.assertEqual(MetaAdsSync._extract_year("Event 2020"), 2020)
+
+    def test_year_boundary_high(self):
+        self.assertEqual(MetaAdsSync._extract_year("Event 2039"), 2039)
+
+    def test_non_year_number_ignored(self):
+        """4-digit numbers outside 2020-2039 are not extracted as years."""
+        self.assertIsNone(MetaAdsSync._extract_year("Campaign 1234"))
+        self.assertIsNone(MetaAdsSync._extract_year("Budget 5000"))
+
+    def test_first_year_wins(self):
+        """When multiple years appear, first one is extracted."""
+        self.assertEqual(MetaAdsSync._extract_year("2025 to 2026 campaign"), 2025)
+
+
+class TestYearGate(unittest.TestCase):
+    """Test that _campaign_matches_event rejects cross-year matches."""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.meta = MetaAdsSync("fake_token", "act_123", self.db)
+
+    def test_same_year_matches(self):
+        """Campaign with year 2026, event year 2026 → should match."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2026 - Awareness",
+            "Austin Coffee Festival 2026",
+            event_year=2026)
+        self.assertIsNotNone(result)
+
+    def test_different_year_rejected(self):
+        """Campaign with year 2026, event year 2025 → hard reject."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2026 - Awareness",
+            "Austin Coffee Festival 2025",
+            event_year=2025)
+        self.assertIsNone(result)
+
+    def test_campaign_no_year_still_matches(self):
+        """Campaign without a year → name matching proceeds normally."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival - Awareness",
+            "Austin Coffee Festival 2026",
+            event_year=2026)
+        self.assertIsNotNone(result)
+
+    def test_event_no_year_still_matches(self):
+        """Event without a year → name matching proceeds normally."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2026 - Awareness",
+            "Austin Coffee Festival",
+            event_year=None)
+        self.assertIsNotNone(result)
+
+
+class TestCrossYearDoubleCount(unittest.TestCase):
+    """The core defect: Austin 2026 campaign must NOT match Austin 2025 event."""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.meta = MetaAdsSync("fake_token", "act_123", self.db)
+
+    def test_austin_2026_campaign_rejects_2025_event(self):
+        """Austin Coffee Festival 2026 campaign → must not match 2025 event."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2026 - Conversions",
+            "Austin Coffee Festival 2025",
+            event_year=2025)
+        self.assertIsNone(result, "2026 campaign must not match 2025 event")
+
+    def test_austin_2026_campaign_accepts_2026_event(self):
+        """Austin Coffee Festival 2026 campaign → must match 2026 event."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2026 - Conversions",
+            "Austin Coffee Festival 2026",
+            event_year=2026)
+        self.assertIsNotNone(result)
+
+    def test_austin_2025_campaign_rejects_2026_event(self):
+        """Austin Coffee Festival 2025 campaign → must not match 2026 event."""
+        result = self.meta._campaign_matches_event(
+            "Austin Coffee Festival 2025 - Retargeting",
+            "Austin Coffee Festival 2026",
+            event_year=2026)
+        self.assertIsNone(result, "2025 campaign must not match 2026 event")
+
+    def test_three_editions_no_cross_match(self):
+        """Austin 2025/2026/2027: each campaign matches only its own edition."""
+        campaigns = [
+            "Austin Coffee 2025 - Awareness",
+            "Austin Coffee 2026 - Awareness",
+            "Austin Coffee 2027 - Awareness",
+        ]
+        events = [
+            ("Austin Coffee Festival 2025", 2025),
+            ("Austin Coffee Festival 2026", 2026),
+            ("Austin Coffee Festival 2027", 2027),
+        ]
+        for campaign in campaigns:
+            camp_year = MetaAdsSync._extract_year(campaign)
+            for event_name, event_year in events:
+                result = self.meta._campaign_matches_event(
+                    campaign, event_name, event_year=event_year)
+                if camp_year == event_year:
+                    self.assertIsNotNone(result,
+                        f"Campaign '{campaign}' should match '{event_name}'")
+                else:
+                    self.assertIsNone(result,
+                        f"Campaign '{campaign}' must NOT match '{event_name}'")
+
+
+class TestPickClosestEvent(unittest.TestCase):
+    """Test _pick_closest_event() tie-breaking logic."""
+
+    def test_prefers_upcoming_over_past(self):
+        today = date.today()
+        upcoming = {'event_id': 'e1', 'name': 'Upcoming',
+                    'event_date': (today + timedelta(days=30)).isoformat()}
+        past = {'event_id': 'e2', 'name': 'Past',
+                'event_date': (today - timedelta(days=30)).isoformat()}
+        result = MetaAdsSync._pick_closest_event([upcoming, past], today)
+        self.assertEqual(result['event_id'], 'e1')
+
+    def test_prefers_nearest_upcoming(self):
+        today = date.today()
+        near = {'event_id': 'e1', 'name': 'Near',
+                'event_date': (today + timedelta(days=10)).isoformat()}
+        far = {'event_id': 'e2', 'name': 'Far',
+               'event_date': (today + timedelta(days=90)).isoformat()}
+        result = MetaAdsSync._pick_closest_event([far, near], today)
+        self.assertEqual(result['event_id'], 'e1')
+
+    def test_prefers_most_recent_past(self):
+        today = date.today()
+        recent = {'event_id': 'e1', 'name': 'Recent',
+                  'event_date': (today - timedelta(days=10)).isoformat()}
+        old = {'event_id': 'e2', 'name': 'Old',
+               'event_date': (today - timedelta(days=200)).isoformat()}
+        result = MetaAdsSync._pick_closest_event([old, recent], today)
+        self.assertEqual(result['event_id'], 'e1')
+
+    def test_same_date_is_ambiguous(self):
+        """Two events on the exact same date → None (cannot resolve)."""
+        today = date.today()
+        same_date = (today + timedelta(days=30)).isoformat()
+        e1 = {'event_id': 'e1', 'name': 'A', 'event_date': same_date}
+        e2 = {'event_id': 'e2', 'name': 'B', 'event_date': same_date}
+        result = MetaAdsSync._pick_closest_event([e1, e2], today)
+        self.assertIsNone(result)
+
+
+class TestOneCampaignOneEvent(unittest.TestCase):
+    """sync_all_events() must assign each campaign to at most one event."""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.meta = MetaAdsSync("fake_token", "act_123", self.db)
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_yeartagged_campaign_maps_to_one_event(self, mock_insights, mock_fetch):
+        """A campaign with explicit year must not appear under multiple events."""
+        mock_fetch.return_value = [
+            {'id': 'c1', 'name': 'Austin Coffee 2026 - Awareness', 'status': 'ACTIVE'},
+        ]
+        mock_insights.return_value = [
+            {'spend': '100.00', 'impressions': '1000', 'clicks': '50',
+             'date_start': '2026-09-01'},
+        ]
+        events = [
+            {'event_id': 'evt_2025', 'name': 'Austin Coffee Festival 2025',
+             'event_date': '2025-11-15'},
+            {'event_id': 'evt_2026', 'name': 'Austin Coffee Festival 2026',
+             'event_date': '2026-11-15'},
+        ]
+        result = self.meta.sync_all_events(events)
+
+        # Campaign should match ONLY the 2026 event
+        rows = self.db.conn.execute(
+            "SELECT DISTINCT event_id FROM ad_spend").fetchall()
+        event_ids = {r['event_id'] for r in rows}
+        self.assertEqual(event_ids, {'evt_2026'},
+            "Year-tagged campaign must map to exactly one event")
+        self.assertEqual(result['campaigns_assigned'], 1)
+        self.assertEqual(result['campaigns_ambiguous'], 0)
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_untagged_campaign_maps_to_closest_event(self, mock_insights, mock_fetch):
+        """A campaign without a year should go to the closest upcoming event."""
+        today = date.today()
+        mock_fetch.return_value = [
+            {'id': 'c1', 'name': 'Austin Coffee Fest - Retargeting', 'status': 'ACTIVE'},
+        ]
+        mock_insights.return_value = [
+            {'spend': '50.00', 'impressions': '500', 'clicks': '25',
+             'date_start': today.isoformat()},
+        ]
+        events = [
+            {'event_id': 'evt_past', 'name': 'Austin Coffee Festival 2025',
+             'event_date': (today - timedelta(days=200)).isoformat()},
+            {'event_id': 'evt_upcoming', 'name': 'Austin Coffee Festival 2026',
+             'event_date': (today + timedelta(days=60)).isoformat()},
+        ]
+        result = self.meta.sync_all_events(events)
+
+        rows = self.db.conn.execute(
+            "SELECT DISTINCT event_id FROM ad_spend").fetchall()
+        event_ids = {r['event_id'] for r in rows}
+        self.assertEqual(event_ids, {'evt_upcoming'},
+            "Un-year-tagged campaign should go to upcoming event, not past")
+        self.assertEqual(result['campaigns_assigned'], 1)
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_multiple_campaigns_different_years(self, mock_insights, mock_fetch):
+        """Two campaigns for different years → each goes to its own event."""
+        mock_fetch.return_value = [
+            {'id': 'c25', 'name': 'Austin Coffee 2025 Awareness', 'status': 'PAUSED'},
+            {'id': 'c26', 'name': 'Austin Coffee 2026 Awareness', 'status': 'ACTIVE'},
+        ]
+        mock_insights.return_value = [
+            {'spend': '75.00', 'impressions': '750', 'clicks': '30',
+             'date_start': '2026-09-01'},
+        ]
+        events = [
+            {'event_id': 'evt_2025', 'name': 'Austin Coffee Festival 2025',
+             'event_date': '2025-11-15'},
+            {'event_id': 'evt_2026', 'name': 'Austin Coffee Festival 2026',
+             'event_date': '2026-11-15'},
+        ]
+        result = self.meta.sync_all_events(events)
+
+        # Each campaign should go to its own event
+        rows_2025 = self.db.conn.execute(
+            "SELECT campaign_id FROM ad_spend WHERE event_id='evt_2025'").fetchall()
+        rows_2026 = self.db.conn.execute(
+            "SELECT campaign_id FROM ad_spend WHERE event_id='evt_2026'").fetchall()
+        cids_2025 = {r['campaign_id'] for r in rows_2025}
+        cids_2026 = {r['campaign_id'] for r in rows_2026}
+        self.assertIn('c25', cids_2025)
+        self.assertNotIn('c26', cids_2025)
+        self.assertIn('c26', cids_2026)
+        self.assertNotIn('c25', cids_2026)
+        self.assertEqual(result['campaigns_assigned'], 2)
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_ambiguous_campaign_skipped(self, mock_insights, mock_fetch):
+        """Campaign that ties between two same-date events → skipped."""
+        today = date.today()
+        same_date = (today + timedelta(days=30)).isoformat()
+        mock_fetch.return_value = [
+            {'id': 'c1', 'name': 'Coffee Event Campaign', 'status': 'ACTIVE'},
+        ]
+        mock_insights.return_value = []
+
+        events = [
+            {'event_id': 'evt_a', 'name': 'Coffee Event Morning',
+             'event_date': same_date},
+            {'event_id': 'evt_b', 'name': 'Coffee Event Evening',
+             'event_date': same_date},
+        ]
+        result = self.meta.sync_all_events(events)
+
+        rows = self.db.conn.execute(
+            "SELECT COUNT(*) as cnt FROM ad_spend").fetchone()
+        self.assertEqual(rows['cnt'], 0,
+            "Ambiguous campaign should be skipped entirely")
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_different_series_no_cross_match(self, mock_insights, mock_fetch):
+        """San Diego campaign must not match Austin event."""
+        mock_fetch.return_value = [
+            {'id': 'c_sd', 'name': 'San Diego Coffee Festival 2026', 'status': 'ACTIVE'},
+        ]
+        mock_insights.return_value = [
+            {'spend': '80.00', 'impressions': '800', 'clicks': '40',
+             'date_start': '2026-08-01'},
+        ]
+        events = [
+            {'event_id': 'evt_austin', 'name': 'Austin Coffee Festival 2026',
+             'event_date': '2026-11-15'},
+            {'event_id': 'evt_sd', 'name': 'San Diego Coffee Festival 2026',
+             'event_date': '2026-08-20'},
+        ]
+        result = self.meta.sync_all_events(events)
+
+        rows = self.db.conn.execute(
+            "SELECT DISTINCT event_id FROM ad_spend").fetchall()
+        event_ids = {r['event_id'] for r in rows}
+        self.assertNotIn('evt_austin', event_ids,
+            "San Diego campaign must not match Austin event")
+        self.assertIn('evt_sd', event_ids)
+
+    @patch.object(MetaAdsSync, '_fetch_all_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_sync_event_spend_uses_override(self, mock_insights, mock_find):
+        """sync_event_spend with campaigns_override=[] skips finding."""
+        mock_insights.return_value = []
+        result = self.meta.sync_event_spend(
+            'evt_1', 'Test Event', '2026-10-01',
+            campaigns_override=[])
+        self.assertEqual(result['campaigns_found'], 0)
+        self.assertEqual(result['total_spend'], 0)
+        # _find_campaigns should NOT have been called
+        mock_find.assert_not_called()
+
+
+class TestReconcileDuplicateAttribution(unittest.TestCase):
+    """Reconciliation tool must detect and optionally fix duplicate attribution."""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+
+    def test_no_duplicates(self):
+        """Clean data → no duplicates found."""
+        self.db.save_ad_spend("evt_1", "c1", "Campaign 1", "2026-09-01", 100, 500, 20)
+        self.db.save_ad_spend("evt_2", "c2", "Campaign 2", "2026-09-01", 200, 800, 30)
+        result = MetaAdsSync.reconcile_duplicate_attribution(self.db)
+        self.assertEqual(result['duplicates_found'], 0)
+        self.assertEqual(result['rows_deleted'], 0)
+        self.assertTrue(result['dry_run'])
+
+    def test_detects_duplicate(self):
+        """Same campaign under two events → detected as duplicate."""
+        self.db.save_ad_spend("evt_1", "c1", "Campaign 1", "2026-09-01", 100, 500, 20)
+        self.db.save_ad_spend("evt_2", "c1", "Campaign 1", "2026-09-01", 100, 500, 20)
+        result = MetaAdsSync.reconcile_duplicate_attribution(self.db)
+        self.assertEqual(result['duplicates_found'], 1)
+        self.assertEqual(result['rows_deleted'], 0)  # dry_run
+        self.assertIn('evt_1', result['duplicates'][0]['event_ids'])
+        self.assertIn('evt_2', result['duplicates'][0]['event_ids'])
+
+    def test_dry_run_does_not_delete(self):
+        """Dry run detects but does not delete."""
+        self.db.save_ad_spend("evt_1", "c1", "Camp", "2026-09-01", 50, 100, 5)
+        self.db.save_ad_spend("evt_2", "c1", "Camp", "2026-09-01", 50, 100, 5)
+        result = MetaAdsSync.reconcile_duplicate_attribution(self.db, dry_run=True)
+        self.assertEqual(result['duplicates_found'], 1)
+        self.assertEqual(result['rows_deleted'], 0)
+        # Both rows should still exist
+        count = self.db.conn.execute("SELECT COUNT(*) as cnt FROM ad_spend").fetchone()
+        self.assertEqual(count['cnt'], 2)
+
+    def test_live_run_deletes_loser(self):
+        """Live run keeps highest-spend event, deletes the other."""
+        self.db.save_ad_spend("evt_1", "c1", "Camp", "2026-09-01", 200, 1000, 50)
+        self.db.save_ad_spend("evt_2", "c1", "Camp", "2026-09-01", 50, 100, 5)
+        result = MetaAdsSync.reconcile_duplicate_attribution(self.db, dry_run=False)
+        self.assertEqual(result['duplicates_found'], 1)
+        self.assertEqual(result['rows_deleted'], 1)
+        # Only evt_1 rows should remain
+        rows = self.db.conn.execute(
+            "SELECT DISTINCT event_id FROM ad_spend WHERE campaign_id='c1'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['event_id'], 'evt_1')
+
+
+class TestSyncEventSpendYearAware(unittest.TestCase):
+    """sync_event_spend() must pass event_year to _find_campaigns."""
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.meta = MetaAdsSync("fake_token", "act_123", self.db)
+
+    @patch.object(MetaAdsSync, '_find_campaigns')
+    @patch.object(MetaAdsSync, '_fetch_daily_insights')
+    def test_year_passed_to_find_campaigns(self, mock_insights, mock_find):
+        """sync_event_spend extracts year from event_date and passes it."""
+        mock_find.return_value = []
+        mock_insights.return_value = []
+        self.meta.sync_event_spend('evt_1', 'Austin Coffee Festival', '2026-11-15')
+        mock_find.assert_called_once_with('Austin Coffee Festival', event_year=2026)
 
 
 if __name__ == "__main__":

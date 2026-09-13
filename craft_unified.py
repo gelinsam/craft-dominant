@@ -2069,6 +2069,12 @@ class MetaAdsSync:
                     time.sleep(2 ** attempt)
         return None
 
+    @staticmethod
+    def _extract_year(text: str) -> Optional[int]:
+        """Extract a 4-digit year (2020-2039) from text, or None."""
+        m = re.search(r'\b(20[2-3]\d)\b', text)
+        return int(m.group(1)) if m else None
+
     def _clean_event_name(self, event_name: str) -> str:
         """Strip year, season, edition from event name and return lowercase cleaned version."""
         cleaned = re.sub(r'\b20\d{2}\b', '', event_name)
@@ -2089,54 +2095,82 @@ class MetaAdsSync:
                     break
         return abbrevs
 
-    def _campaign_matches_event(self, campaign_name: str, event_name: str) -> Optional[str]:
+    def _campaign_matches_event(self, campaign_name: str, event_name: str,
+                               event_year: Optional[int] = None) -> Optional[str]:
         """Determine if a Meta campaign belongs to a specific event.
 
         Uses strict matching to avoid cross-event contamination:
         1. Full cleaned event name appears in campaign name
         2. ALL content words from event name appear in campaign name
-        3. A known abbreviation appears as a whole word in campaign name
+        3. A known abbreviation appears as whole word in campaign name
         4. Reverse alias: campaign contains abbreviation that maps to this event
+
+        Year safety rule: if the campaign name contains a 4-digit year, it must
+        match the event's year.  If the campaign has no year but the event does,
+        name-matching proceeds but the caller decides edition preference.
 
         Returns the match reason string, or None if no match.
         """
         cleaned = self._clean_event_name(event_name)
         if not cleaned:
             return None
+
+        # --- Year gate ---
+        campaign_year = self._extract_year(campaign_name)
+        if campaign_year is not None and event_year is not None:
+            if campaign_year != event_year:
+                return None  # Hard reject: explicit year mismatch
+
         cname = campaign_name.lower()
         cname_clean = re.sub(r'[^\w\s]', '', cname)
 
+        match_reason = None
+
         # Strategy 1: Full cleaned name is substring of campaign name
         if cleaned in cname_clean:
-            return f"full name '{cleaned}'"
+            match_reason = f"full name '{cleaned}'"
 
         # Strategy 2: ALL content words present in campaign name
-        skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an', 'festival', 'fest'}
-        content_words = [w for w in cleaned.split() if w not in skip_words]
-        if len(content_words) >= 2:
-            cname_words_set = set(cname_clean.split())
-            if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
-                return f"all content words {content_words}"
+        if not match_reason:
+            skip_words = {'the', 'of', 'and', 'in', 'at', 'for', 'a', 'an', 'festival', 'fest'}
+            content_words = [w for w in cleaned.split() if w not in skip_words]
+            if len(content_words) >= 2:
+                cname_words_set = set(cname_clean.split())
+                if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
+                    match_reason = f"all content words {content_words}"
 
         # Strategy 3: Known abbreviation appears as whole word in campaign
-        abbrevs = self._get_abbreviations(event_name)
-        cname_words = set(cname_clean.split())
-        for abbr in abbrevs:
-            if abbr in cname_words:
-                return f"abbreviation '{abbr}'"
+        if not match_reason:
+            abbrevs = self._get_abbreviations(event_name)
+            cname_words = set(cname_clean.split())
+            for abbr in abbrevs:
+                if abbr in cname_words:
+                    match_reason = f"abbreviation '{abbr}'"
+                    break
 
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
-        event_lower = event_name.lower()
-        for word in cname_words:
-            if word in self.EVENT_ALIASES:
-                for pattern in self.EVENT_ALIASES[word]:
-                    if pattern in event_lower or event_lower in pattern:
-                        return f"reverse alias '{word}'->'{pattern}'"
+        if not match_reason:
+            event_lower = event_name.lower()
+            cname_words = set(re.sub(r'[^\w\s]', '', cname).split())
+            for word in cname_words:
+                if word in self.EVENT_ALIASES:
+                    for pattern in self.EVENT_ALIASES[word]:
+                        if pattern in event_lower or event_lower in pattern:
+                            match_reason = f"reverse alias '{word}'->'{pattern}'"
+                            break
+                if match_reason:
+                    break
 
-        return None
+        return match_reason
 
-    def _find_campaigns(self, event_name: str):
-        """Find Meta campaigns matching an event name using strict matching."""
+    def _find_campaigns(self, event_name: str, event_year: Optional[int] = None):
+        """Find Meta campaigns matching an event name using strict matching.
+
+        Args:
+            event_name: The event name to match against.
+            event_year: The event's year (from event_date). Campaigns with an
+                        explicit year that differs are rejected.
+        """
         cleaned = self._clean_event_name(event_name)
         if not cleaned:
             return []
@@ -2151,10 +2185,12 @@ class MetaAdsSync:
             for campaign in data.get('data', []):
                 if campaign['id'] in seen_ids:
                     continue
-                match_reason = self._campaign_matches_event(campaign['name'], event_name)
+                match_reason = self._campaign_matches_event(
+                    campaign['name'], event_name, event_year=event_year)
                 if match_reason:
                     matched.append({'id': campaign['id'], 'name': campaign['name'],
-                                    'status': campaign.get('status')})
+                                    'status': campaign.get('status'),
+                                    'match_reason': match_reason})
                     seen_ids.add(campaign['id'])
                     log.info(f"  Matched campaign '{campaign['name']}' via {match_reason}")
             paging = data.get('paging', {})
@@ -2164,8 +2200,73 @@ class MetaAdsSync:
                 params = {}
             else:
                 break
-        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}'")
+        log.info(f"Found {len(matched)} Meta campaigns for '{event_name}' (year={event_year})")
         return matched
+
+    def _fetch_all_campaigns(self):
+        """Fetch all campaigns from the Meta account (single API pagination series).
+
+        Returns a list of raw campaign dicts with id, name, status, objective.
+        Used by sync_all_events() to avoid re-fetching per event.
+        """
+        url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
+        params = {'fields': 'id,name,status,objective', 'limit': 200}
+        all_campaigns = []
+        seen_ids = set()
+        while url:
+            data = self._api_get(url, params)
+            if not data:
+                break
+            for campaign in data.get('data', []):
+                if campaign['id'] not in seen_ids:
+                    all_campaigns.append(campaign)
+                    seen_ids.add(campaign['id'])
+            paging = data.get('paging', {})
+            next_url = paging.get('next')
+            if next_url:
+                url = next_url
+                params = {}
+            else:
+                break
+        log.info(f"Fetched {len(all_campaigns)} total campaigns from Meta account")
+        return all_campaigns
+
+    @staticmethod
+    def _pick_closest_event(events, today):
+        """Given multiple tied events, pick the one closest to today.
+
+        Preference order:
+          1. Upcoming events (event_date >= today), nearest first
+          2. Past events, most recent first
+        If two events share the exact same date, returns None (truly ambiguous).
+        """
+        upcoming = []
+        past = []
+        for e in events:
+            try:
+                ed = datetime.fromisoformat(e['event_date']).date()
+            except Exception:
+                continue
+            if ed >= today:
+                upcoming.append((e, ed))
+            else:
+                past.append((e, ed))
+        # Prefer upcoming, nearest first
+        if upcoming:
+            upcoming.sort(key=lambda x: x[1])
+            if len(upcoming) > 1 and upcoming[0][1] == upcoming[1][1]:
+                return None  # Truly ambiguous — same date
+            return upcoming[0][0]
+        # Fall back to most recent past event
+        if past:
+            past.sort(key=lambda x: x[1], reverse=True)
+            if len(past) > 1 and past[0][1] == past[1][1]:
+                return None  # Truly ambiguous — same date
+            return past[0][0]
+        return None
+
+    # Match-reason strength ranking for dedup conflict resolution
+    _MATCH_RANK = {'full_name': 4, 'content_words': 3, 'abbreviation': 2, 'reverse_alias': 1}
 
     def _fetch_daily_insights(self, campaign_id: str, date_start: str, date_stop: str):
         """Fetch daily spend insights for a campaign."""
@@ -2191,20 +2292,30 @@ class MetaAdsSync:
             else:
                 break
         return insights
-    def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str):
+    def sync_event_spend(self, event_id: str, event_name: str, event_date_str: str,
+                         campaigns_override=None):
         """Sync ad spend from Meta for a single event.
 
         All API data is fetched first, then written to the database in a
         single batch transaction.  This avoids holding the SQLite write lock
         across remote API calls, which was the root cause of "database is
         locked" errors in production.
+
+        Args:
+            campaigns_override: If provided (even if empty list), use these
+                pre-assigned campaigns instead of calling _find_campaigns().
+                This is how sync_all_events() enforces one-campaign-one-event.
         """
         try:
             event_date = datetime.fromisoformat(event_date_str).date()
+            event_year = event_date.year
             today = date.today()
             date_start = (event_date - timedelta(days=300)).isoformat()
             date_stop = min(event_date, today).isoformat()
-            campaigns = self._find_campaigns(event_name)
+            if campaigns_override is not None:
+                campaigns = campaigns_override
+            else:
+                campaigns = self._find_campaigns(event_name, event_year=event_year)
             if not campaigns:
                 return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0, 'days_of_data': 0}
             # Phase 1: Fetch all data from Meta API (no DB writes)
@@ -2235,17 +2346,122 @@ class MetaAdsSync:
             return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0,
                     'days_of_data': 0, 'error': str(e)}
     def sync_all_events(self, events_list):
-        """Sync Meta ad spend for all events with observability logging."""
+        """Sync Meta ad spend with one-campaign-one-event attribution.
+
+        Architecture:
+          1. Fetch ALL campaigns from Meta once (single API pagination series).
+          2. For each campaign, match against all events and pick the single
+             best event.  Year gate rejects cross-year mismatches.  Ties are
+             broken by date proximity (upcoming > recent-past).  Truly
+             ambiguous campaigns are skipped and reported.
+          3. Sync each event with only its assigned campaigns.
+
+        This prevents the same campaign's spend from being written under
+        multiple event_ids — the root cause of cross-year double-counting.
+        """
         import time as _time
         sync_start = _time.monotonic()
+        today = date.today()
+
+        # --- Phase 1: Fetch all campaigns from Meta ---
+        all_campaigns = self._fetch_all_campaigns()
+
+        # --- Phase 2: Assign each campaign to at most one event ---
+        campaign_assignments = {}   # campaign_id -> {campaign, event, match_reason}
+        ambiguous_campaigns = []    # campaigns that tied and could not be resolved
+
+        for campaign in all_campaigns:
+            best_event = None
+            best_reason = None
+            best_rank = -1
+            tied_events = []
+
+            for event in events_list:
+                event_year = None
+                try:
+                    event_year = datetime.fromisoformat(event['event_date']).date().year
+                except Exception:
+                    pass
+
+                match_reason = self._campaign_matches_event(
+                    campaign['name'], event['name'], event_year=event_year)
+                if not match_reason:
+                    continue
+
+                rank = self._MATCH_RANK.get(match_reason, 0)
+
+                if rank > best_rank:
+                    best_event = event
+                    best_reason = match_reason
+                    best_rank = rank
+                    tied_events = [event]
+                elif rank == best_rank and best_event is not None:
+                    tied_events.append(event)
+
+            if best_event is None:
+                continue  # Campaign matched no event
+
+            if len(tied_events) > 1:
+                # Multiple events tied at the same match strength — resolve by date
+                resolved = self._pick_closest_event(tied_events, today)
+                if resolved is None:
+                    # Truly ambiguous — fail-safe: skip this campaign
+                    ambiguous_campaigns.append({
+                        'campaign_id': campaign['id'],
+                        'campaign_name': campaign['name'],
+                        'tied_events': [e['name'] for e in tied_events],
+                        'match_reason': best_reason,
+                    })
+                    log.warning(
+                        f"AMBIGUOUS: Campaign '{campaign['name']}' matched {len(tied_events)} "
+                        f"events equally ({best_reason}): "
+                        f"{[e['name'] for e in tied_events]} — skipping per fail-safe"
+                    )
+                    continue
+                best_event = resolved
+
+            campaign_assignments[campaign['id']] = {
+                'campaign': campaign,
+                'event': best_event,
+                'match_reason': best_reason,
+            }
+            log.info(
+                f"  Assigned campaign '{campaign['name']}' -> event "
+                f"'{best_event['name']}' via {best_reason}"
+            )
+
+        # --- Phase 3: Group assigned campaigns by event_id ---
+        event_campaigns = {}  # event_id -> [campaign dicts]
+        for cid, assignment in campaign_assignments.items():
+            eid = assignment['event']['event_id']
+            if eid not in event_campaigns:
+                event_campaigns[eid] = []
+            event_campaigns[eid].append({
+                'id': assignment['campaign']['id'],
+                'name': assignment['campaign']['name'],
+                'status': assignment['campaign'].get('status'),
+                'match_reason': assignment['match_reason'],
+            })
+
+        # --- Phase 4: Sync each event with its deduplicated campaigns ---
         results = {
             'total_events': len(events_list), 'successful': 0, 'failed': 0,
             'total_spend': 0.0, 'total_rows': 0,
             'matched_events': 0, 'unmatched_events': 0,
+            'total_campaigns_fetched': len(all_campaigns),
+            'campaigns_assigned': len(campaign_assignments),
+            'campaigns_ambiguous': len(ambiguous_campaigns),
+            'ambiguous_details': ambiguous_campaigns,
             'event_results': [],
         }
+
         for event in events_list:
-            result = self.sync_event_spend(event['event_id'], event['name'], event['event_date'])
+            eid = event['event_id']
+            assigned = event_campaigns.get(eid, [])
+            result = self.sync_event_spend(
+                eid, event['name'], event['event_date'],
+                campaigns_override=assigned
+            )
             results['event_results'].append(result)
             results['total_spend'] += result.get('total_spend', 0)
             results['total_rows'] += result.get('rows_written', 0)
@@ -2257,13 +2473,16 @@ class MetaAdsSync:
                     results['matched_events'] += 1
                 else:
                     results['unmatched_events'] += 1
+
         elapsed = round(_time.monotonic() - sync_start, 1)
         results['duration_seconds'] = elapsed
         log.info(
             f"Meta sync complete: {results['successful']}/{results['total_events']} events, "
             f"${results['total_spend']:.2f} spend, {results['total_rows']} rows written, "
             f"{results['matched_events']} matched / {results['unmatched_events']} unmatched, "
-            f"{results['failed']} failed, {elapsed}s elapsed"
+            f"{results['failed']} failed, {elapsed}s elapsed, "
+            f"{results['campaigns_assigned']}/{results['total_campaigns_fetched']} campaigns assigned, "
+            f"{results['campaigns_ambiguous']} ambiguous"
         )
         # Post-sync verification: readback totals
         try:
@@ -2279,6 +2498,93 @@ class MetaAdsSync:
         except Exception as e:
             log.warning(f"Post-sync verification query failed: {e}")
         return results
+
+    @staticmethod
+    def reconcile_duplicate_attribution(db: 'Database', dry_run: bool = True) -> dict:
+        """Find campaigns that have spend recorded under multiple event_ids.
+
+        This detects historical double-counting that may have occurred before
+        the year-gate and one-campaign-one-event dedup were added.
+
+        Args:
+            db: Database instance to query.
+            dry_run: If True (default), only report duplicates. If False,
+                     delete the losing rows (keep the most recent event_id).
+
+        Returns:
+            dict with 'duplicates' (list of dicts with campaign_id, campaign_name,
+            event_ids, total_spend_each) and 'rows_deleted' (0 in dry_run mode).
+        """
+        rows = db.conn.execute("""
+            SELECT campaign_id, campaign_name, event_id,
+                   SUM(spend) as total_spend, COUNT(*) as row_count
+            FROM ad_spend
+            GROUP BY campaign_id, event_id
+        """).fetchall()
+
+        # Group by campaign_id
+        by_campaign = {}
+        for r in rows:
+            cid = r['campaign_id']
+            if cid not in by_campaign:
+                by_campaign[cid] = []
+            by_campaign[cid].append({
+                'event_id': r['event_id'],
+                'campaign_name': r['campaign_name'],
+                'total_spend': float(r['total_spend'] or 0),
+                'row_count': r['row_count'],
+            })
+
+        duplicates = []
+        rows_deleted = 0
+        for cid, entries in by_campaign.items():
+            if len(entries) <= 1:
+                continue
+            dup = {
+                'campaign_id': cid,
+                'campaign_name': entries[0]['campaign_name'],
+                'event_ids': [e['event_id'] for e in entries],
+                'spend_per_event': {e['event_id']: e['total_spend'] for e in entries},
+                'total_duplicate_spend': sum(e['total_spend'] for e in entries),
+            }
+            duplicates.append(dup)
+            log.warning(
+                f"DUPLICATE ATTRIBUTION: campaign '{dup['campaign_name']}' ({cid}) "
+                f"has spend under {len(entries)} events: "
+                f"{dup['spend_per_event']}"
+            )
+            if not dry_run:
+                # Keep the entry with the highest spend, delete others
+                entries.sort(key=lambda e: e['total_spend'], reverse=True)
+                keeper = entries[0]['event_id']
+                for entry in entries[1:]:
+                    db.conn.execute(
+                        "DELETE FROM ad_spend WHERE campaign_id = ? AND event_id = ?",
+                        (cid, entry['event_id'])
+                    )
+                    rows_deleted += entry['row_count']
+                    log.info(
+                        f"  Deleted {entry['row_count']} rows for campaign {cid} "
+                        f"under event {entry['event_id']} (kept {keeper})"
+                    )
+                db.conn.commit()
+
+        result = {
+            'duplicates_found': len(duplicates),
+            'duplicates': duplicates,
+            'rows_deleted': rows_deleted,
+            'dry_run': dry_run,
+        }
+        if duplicates:
+            log.warning(
+                f"Reconciliation {'(DRY RUN) ' if dry_run else ''}: "
+                f"{len(duplicates)} campaigns with duplicate attribution, "
+                f"{rows_deleted} rows deleted"
+            )
+        else:
+            log.info("Reconciliation: no duplicate campaign attribution found")
+        return result
+
 # =============================================================================
 # DECISION ENGINE
 # =============================================================================
@@ -2455,11 +2761,9 @@ class DecisionEngine:
         if spend_known and cac > 0:
             spend_context = f"CAC ${cac:.2f}"
         elif spend_status == 'current_zero_spend':
-            spend_context = "No active paid campaigns"
-        elif spend_status == 'stale':
-            spend_context = "Paid performance unavailable (stale data)"
-        elif spend_status in ('no_records', 'unavailable', 'unknown'):
-            spend_context = "Paid performance unavailable"
+            spend_context = "No paid spend detected"
+        elif spend_status in ('stale', 'no_records', 'unavailable', 'unknown'):
+            spend_context = "CAC unavailable"
         else:
             spend_context = "Paid performance unavailable"
 
