@@ -23,11 +23,9 @@ from diagnosis_engine import DiagnosisEngine
 from dominant_agent import OpportunityEngine
 from execution_adapter import ExecutionAdapter
 from intervention_model import (
-    AuditLogger,
     IllegalTransition,
     Intervention,
     InterventionStatus,
-    InterventionStore,
 )
 from v2_backend import init_v2_backend
 
@@ -67,20 +65,16 @@ def _build_app():
     # V2 State Repository — backend selected by DATABASE_URL presence
     v2_repo = init_v2_backend(db)
 
-    # Legacy stores kept for backward compatibility with ExecutionAdapter
-    # until ExecutionAdapter is fully wired to v2_repo (Task #154 phase 2)
-    intervention_store = InterventionStore(db)
-    audit_logger = AuditLogger(db)
-    campaign_adapter = CampaignDraftAdapter(db)
+    campaign_adapter = CampaignDraftAdapter(db, v2_repo=v2_repo)
     # Wire up CraftCampaignEngine for Mailchimp sends if available
     _campaign_engine = None
     try:
         from craft_engine import CraftCampaignEngine
         if os.environ.get("MAILCHIMP_API_KEY") and os.environ.get("MAILCHIMP_AUDIENCE_ID"):
-            _campaign_engine = CraftCampaignEngine(db)
+            _campaign_engine = CraftCampaignEngine(db, v2_repo=v2_repo)
     except Exception:
         pass
-    execution_adapter = ExecutionAdapter(db, intervention_store, audit_logger, _campaign_engine)
+    execution_adapter = ExecutionAdapter(db, v2_repo, _campaign_engine)
 
     def require_command_auth(fn):
         """Protect V2 business intelligence with a server-side bearer token."""
@@ -532,7 +526,7 @@ def _build_app():
                 "message": str(e),
             }), 500
 
-        guard = SuppressionGuard(db)
+        guard = SuppressionGuard(db, v2_repo=v2_repo)
         result = guard.refresh_from_mailchimp(mc_client)
 
         if "error" in result:

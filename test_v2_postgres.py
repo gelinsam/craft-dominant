@@ -817,3 +817,218 @@ class TestPostgresAtomicity:
         entries = self.repo.get_audit_log(iv.id)
         assert len(entries) == 4
         assert [e["action"] for e in entries] == actions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Split-brain regression tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSplitBrainPrevention:
+    """Verify that ExecutionAdapter, SuppressionGuard, and CampaignDraftAdapter
+    all route V2 operational state through v2_repo, NOT through legacy
+    InterventionStore/AuditLogger/LearningStore, preventing split-brain
+    between SQLite and Postgres.
+    """
+
+    def _make_full_db(self, tmp_path):
+        """Create a full database with analytics + V2 tables."""
+        db = _MinimalDB(str(tmp_path / "split_brain_test.db"))
+        # Analytics tables (stay in SQLite)
+        db.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY, name TEXT, event_type TEXT,
+                city TEXT, event_date TEXT, capacity INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY, event_id TEXT, email TEXT,
+                order_timestamp TEXT NOT NULL DEFAULT '2026-01-01T00:00:00+00:00',
+                ticket_count INTEGER, gross_amount REAL
+            );
+            CREATE TABLE IF NOT EXISTS customers (
+                email TEXT PRIMARY KEY, favorite_city TEXT,
+                event_types TEXT, rfm_segment TEXT
+            );
+            CREATE TABLE IF NOT EXISTS suppressions (email TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id TEXT PRIMARY KEY, intervention_id TEXT, event_id TEXT,
+                subject_line TEXT, preview_text TEXT, body_html TEXT,
+                audience_json TEXT, audience_count INTEGER,
+                segment_description TEXT, status TEXT DEFAULT 'draft',
+                sent_at TEXT, created_at TEXT
+            );
+        """)
+        db.conn.commit()
+        return db
+
+    def test_execution_adapter_reads_from_v2_repo(self, tmp_path):
+        """Intervention saved via v2_repo must be readable by ExecutionAdapter."""
+        from execution_adapter import ExecutionAdapter
+
+        db = self._make_full_db(tmp_path)
+        repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, repo, campaign_engine=None)
+
+        # Save intervention via v2_repo
+        iv = _make_intervention()
+        iv.transition_to(InterventionStatus.INVESTIGATED)
+        iv.transition_to(InterventionStatus.PROPOSED)
+        repo.save_intervention(iv)
+
+        # Adapter must find it via v2_repo (not via legacy store)
+        got = repo.get_intervention(iv.id)
+        assert got is not None
+        assert got.status == InterventionStatus.PROPOSED
+
+    def test_execution_adapter_writes_audit_via_v2_repo(self, tmp_path):
+        """Audit entries written by ExecutionAdapter must be readable via v2_repo."""
+        from execution_adapter import ExecutionAdapter
+        from datetime import date, timedelta
+
+        db = self._make_full_db(tmp_path)
+        repo = SQLiteV2StateRepository(db)
+
+        # Seed event and suppression for execution path
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "split-intv", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        db.conn.commit()
+        # No suppression sentinel → execution will be blocked
+
+        adapter = ExecutionAdapter(db, repo, campaign_engine=None)
+
+        iv = _make_intervention(event_id="evt1")
+        iv.id = "split-intv"
+        iv.campaign_draft_id = "v2-d1"
+        iv.measurement_window = 7
+        iv.transition_to(InterventionStatus.INVESTIGATED)
+        iv.transition_to(InterventionStatus.PROPOSED)
+        iv.transition_to(InterventionStatus.APPROVED)
+        repo.save_intervention(iv)
+
+        # Execute — will be blocked by suppression guard (no sentinel)
+        result = adapter.execute("split-intv", actor="test")
+        assert "error" in result
+
+        # Audit must be readable via v2_repo
+        audit = repo.get_audit_log("split-intv")
+        assert len(audit) > 0
+        assert any(e["action"] == "execute_blocked" for e in audit)
+
+    def test_suppression_guard_sentinel_routes_through_v2_repo(self, tmp_path):
+        """When v2_repo is provided, sentinel reads/writes go through it."""
+        from suppression_guard import SuppressionGuard, SuppressionStatus
+
+        db = self._make_full_db(tmp_path)
+        repo = SQLiteV2StateRepository(db)
+        guard = SuppressionGuard(db, v2_repo=repo)
+
+        # No sentinel yet — should report NEVER_SYNCED
+        status, details = guard.validate()
+        assert status == SuppressionStatus.NEVER_SYNCED
+
+        # Seed a suppression row and write sentinel with last_full_refresh_at
+        # (record_sync alone doesn't set last_full_refresh_at, which validate requires)
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("test@example.com",))
+        db.conn.commit()
+        now = datetime.now(timezone.utc).isoformat()
+        repo.upsert_suppression_sentinel({
+            "last_synced_at": now,
+            "row_count": 1,
+            "source": "test_full_refresh",
+            "last_full_refresh_at": now,
+            "last_full_refresh_source": "test",
+        })
+
+        # Verify sentinel is readable via v2_repo
+        sentinel = repo.get_suppression_sentinel()
+        assert sentinel is not None
+        assert sentinel["row_count"] == 1
+
+        # Validate should now pass — sentinel was written through v2_repo
+        status, details = guard.validate()
+        assert status == SuppressionStatus.HEALTHY
+
+    def test_suppression_guard_without_v2_repo_uses_sqlite(self, tmp_path):
+        """When v2_repo is None, sentinel reads/writes go through direct SQLite."""
+        from suppression_guard import SuppressionGuard, SuppressionStatus
+
+        db = self._make_full_db(tmp_path)
+        # Ensure sentinel table exists
+        db.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS v2_suppression_sync (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_synced_at TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'unknown',
+                empty_acknowledged INTEGER NOT NULL DEFAULT 0,
+                acknowledged_by TEXT,
+                acknowledged_at TEXT,
+                acknowledged_reason TEXT,
+                last_full_refresh_at TEXT,
+                last_mutation_at TEXT,
+                last_full_refresh_source TEXT,
+                last_mutation_source TEXT
+            );
+        """)
+        guard = SuppressionGuard(db)  # no v2_repo
+
+        # Seed suppression and a full-refresh sentinel (validate requires last_full_refresh_at)
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("test@example.com",))
+        now = datetime.now(timezone.utc).isoformat()
+        db.conn.execute(
+            """INSERT OR REPLACE INTO v2_suppression_sync
+               (id, last_synced_at, row_count, source, last_full_refresh_at, last_full_refresh_source)
+               VALUES (1, ?, 1, 'test', ?, 'test')""",
+            (now, now),
+        )
+        db.conn.commit()
+
+        # Should work via direct SQLite
+        status, details = guard.validate()
+        assert status == SuppressionStatus.HEALTHY
+
+    def test_campaign_adapter_passes_v2_repo_to_suppression_guard(self, tmp_path):
+        """CampaignDraftAdapter must pass v2_repo to its SuppressionGuard."""
+        from campaign_adapter import CampaignDraftAdapter
+
+        db = self._make_full_db(tmp_path)
+        repo = SQLiteV2StateRepository(db)
+        adapter = CampaignDraftAdapter(db, v2_repo=repo)
+
+        # The adapter's suppression_guard should have v2_repo set
+        assert adapter.suppression_guard._v2_repo is repo
+
+    def test_execution_adapter_sends_records_via_v2_repo(self, tmp_path):
+        """ExecutionAdapter._record_sends must persist via v2_repo."""
+        from execution_adapter import ExecutionAdapter
+
+        db = self._make_full_db(tmp_path)
+        repo = SQLiteV2StateRepository(db)
+        adapter = ExecutionAdapter(db, repo, campaign_engine=None)
+
+        adapter._record_sends("intv-sends", "draft-1", ["a@test.com", "b@test.com"])
+
+        # Must be readable via v2_repo
+        sends = repo.get_sends("intv-sends")
+        assert len(sends) == 2
+        assert {s["email"] for s in sends} == {"a@test.com", "b@test.com"}
+
+    def test_no_legacy_store_on_execution_adapter(self):
+        """ExecutionAdapter must NOT have store/audit attributes (legacy)."""
+        from execution_adapter import ExecutionAdapter
+        import inspect
+
+        sig = inspect.signature(ExecutionAdapter.__init__)
+        params = list(sig.parameters.keys())
+        # New signature: self, db, v2_repo, campaign_engine
+        assert "v2_repo" in params
+        assert "store" not in params
+        assert "audit" not in params

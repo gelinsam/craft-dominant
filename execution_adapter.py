@@ -18,11 +18,8 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from intervention_model import (
-    AuditLogger,
     Intervention,
     InterventionStatus,
-    InterventionStore,
-    LearningStore,
 )
 from suppression_guard import SuppressionGuard, SuppressionStatus
 
@@ -45,26 +42,33 @@ class ExecutionAdapter:
     - All state transitions audited
     """
 
-    def __init__(self, db, intervention_store: InterventionStore,
-                 audit_logger: AuditLogger, campaign_engine=None):
+    def __init__(self, db, v2_repo, campaign_engine=None):
+        """Initialize with analytics DB and V2 state repository.
+
+        Args:
+            db: SQLite Database instance for analytics reads (events, orders,
+                buyers, campaigns, suppression email set).
+            v2_repo: V2StateRepository for all V2 operational state
+                     (interventions, audit, sends, learning, sentinel).
+            campaign_engine: Optional CraftCampaignEngine for Mailchimp sends.
+        """
         self.db = db
-        self.store = intervention_store
-        self.audit = audit_logger
+        self.v2_repo = v2_repo
         self.campaign_engine = campaign_engine
-        self.suppression_guard = SuppressionGuard(db)
+        self.suppression_guard = SuppressionGuard(db, v2_repo=v2_repo)
 
     def execute(self, intervention_id: str, actor: str = "system") -> Dict[str, Any]:
         """Execute an approved CRM intervention.
 
         Returns a result dict with execution status and details.
         """
-        intervention = self.store.get(intervention_id)
+        intervention = self.v2_repo.get_intervention(intervention_id)
         if not intervention:
             return {"error": "intervention_not_found"}
 
         # ── Gate 1: status must be approved ────────────────────────────
         if intervention.status != InterventionStatus.APPROVED:
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
@@ -78,7 +82,7 @@ class ExecutionAdapter:
 
         # ── Gate 2: campaign draft must exist ──────────────────────────
         if not intervention.campaign_draft_id:
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
@@ -89,7 +93,7 @@ class ExecutionAdapter:
 
         campaign = self._get_campaign_draft(intervention.campaign_draft_id)
         if not campaign:
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
@@ -103,7 +107,7 @@ class ExecutionAdapter:
             self.suppression_guard.get_suppressions_if_valid()
         )
         if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
@@ -133,7 +137,7 @@ class ExecutionAdapter:
         # Rebuild audience from scratch (never trust stale prepared audience)
         audience_emails = self._build_fresh_audience(intervention.event_id, event, exclude)
         if not audience_emails:
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
@@ -147,7 +151,7 @@ class ExecutionAdapter:
 
         if not external_send_enabled:
             # Dry-run: record what would happen, but do not make any external HTTP calls
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_dry_run",
                 from_status=intervention.status.value,
@@ -177,7 +181,7 @@ class ExecutionAdapter:
             )
         except Exception as e:
             log.error(f"Execution failed for {intervention_id}: {e}")
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="execute_failed",
                 from_status=intervention.status.value,
@@ -186,7 +190,7 @@ class ExecutionAdapter:
             )
             # Do NOT advance state on failure
             intervention.evidence["execution_error"] = str(e)
-            self.store.save(intervention)
+            self.v2_repo.save_intervention(intervention)
             return {"error": "execution_failed", "message": str(e)}
 
         # ── Transition: approved → executing → measuring ───────────────
@@ -196,12 +200,12 @@ class ExecutionAdapter:
         intervention.sent_count = len(audience_emails)
         intervention.evidence["execution_result"] = send_result
         intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
-        self.store.save(intervention)
+        self.v2_repo.save_intervention(intervention)
 
         # Record sends for attribution
         self._record_sends(intervention_id, intervention.campaign_draft_id, audience_emails)
 
-        self.audit.log(
+        self.v2_repo.append_audit(
             intervention_id, intervention.event_id,
             action="executed",
             from_status=from_status,
@@ -234,7 +238,7 @@ class ExecutionAdapter:
         - Only count orders within the attribution window
         - Label as attributed_revenue, NOT incremental or causal
         """
-        intervention = self.store.get(intervention_id)
+        intervention = self.v2_repo.get_intervention(intervention_id)
         if not intervention:
             return {"error": "intervention_not_found"}
 
@@ -244,11 +248,8 @@ class ExecutionAdapter:
                 "message": f"Measurement requires status 'measuring', got '{intervention.status.value}'",
             }
 
-        # Get sent recipients
-        sent_rows = self.db.conn.execute(
-            "SELECT email, sent_at FROM v2_campaign_sends WHERE intervention_id = ?",
-            (intervention_id,),
-        ).fetchall()
+        # Get sent recipients from v2_repo
+        sent_rows = self.v2_repo.get_sends(intervention_id)
         sent_emails = {row["email"] for row in sent_rows}
         sent_at_str = sent_rows[0]["sent_at"] if sent_rows else intervention.executed_at
 
@@ -288,7 +289,7 @@ class ExecutionAdapter:
             # Persist learning record
             self._persist_learning(intervention)
 
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="measured_complete",
                 from_status=from_status,
@@ -301,7 +302,7 @@ class ExecutionAdapter:
                 },
             )
         else:
-            self.audit.log(
+            self.v2_repo.append_audit(
                 intervention_id, intervention.event_id,
                 action="measured_partial",
                 from_status=intervention.status.value,
@@ -314,7 +315,7 @@ class ExecutionAdapter:
                 },
             )
 
-        self.store.save(intervention)
+        self.v2_repo.save_intervention(intervention)
 
         return {
             "status": "learned" if window_complete else "measuring",
@@ -414,19 +415,8 @@ class ExecutionAdapter:
 
     def _record_sends(self, intervention_id: str, campaign_draft_id: str,
                        emails: List[str]) -> None:
-        """Record sent recipients for attribution tracking."""
-        now = datetime.now(timezone.utc).isoformat()
-        for email in emails:
-            try:
-                self.db.conn.execute(
-                    """INSERT OR IGNORE INTO v2_campaign_sends
-                       (intervention_id, campaign_draft_id, email, sent_at)
-                       VALUES (?,?,?,?)""",
-                    (intervention_id, campaign_draft_id, email, now),
-                )
-            except Exception as e:
-                log.warning(f"Failed to record send for {email}: {e}")
-        self.db.conn.commit()
+        """Record sent recipients for attribution tracking via v2_repo."""
+        self.v2_repo.record_sends(intervention_id, campaign_draft_id, emails)
 
     def _compute_attribution(
         self, event_id: str, sent_emails: set,
@@ -473,7 +463,7 @@ class ExecutionAdapter:
         }
 
     def _persist_learning(self, intervention: Intervention) -> None:
-        """Write a learning record when an intervention reaches 'learned'."""
+        """Write a learning record via v2_repo when an intervention reaches 'learned'."""
         try:
             event = self.db.get_event(intervention.event_id)
             event = dict(event) if event else {}
@@ -492,8 +482,7 @@ class ExecutionAdapter:
                 else None
             )
 
-            learning_store = LearningStore(self.db)
-            learning_store.save({
+            self.v2_repo.save_learning({
                 "intervention_id": intervention.id,
                 "intervention_type": intervention.intervention_type,
                 "event_id": intervention.event_id,

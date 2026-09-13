@@ -80,11 +80,20 @@ class SuppressionGuard:
 
     Checks the v2_suppression_sync sentinel table to determine whether
     suppression data is trustworthy before allowing operations.
+
+    When v2_repo is provided, sentinel reads/writes are routed through the
+    V2StateRepository (Postgres or SQLite depending on backend selection).
+    The suppression EMAIL SET always stays in SQLite (analytics data plane).
+    When v2_repo is None, falls back to direct SQLite sentinel access for
+    backward compatibility.
     """
 
-    def __init__(self, db):
+    def __init__(self, db, v2_repo=None):
         self.db = db
-        self._ensure_sentinel_table()
+        self._v2_repo = v2_repo
+        if self._v2_repo is None:
+            # Legacy path: manage sentinel table directly in SQLite
+            self._ensure_sentinel_table()
 
     def _ensure_sentinel_table(self) -> None:
         """Create the sentinel table if it doesn't exist, and migrate schema.
@@ -152,6 +161,18 @@ class SuppressionGuard:
         ).fetchone()
         return result["cnt"] if result else 0
 
+    def _read_sentinel(self) -> Optional[Dict[str, Any]]:
+        """Read sentinel from v2_repo or direct SQLite.
+
+        Returns dict or None. Raises on error.
+        """
+        if self._v2_repo is not None:
+            return self._v2_repo.get_suppression_sentinel()
+        row = self.db.conn.execute(
+            "SELECT * FROM v2_suppression_sync WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row else None
+
     def validate(self) -> Tuple[SuppressionStatus, Dict[str, Any]]:
         """Check suppression state. Returns (status, details).
 
@@ -165,9 +186,7 @@ class SuppressionGuard:
 
         # Step 1: Read the sentinel
         try:
-            row = self.db.conn.execute(
-                "SELECT * FROM v2_suppression_sync WHERE id = 1"
-            ).fetchone()
+            row = self._read_sentinel()
         except Exception as e:
             return SuppressionStatus.UNAVAILABLE, {
                 "reason": f"Cannot read suppression sentinel: {e}",
@@ -349,6 +368,67 @@ class SuppressionGuard:
 
         return status, details, emails
 
+    def _write_sentinel(self, data: Dict[str, Any]) -> None:
+        """Write sentinel through v2_repo or direct SQLite."""
+        if self._v2_repo is not None:
+            self._v2_repo.upsert_suppression_sentinel(data)
+            return
+        # Legacy direct SQLite path
+        now = data.get("last_synced_at", datetime.now(timezone.utc).isoformat())
+        row_count = data.get("row_count", 0)
+        source = data.get("source", "unknown")
+
+        if row_count > 0:
+            self.db.conn.execute(
+                """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                       empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason,
+                       last_mutation_at, last_mutation_source,
+                       last_full_refresh_at, last_full_refresh_source)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       last_synced_at = excluded.last_synced_at,
+                       row_count = excluded.row_count,
+                       source = excluded.source,
+                       empty_acknowledged = COALESCE(excluded.empty_acknowledged, v2_suppression_sync.empty_acknowledged),
+                       acknowledged_by = CASE WHEN excluded.empty_acknowledged = 0 THEN NULL ELSE COALESCE(excluded.acknowledged_by, v2_suppression_sync.acknowledged_by) END,
+                       acknowledged_at = CASE WHEN excluded.empty_acknowledged = 0 THEN NULL ELSE COALESCE(excluded.acknowledged_at, v2_suppression_sync.acknowledged_at) END,
+                       acknowledged_reason = CASE WHEN excluded.empty_acknowledged = 0 THEN NULL ELSE COALESCE(excluded.acknowledged_reason, v2_suppression_sync.acknowledged_reason) END,
+                       last_mutation_at = COALESCE(excluded.last_mutation_at, v2_suppression_sync.last_mutation_at),
+                       last_mutation_source = COALESCE(excluded.last_mutation_source, v2_suppression_sync.last_mutation_source),
+                       last_full_refresh_at = COALESCE(excluded.last_full_refresh_at, v2_suppression_sync.last_full_refresh_at),
+                       last_full_refresh_source = COALESCE(excluded.last_full_refresh_source, v2_suppression_sync.last_full_refresh_source)""",
+                (now, row_count, source,
+                 data.get("empty_acknowledged", 0),
+                 data.get("acknowledged_by"),
+                 data.get("acknowledged_at"),
+                 data.get("acknowledged_reason"),
+                 data.get("last_mutation_at"),
+                 data.get("last_mutation_source"),
+                 data.get("last_full_refresh_at"),
+                 data.get("last_full_refresh_source")),
+            )
+        else:
+            self.db.conn.execute(
+                """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
+                       last_mutation_at, last_mutation_source,
+                       last_full_refresh_at, last_full_refresh_source)
+                   VALUES (1, ?, 0, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       last_synced_at = excluded.last_synced_at,
+                       row_count = 0,
+                       source = excluded.source,
+                       last_mutation_at = COALESCE(excluded.last_mutation_at, v2_suppression_sync.last_mutation_at),
+                       last_mutation_source = COALESCE(excluded.last_mutation_source, v2_suppression_sync.last_mutation_source),
+                       last_full_refresh_at = COALESCE(excluded.last_full_refresh_at, v2_suppression_sync.last_full_refresh_at),
+                       last_full_refresh_source = COALESCE(excluded.last_full_refresh_source, v2_suppression_sync.last_full_refresh_source)""",
+                (now, source,
+                 data.get("last_mutation_at"),
+                 data.get("last_mutation_source"),
+                 data.get("last_full_refresh_at"),
+                 data.get("last_full_refresh_source")),
+            )
+        self.db.conn.commit()
+
     def record_mutation(self, source: str = "webhook") -> Dict[str, Any]:
         """Update the sentinel after a successful suppression table mutation.
 
@@ -377,42 +457,22 @@ class SuppressionGuard:
                 "source": source,
             }
 
+        sentinel_data = {
+            "last_synced_at": now,
+            "row_count": actual_count,
+            "source": source,
+            "last_mutation_at": now,
+            "last_mutation_source": source,
+        }
+        if actual_count > 0:
+            # Real rows exist — clear any acknowledgment state
+            sentinel_data["empty_acknowledged"] = 0
+            sentinel_data["acknowledged_by"] = None
+            sentinel_data["acknowledged_at"] = None
+            sentinel_data["acknowledged_reason"] = None
+
         try:
-            if actual_count > 0:
-                # Real rows exist — clear any acknowledgment state
-                # Note: last_full_refresh_at is deliberately NOT updated here
-                self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason,
-                           last_mutation_at, last_mutation_source)
-                       VALUES (1, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?)
-                       ON CONFLICT(id) DO UPDATE SET
-                           last_synced_at = excluded.last_synced_at,
-                           row_count = excluded.row_count,
-                           source = excluded.source,
-                           empty_acknowledged = 0,
-                           acknowledged_by = NULL,
-                           acknowledged_at = NULL,
-                           acknowledged_reason = NULL,
-                           last_mutation_at = excluded.last_mutation_at,
-                           last_mutation_source = excluded.last_mutation_source""",
-                    (now, actual_count, source, now, source),
-                )
-            else:
-                # Zero rows — preserve acknowledgment state, update count and time
-                self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           last_mutation_at, last_mutation_source)
-                       VALUES (1, ?, 0, ?, ?, ?)
-                       ON CONFLICT(id) DO UPDATE SET
-                           last_synced_at = excluded.last_synced_at,
-                           row_count = 0,
-                           source = excluded.source,
-                           last_mutation_at = excluded.last_mutation_at,
-                           last_mutation_source = excluded.last_mutation_source""",
-                    (now, source, now, source),
-                )
-            self.db.conn.commit()
+            self._write_sentinel(sentinel_data)
         except Exception as e:
             log.error(f"record_mutation: cannot update sentinel: {e}")
             return {
@@ -440,34 +500,18 @@ class SuppressionGuard:
         """
         now = datetime.now(timezone.utc).isoformat()
 
-        # If real rows are synced, clear acknowledgment state
+        sentinel_data = {
+            "last_synced_at": now,
+            "row_count": row_count,
+            "source": source,
+        }
         if row_count > 0:
-            self.db.conn.execute(
-                """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                       empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason)
-                   VALUES (1, ?, ?, ?, 0, NULL, NULL, NULL)
-                   ON CONFLICT(id) DO UPDATE SET
-                       last_synced_at = excluded.last_synced_at,
-                       row_count = excluded.row_count,
-                       source = excluded.source,
-                       empty_acknowledged = 0,
-                       acknowledged_by = NULL,
-                       acknowledged_at = NULL,
-                       acknowledged_reason = NULL""",
-                (now, row_count, source),
-            )
-        else:
-            # Zero rows — preserve acknowledgment state if it exists; update sync time
-            self.db.conn.execute(
-                """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source)
-                   VALUES (1, ?, 0, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       last_synced_at = excluded.last_synced_at,
-                       row_count = 0,
-                       source = excluded.source""",
-                (now, source),
-            )
-        self.db.conn.commit()
+            sentinel_data["empty_acknowledged"] = 0
+            sentinel_data["acknowledged_by"] = None
+            sentinel_data["acknowledged_at"] = None
+            sentinel_data["acknowledged_reason"] = None
+
+        self._write_sentinel(sentinel_data)
 
     def refresh_from_mailchimp(self, mailchimp_client) -> Dict[str, Any]:
         """Perform an authoritative full-refresh of suppressions from Mailchimp.
@@ -475,10 +519,16 @@ class SuppressionGuard:
         This is the bootstrap and ongoing refresh path. It:
         1. Queries Mailchimp for ALL unsubscribed + cleaned members (paginated).
         2. Normalizes emails (lowercase, stripped).
-        3. In a single local transaction: replaces the entire suppressions table,
-           then updates the sentinel with exact count, timestamp, and source.
-        4. If the Mailchimp query fails at any point, returns an error WITHOUT
-           touching local state — all-or-nothing from the sentinel's perspective.
+        3. Replaces the entire suppressions table in SQLite (email data plane).
+        4. Verifies the count matches.
+        5. Updates the sentinel (through v2_repo if available, else SQLite).
+        6. If sentinel update fails, FAIL CLOSED — email set is already
+           committed but sentinel mismatch will block operations safely.
+
+        Safe cross-database ordering when v2_repo uses Postgres:
+            (A) fetch Mailchimp → (B) replace SQLite suppression set →
+            (C) verify count → (D) update v2_repo sentinel.
+            If D fails, operations are blocked (sentinel stale/mismatched).
 
         Returns dict with either {"refreshed": True, "row_count": N, ...}
         or {"error": "..."}.
@@ -503,64 +553,63 @@ class SuppressionGuard:
         count = len(normalized)
         log.info(f"refresh_from_mailchimp: {count} unique suppressed emails from Mailchimp")
 
-        # Step 3: Atomic local replacement — transaction wraps both tables
+        # Step 3: Replace email set in SQLite (analytics data plane)
         now = datetime.now(timezone.utc).isoformat()
         try:
-            # Delete all existing suppressions
             self.db.conn.execute("DELETE FROM suppressions")
-
-            # Insert the authoritative set
             for email in normalized:
                 self.db.conn.execute(
                     "INSERT OR IGNORE INTO suppressions (email, reason) "
                     "VALUES (?, 'mailchimp_suppressed')",
                     (email,),
                 )
-
-            # Update sentinel — clear any acknowledgment if real rows exist
-            # CRITICAL: Set last_full_refresh_at — this IS the authoritative freshness
-            if count > 0:
-                self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           empty_acknowledged, acknowledged_by, acknowledged_at, acknowledged_reason,
-                           last_full_refresh_at, last_full_refresh_source)
-                       VALUES (1, ?, ?, 'mailchimp_full_refresh', 0, NULL, NULL, NULL, ?, 'mailchimp_full_refresh')
-                       ON CONFLICT(id) DO UPDATE SET
-                           last_synced_at = excluded.last_synced_at,
-                           row_count = excluded.row_count,
-                           source = 'mailchimp_full_refresh',
-                           empty_acknowledged = 0,
-                           acknowledged_by = NULL,
-                           acknowledged_at = NULL,
-                           acknowledged_reason = NULL,
-                           last_full_refresh_at = excluded.last_full_refresh_at,
-                           last_full_refresh_source = 'mailchimp_full_refresh'""",
-                    (now, count, now),
-                )
-            else:
-                # Zero suppressions from Mailchimp — preserve acknowledgment state
-                self.db.conn.execute(
-                    """INSERT INTO v2_suppression_sync (id, last_synced_at, row_count, source,
-                           last_full_refresh_at, last_full_refresh_source)
-                       VALUES (1, ?, 0, 'mailchimp_full_refresh', ?, 'mailchimp_full_refresh')
-                       ON CONFLICT(id) DO UPDATE SET
-                           last_synced_at = excluded.last_synced_at,
-                           row_count = 0,
-                           source = 'mailchimp_full_refresh',
-                           last_full_refresh_at = excluded.last_full_refresh_at,
-                           last_full_refresh_source = 'mailchimp_full_refresh'""",
-                    (now, now),
-                )
-
             self.db.conn.commit()
         except Exception as e:
-            # Rollback on any failure — suppressions and sentinel stay untouched
             try:
                 self.db.conn.rollback()
             except Exception:
                 pass
-            log.error(f"refresh_from_mailchimp: local write failed: {e}")
+            log.error(f"refresh_from_mailchimp: SQLite email write failed: {e}")
             return {"error": f"Local write failed — suppressions NOT updated: {e}"}
+
+        # Step 4: Verify count
+        try:
+            actual_count = self._actual_suppression_count()
+            if actual_count != count:
+                log.warning(
+                    f"refresh_from_mailchimp: count mismatch after write: "
+                    f"expected {count}, got {actual_count}"
+                )
+                count = actual_count
+        except Exception as e:
+            log.error(f"refresh_from_mailchimp: count verification failed: {e}")
+            return {"error": f"Count verification failed after write: {e}"}
+
+        # Step 5: Update sentinel (through v2_repo or direct SQLite)
+        # If this fails, the email set is committed but sentinel is stale/mismatched
+        # which will BLOCK operations (fail closed) — correct safety behavior.
+        sentinel_data = {
+            "last_synced_at": now,
+            "row_count": count,
+            "source": "mailchimp_full_refresh",
+            "last_full_refresh_at": now,
+            "last_full_refresh_source": "mailchimp_full_refresh",
+        }
+        if count > 0:
+            sentinel_data["empty_acknowledged"] = 0
+            sentinel_data["acknowledged_by"] = None
+            sentinel_data["acknowledged_at"] = None
+            sentinel_data["acknowledged_reason"] = None
+
+        try:
+            self._write_sentinel(sentinel_data)
+        except Exception as e:
+            log.error(f"refresh_from_mailchimp: sentinel update failed: {e}")
+            return {
+                "error": f"Sentinel update failed — operations will be blocked "
+                         f"until sentinel is corrected: {e}",
+                "emails_written": count,
+            }
 
         log.info(f"refresh_from_mailchimp: complete. {count} suppressions, sentinel updated.")
         return {
@@ -589,7 +638,11 @@ class SuppressionGuard:
 
         now = datetime.now(timezone.utc)
 
-        # Check that sentinel exists (sync must have occurred)
+        # If v2_repo is available, delegate to it
+        if self._v2_repo is not None:
+            return self._v2_repo.acknowledge_empty_suppressions(actor, reason)
+
+        # Legacy direct SQLite path
         try:
             row = self.db.conn.execute(
                 "SELECT * FROM v2_suppression_sync WHERE id = 1"
