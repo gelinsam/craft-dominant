@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from intervention_model import Intervention, InterventionStatus
+from suppression_guard import SuppressionGuard, SuppressionStatus
 
 log = logging.getLogger("craft.campaign_adapter")
 
@@ -42,6 +43,7 @@ class CampaignDraftAdapter:
         """
         self.db = db
         self.campaign_engine = campaign_engine
+        self.suppression_guard = SuppressionGuard(db)
 
     def prepare_draft(
         self,
@@ -154,15 +156,16 @@ class CampaignDraftAdapter:
         buyers = self.db.get_event_buyers(event_id)
         buyer_set = set(buyers)
 
-        # Get suppressions — this is a hard invariant.
-        # If we cannot verify the suppression list, we MUST NOT produce an audience.
-        suppressed = set()
-        try:
-            rows = self.db.conn.execute("SELECT email FROM suppressions").fetchall()
-            suppressed = {r["email"] for r in rows}
-        except Exception as e:
+        # Get suppressions — fail-closed invariant.
+        # Suppression data must be positively validated via the sync sentinel.
+        # If suppression state is unknown, stale, or unverified-empty, block.
+        supp_status, supp_details, suppressed = (
+            self.suppression_guard.get_suppressions_if_valid()
+        )
+        if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             raise ValueError(
-                f"Cannot verify suppression list: {e}. "
+                f"Suppression check failed ({supp_status.value}): "
+                f"{supp_details.get('reason', 'unknown')}. "
                 "Campaign draft blocked to prevent sending to unsubscribed contacts."
             )
 

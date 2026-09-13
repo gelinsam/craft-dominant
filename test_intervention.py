@@ -27,6 +27,20 @@ from campaign_adapter import (
     EMAIL_CONVERSION_RATE,
     CHAMPION_MULTIPLIER,
 )
+from suppression_guard import SuppressionGuard, SuppressionStatus, SENTINEL_TABLE_SCHEMA
+
+
+def _seed_valid_suppression_sentinel(db, row_count=1, source="test"):
+    """Create a valid, fresh suppression sentinel for tests that need healthy suppression state."""
+    from datetime import datetime, timezone
+    db.conn.executescript(SENTINEL_TABLE_SCHEMA)
+    now = datetime.now(timezone.utc).isoformat()
+    db.conn.execute(
+        """INSERT OR REPLACE INTO v2_suppression_sync
+           (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
+        (now, row_count, source),
+    )
+    db.conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -368,6 +382,7 @@ class TestCampaignAdapter(unittest.TestCase):
             ("crm0@example.com",),
         )
         self.db.conn.commit()
+        _seed_valid_suppression_sentinel(self.db, row_count=1)
         self.adapter = CampaignDraftAdapter(self.db)
 
     def test_prepare_draft_creates_record(self):
@@ -693,6 +708,10 @@ class TestExecutionAdapter(unittest.TestCase):
                 "INSERT INTO customers VALUES (?,?,?,?)",
                 (f"audience{i}@example.com", "Philadelphia", "coffee", "regular"),
             )
+        # Seed suppressed email so sentinel is healthy (non-empty)
+        self.db.conn.execute(
+            "INSERT INTO suppressions VALUES (?)", ("suppressed@example.com",)
+        )
         # Seed campaign draft
         self.db.conn.execute(
             """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
@@ -700,6 +719,7 @@ class TestExecutionAdapter(unittest.TestCase):
             ("v2-draft-1", "test-intv", "evt1", "Test subject", 50, "draft", "2026-01-01"),
         )
         self.db.conn.commit()
+        _seed_valid_suppression_sentinel(self.db, row_count=1)
 
     def _make_approved_intervention(self, intv_id="test-intv"):
         """Helper: create an approved intervention linked to campaign draft."""
@@ -765,7 +785,7 @@ class TestExecutionAdapter(unittest.TestCase):
         result = self.adapter.execute(i.id, actor="user")
         self.assertEqual(result["error"], "campaign_draft_missing")
 
-    # Gate 3: suppression list
+    # Gate 3: suppression list (fail-closed)
     def test_execute_blocks_suppression_unavailable(self):
         """Execute must block if suppression list is unreadable."""
         i = self._make_approved_intervention()
@@ -774,6 +794,16 @@ class TestExecutionAdapter(unittest.TestCase):
 
         result = self.adapter.execute(i.id, actor="user")
         self.assertEqual(result["error"], "suppression_unavailable")
+
+    def test_execute_blocks_no_sentinel(self):
+        """Execute must block if suppression sentinel has never been created."""
+        i = self._make_approved_intervention()
+        # Remove sentinel — simulates first boot with no sync
+        self.db.conn.execute("DELETE FROM v2_suppression_sync")
+        self.db.conn.commit()
+
+        result = self.adapter.execute(i.id, actor="user")
+        self.assertEqual(result["error"], "suppression_never_synced")
 
     # Gate 5: external send flag
     def test_execute_dry_run_without_flag(self):
@@ -1434,11 +1464,15 @@ class TestNoExternalHTTPByDefault(unittest.TestCase):
                 (f"c{i}@test.com", "Phila", "coffee", "regular"),
             )
         db.conn.execute(
+            "INSERT INTO suppressions VALUES (?)", ("suppressed@test.com",)
+        )
+        db.conn.execute(
             """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
                audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
             ("v2-d1", "test-intv", "evt1", "Subj", 10, "draft", "2026-01-01"),
         )
         db.conn.commit()
+        _seed_valid_suppression_sentinel(db, row_count=1)
 
         adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
 
@@ -1464,6 +1498,434 @@ class TestNoExternalHTTPByDefault(unittest.TestCase):
         self.assertEqual(loaded.status, InterventionStatus.APPROVED)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Suppression Guard fail-closed regression tests
+# ─────────────────────────────────────────────────────────────────────
+
+class TestSuppressionGuard(unittest.TestCase):
+    """Regression tests for suppression guard fail-closed behavior.
+
+    Priority: customer safety > fail-closed behavior > correctness > auditability.
+    Every ambiguous or missing state MUST block.
+    """
+
+    def _make_db(self):
+        """Create a minimal in-memory DB with suppressions table."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE suppressions (email TEXT PRIMARY KEY)")
+        conn.commit()
+
+        class MinimalDB:
+            pass
+
+        db = MinimalDB()
+        db.conn = conn
+        return db
+
+    def _seed_sentinel(self, db, row_count=1, source="test", age_hours=0):
+        """Seed a sentinel with configurable age."""
+        from datetime import datetime, timezone, timedelta as td
+        db.conn.executescript(SENTINEL_TABLE_SCHEMA)
+        synced_at = (datetime.now(timezone.utc) - td(hours=age_hours)).isoformat()
+        db.conn.execute(
+            """INSERT OR REPLACE INTO v2_suppression_sync
+               (id, last_synced_at, row_count, source) VALUES (1, ?, ?, ?)""",
+            (synced_at, row_count, source),
+        )
+        db.conn.commit()
+
+    def _acknowledge_empty(self, db, actor="admin", reason="legit empty", age_hours=0):
+        """Set acknowledgment on an existing sentinel."""
+        from datetime import datetime, timezone, timedelta as td
+        ack_at = (datetime.now(timezone.utc) - td(hours=age_hours)).isoformat()
+        db.conn.execute(
+            """UPDATE v2_suppression_sync SET
+                   empty_acknowledged = 1,
+                   acknowledged_by = ?,
+                   acknowledged_at = ?,
+                   acknowledged_reason = ?
+               WHERE id = 1""",
+            (actor, ack_at, reason),
+        )
+        db.conn.commit()
+
+    # --- Blocked states ---
+
+    def test_no_sentinel_blocks(self):
+        """No sentinel row → NEVER_SYNCED → blocked."""
+        db = self._make_db()
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+
+    def test_zero_rows_no_acknowledgment_blocks(self):
+        """Sentinel exists + zero rows + no acknowledgment → EMPTY_UNVERIFIED → blocked."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.EMPTY_UNVERIFIED)
+        self.assertFalse(guard.is_valid())
+
+    def test_expired_acknowledgment_blocks(self):
+        """Acknowledgment older than 24 hours → EMPTY_UNVERIFIED → blocked."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db, age_hours=25)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.EMPTY_UNVERIFIED)
+        self.assertFalse(guard.is_valid())
+        self.assertIn("expired", details.get("reason", "").lower())
+
+    def test_stale_sentinel_blocks(self):
+        """Sentinel synced > 24 hours ago → STALE → blocked."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1, age_hours=25)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.STALE)
+        self.assertFalse(guard.is_valid())
+
+    def test_suppression_query_error_blocks(self):
+        """Sentinel valid but suppressions table dropped → UNAVAILABLE → blocked."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1)
+        guard = SuppressionGuard(db)
+        # Drop the table after guard is created
+        db.conn.execute("DROP TABLE suppressions")
+        db.conn.commit()
+        status, details, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.UNAVAILABLE)
+        self.assertEqual(emails, set())
+
+    # --- Allowed states ---
+
+    def test_healthy_sentinel_nonzero_rows_allowed(self):
+        """Sentinel fresh + row_count > 0 → HEALTHY → allowed."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=1)
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertTrue(guard.is_valid())
+
+    def test_acknowledged_empty_allowed(self):
+        """Sentinel + zero rows + valid acknowledgment → ACKNOWLEDGED_EMPTY → allowed."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db, actor="admin", reason="New org, no unsubscribes yet")
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.ACKNOWLEDGED_EMPTY)
+        self.assertTrue(guard.is_valid())
+
+    # --- Suppression data correctness ---
+
+    def test_suppressed_email_excluded(self):
+        """get_suppressions_if_valid returns actual suppressed emails."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("unsub@test.com",))
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("optout@test.com",))
+        db.conn.commit()
+        self._seed_sentinel(db, row_count=2)
+        guard = SuppressionGuard(db)
+        status, details, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.HEALTHY)
+        self.assertEqual(emails, {"unsub@test.com", "optout@test.com"})
+
+    def test_invalid_state_returns_empty_set(self):
+        """get_suppressions_if_valid returns empty set when state is invalid."""
+        db = self._make_db()
+        guard = SuppressionGuard(db)
+        status, details, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertEqual(emails, set())
+
+    # --- record_sync behavior ---
+
+    def test_record_sync_with_rows_clears_acknowledgment(self):
+        """Syncing with row_count > 0 must clear any prior acknowledgment."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db)
+        guard = SuppressionGuard(db)
+        guard.record_sync(row_count=5, source="mailchimp")
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["row_count"], 5)
+        self.assertEqual(row["empty_acknowledged"], 0)
+        self.assertIsNone(row["acknowledged_by"])
+
+    def test_record_sync_zero_preserves_acknowledgment(self):
+        """Syncing with zero rows must preserve existing acknowledgment."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        self._acknowledge_empty(db, actor="admin", reason="legit")
+        guard = SuppressionGuard(db)
+        guard.record_sync(row_count=0, source="mailchimp")
+        row = db.conn.execute("SELECT * FROM v2_suppression_sync WHERE id = 1").fetchone()
+        row = dict(row)
+        self.assertEqual(row["empty_acknowledged"], 1)
+        self.assertEqual(row["acknowledged_by"], "admin")
+
+    # --- acknowledge_empty validation ---
+
+    def test_acknowledge_requires_actor(self):
+        """Empty or blank actor must raise ValueError."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        guard = SuppressionGuard(db)
+        with self.assertRaises(ValueError):
+            guard.acknowledge_empty("", "reason")
+        with self.assertRaises(ValueError):
+            guard.acknowledge_empty("  ", "reason")
+
+    def test_acknowledge_requires_reason(self):
+        """Empty or blank reason must raise ValueError."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=0)
+        guard = SuppressionGuard(db)
+        with self.assertRaises(ValueError):
+            guard.acknowledge_empty("admin", "")
+
+    def test_acknowledge_rejects_nonempty_list(self):
+        """Cannot acknowledge empty when row_count > 0."""
+        db = self._make_db()
+        self._seed_sentinel(db, row_count=5)
+        guard = SuppressionGuard(db)
+        with self.assertRaises(ValueError) as ctx:
+            guard.acknowledge_empty("admin", "reason")
+        self.assertIn("5 rows", str(ctx.exception))
+
+    def test_acknowledge_rejects_no_sync(self):
+        """Cannot acknowledge if no sync has ever occurred."""
+        db = self._make_db()
+        guard = SuppressionGuard(db)
+        with self.assertRaises(ValueError):
+            guard.acknowledge_empty("admin", "reason")
+
+    # --- Integration: prepare blocks ---
+
+    def test_prepare_blocks_when_suppression_invalid(self):
+        """CampaignDraftAdapter.prepare_draft must raise when suppression state is invalid."""
+        db = FakeCampaignDB()
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.commit()
+        # No sentinel seeded → NEVER_SYNCED
+        adapter = CampaignDraftAdapter(db)
+        intervention = Intervention.create(
+            opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", confidence=0.5,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            adapter.prepare_draft(intervention, {"avg_ticket_price": 50.0, "crm_champions": 0})
+        self.assertIn("suppression", str(ctx.exception).lower())
+
+    # --- Integration: execute blocks ---
+
+    def test_execute_blocks_when_suppression_invalid(self):
+        """ExecutionAdapter.execute must block when suppression state is invalid."""
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        db = FakeExecutionDB()
+        store = InterventionStore(db)
+        audit = AuditLogger(db)
+        db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "intv1", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        db.conn.commit()
+        # No sentinel → NEVER_SYNCED
+
+        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        i = Intervention(
+            id="intv1", opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", status=InterventionStatus.NEW,
+            campaign_draft_id="v2-d1", measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        store.save(i)
+
+        result = adapter.execute("intv1", actor="user")
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "suppression_never_synced")
+
+        # Verify NO state change
+        loaded = store.get("intv1")
+        self.assertEqual(loaded.status, InterventionStatus.APPROVED)
+
+    def test_blocked_path_writes_audit_entry(self):
+        """Blocked execution must write an audit log entry."""
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        db = FakeExecutionDB()
+        store = InterventionStore(db)
+        audit = AuditLogger(db)
+        db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "intv-audit", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        db.conn.commit()
+        # No sentinel → blocked
+
+        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        i = Intervention(
+            id="intv-audit", opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", status=InterventionStatus.NEW,
+            campaign_draft_id="v2-d1", measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        store.save(i)
+
+        adapter.execute("intv-audit", actor="user")
+
+        # Check audit log
+        rows = db.conn.execute(
+            "SELECT * FROM intervention_audit_log WHERE intervention_id = ? AND action = 'execute_blocked'",
+            ("intv-audit",),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = dict(rows[0])
+        self.assertIn("suppression", row.get("error", "").lower())
+
+    def test_blocked_path_makes_zero_external_http_calls(self):
+        """Blocked execution must not make any external HTTP calls.
+
+        Since V2_ENABLE_EXTERNAL_SEND is not set and the suppression
+        guard blocks before that check, no HTTP calls should be possible.
+        The adapter never reaches the Mailchimp send code path.
+        """
+        from intervention_model import AuditLogger, CAMPAIGN_SENDS_SCHEMA, LEARNING_RECORD_SCHEMA
+        from execution_adapter import ExecutionAdapter
+
+        db = FakeExecutionDB()
+        store = InterventionStore(db)
+        audit = AuditLogger(db)
+        db.conn.executescript(CAMPAIGN_SENDS_SCHEMA)
+        db.conn.executescript(LEARNING_RECORD_SCHEMA)
+
+        event_date = (date.today() + timedelta(days=30)).isoformat()
+        db.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            ("evt1", "Test", "coffee", "Phila", event_date, 1000),
+        )
+        db.conn.execute(
+            """INSERT INTO campaigns (id, intervention_id, event_id, subject_line,
+               audience_count, status, created_at) VALUES (?,?,?,?,?,?,?)""",
+            ("v2-d1", "intv-nohttp", "evt1", "Subj", 10, "draft", "2026-01-01"),
+        )
+        db.conn.commit()
+        # No sentinel → blocked before any HTTP could happen
+
+        adapter = ExecutionAdapter(db, store, audit, campaign_engine=None)
+        i = Intervention(
+            id="intv-nohttp", opportunity_id="opp1", event_id="evt1",
+            intervention_type="crm_campaign", status=InterventionStatus.NEW,
+            campaign_draft_id="v2-d1", measurement_window=7,
+        )
+        i.transition_to(InterventionStatus.INVESTIGATED)
+        i.transition_to(InterventionStatus.PROPOSED)
+        i.transition_to(InterventionStatus.APPROVED)
+        store.save(i)
+
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+        result = adapter.execute("intv-nohttp", actor="user")
+        # Blocked at suppression gate — never reached external send
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "suppression_never_synced")
+
+        # State unchanged
+        loaded = store.get("intv-nohttp")
+        self.assertEqual(loaded.status, InterventionStatus.APPROVED)
+
+    # --- Production failure mode regression ---
+
+    def test_production_failure_mode_schema_recreated_sentinel_missing(self):
+        """CRITICAL REGRESSION: Railway restart recreates schema, loses suppression
+        rows AND sentinel. This MUST block.
+
+        Scenario: ephemeral SQLite → redeploy → schema recreated via
+        CREATE TABLE IF NOT EXISTS → all rows lost → suppression table
+        exists but is empty → sentinel table exists but is empty.
+        """
+        db = self._make_db()
+        # Simulate: schema exists, but both tables are empty (restart scenario)
+        db.conn.executescript(SENTINEL_TABLE_SCHEMA)
+        db.conn.commit()
+        # Suppressions table exists but is empty
+        # Sentinel table exists but has no rows
+        guard = SuppressionGuard(db)
+        status, details = guard.validate()
+        self.assertEqual(status, SuppressionStatus.NEVER_SYNCED)
+        self.assertFalse(guard.is_valid())
+
+        # Also verify get_suppressions_if_valid blocks
+        status2, details2, emails = guard.get_suppressions_if_valid()
+        self.assertEqual(status2, SuppressionStatus.NEVER_SYNCED)
+        self.assertEqual(emails, set())
+
+    def test_configurable_max_age(self):
+        """SUPPRESSION_MAX_AGE_HOURS env var overrides default threshold."""
+        db = self._make_db()
+        db.conn.execute("INSERT INTO suppressions VALUES (?)", ("a@test.com",))
+        db.conn.commit()
+        # Synced 5 hours ago — stale if threshold is 4, fresh if threshold is 6
+        self._seed_sentinel(db, row_count=1, age_hours=5)
+
+        guard = SuppressionGuard(db)
+        os.environ["SUPPRESSION_MAX_AGE_HOURS"] = "4"
+        try:
+            status, _ = guard.validate()
+            self.assertEqual(status, SuppressionStatus.STALE)
+        finally:
+            os.environ.pop("SUPPRESSION_MAX_AGE_HOURS", None)
+
+        os.environ["SUPPRESSION_MAX_AGE_HOURS"] = "6"
+        try:
+            status, _ = guard.validate()
+            self.assertEqual(status, SuppressionStatus.HEALTHY)
+        finally:
+            os.environ.pop("SUPPRESSION_MAX_AGE_HOURS", None)
+
+
 class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
     """Regression tests for blocker-removal pass — campaign adapter side."""
 
@@ -1480,6 +1942,21 @@ class TestCampaignAdapterBlockerRegressions(unittest.TestCase):
                 "INSERT INTO orders (order_id, event_id, email, ticket_count, gross_amount) VALUES (?,?,?,?,?)",
                 (f"o{i}", "evt_br", f"buyer{i}@example.com", 1, 50.0),
             )
+        self.db.conn.commit()
+        # Seed suppression sentinel so guard passes for non-suppression tests
+        _seed_valid_suppression_sentinel(self.db, row_count=0)
+        # Acknowledge empty since there are zero suppression rows
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.conn.execute(
+            """UPDATE v2_suppression_sync SET
+                   empty_acknowledged = 1,
+                   acknowledged_by = 'test',
+                   acknowledged_at = ?,
+                   acknowledged_reason = 'test setup'
+               WHERE id = 1""",
+            (now,),
+        )
         self.db.conn.commit()
 
     def test_audience_dedup_excludes_past_attendees_from_city(self):

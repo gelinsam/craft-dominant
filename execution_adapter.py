@@ -24,6 +24,7 @@ from intervention_model import (
     InterventionStore,
     LearningStore,
 )
+from suppression_guard import SuppressionGuard, SuppressionStatus
 
 log = logging.getLogger("craft.execution")
 
@@ -50,6 +51,7 @@ class ExecutionAdapter:
         self.store = intervention_store
         self.audit = audit_logger
         self.campaign_engine = campaign_engine
+        self.suppression_guard = SuppressionGuard(db)
 
     def execute(self, intervention_id: str, actor: str = "system") -> Dict[str, Any]:
         """Execute an approved CRM intervention.
@@ -96,20 +98,27 @@ class ExecutionAdapter:
             )
             return {"error": "campaign_draft_missing", "message": "Campaign draft record not found"}
 
-        # ── Gate 3: suppression list must be readable ──────────────────
-        try:
-            suppressed = self._get_suppressions()
-        except Exception as e:
+        # ── Gate 3: suppression must be positively valid (fail-closed) ──
+        supp_status, supp_details, suppressed = (
+            self.suppression_guard.get_suppressions_if_valid()
+        )
+        if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             self.audit.log(
                 intervention_id, intervention.event_id,
                 action="execute_blocked",
                 from_status=intervention.status.value,
                 actor=actor,
-                error=f"Suppression list unavailable: {e}",
+                error=f"Suppression check failed: {supp_status.value}",
+                metadata={
+                    "suppression_status": supp_status.value,
+                    "last_synced_at": supp_details.get("last_synced_at"),
+                    "row_count": supp_details.get("row_count"),
+                    "reason": supp_details.get("reason", ""),
+                },
             )
             return {
-                "error": "suppression_unavailable",
-                "message": "Cannot verify suppression list — execution blocked for safety",
+                "error": supp_status.value,
+                "message": supp_details.get("reason", "Suppression validation failed — execution blocked for safety"),
             }
 
         # ── Gate 4: recompute audience at execution time ───────────────
@@ -334,11 +343,6 @@ class ExecutionAdapter:
             return dict(row) if row else None
         except Exception:
             return None
-
-    def _get_suppressions(self) -> set:
-        """Get suppression list. Raises on failure (hard invariant)."""
-        rows = self.db.conn.execute("SELECT email FROM suppressions").fetchall()
-        return {r["email"] for r in rows}
 
     def _build_fresh_audience(self, event_id: str, event: dict, exclude: set) -> List[str]:
         """Rebuild audience from scratch at execution time."""
