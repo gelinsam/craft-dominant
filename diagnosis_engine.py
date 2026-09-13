@@ -207,6 +207,130 @@ class DiagnosisEngine:
         )
 
     # ─────────────────────────────────────────────────────────────────────
+    # Grouped-event diagnosis
+    # ─────────────────────────────────────────────────────────────────────
+
+    def diagnose_grouped(self, pacing, opportunity: Dict[str, Any],
+                         event_context: Dict[str, Any]) -> Diagnosis:
+        """Produce a diagnosis for a grouped (timed-entry) opportunity.
+
+        Args:
+            pacing: The grouped EventPacing object from analyze_portfolio().
+            opportunity: The Opportunity.to_dict() output.
+            event_context: An event-like dict with city, event_type, name,
+                           capacity — from OpportunityEngine.get_event_context().
+        """
+        constituent_ids = getattr(pacing, "constituent_event_ids", []) or []
+        evidence = opportunity.get("evidence", {})
+
+        # ── Core pacing data (from grouped pacing) ─────────────────────
+        days_until = int(evidence.get("days_until", 0))
+        tickets_sold = int(evidence.get("tickets_sold", 0))
+        capacity = int(event_context.get("capacity", 0))
+        sell_through = (tickets_sold / capacity * 100) if capacity > 0 else 0
+        avg_price = float(evidence.get("avg_ticket_price", 0))
+        pace_delta = float(evidence.get("pace_delta_pct", 0))
+        gap_tickets = int(evidence.get("gap_tickets", 0))
+        revenue_at_risk = float(opportunity.get("revenue_at_risk", 0))
+
+        # ── Velocity (aggregate across constituent slots) ──────────────
+        recent_velocity = self._compute_velocity_for_ids(constituent_ids, days=7)
+        historical_velocity = None  # Use pacing's historical comparisons below
+
+        # ── Meta spend (aggregate across constituent slots) ────────────
+        meta_data_status = self._check_meta_data_status_for_ids(constituent_ids)
+        meta_total, meta_7d_spend, meta_7d_impressions, meta_7d_clicks = (
+            self._get_meta_spend_for_ids(constituent_ids)
+        )
+        blended_ad_spend_per_ticket = (
+            (meta_total / tickets_sold) if tickets_sold > 0 and meta_total > 0 else 0.0
+        )
+
+        # ── CRM audience (using constituent IDs for buyer exclusion) ───
+        audience = self._compute_audience_grouped(constituent_ids, event_context)
+
+        # ── Historical editions (from pacing's pre-computed data) ──────
+        historical_editions = getattr(pacing, "historical_comparisons", []) or []
+
+        # ── Campaigns sent (aggregate across constituent slots) ────────
+        historical_campaigns = self._count_campaigns_for_ids(constituent_ids)
+
+        # ── Missing data ───────────────────────────────────────────────
+        missing = self._detect_missing_data(
+            meta_total, recent_velocity, historical_velocity,
+            audience, historical_editions, historical_campaigns,
+            meta_data_status,
+        )
+
+        # ── Root cause analysis ────────────────────────────────────────
+        root_causes = self._analyze_root_causes(
+            pace_delta=pace_delta,
+            recent_velocity=recent_velocity,
+            historical_velocity=historical_velocity,
+            meta_total=meta_total,
+            meta_7d_spend=meta_7d_spend,
+            meta_7d_clicks=meta_7d_clicks,
+            blended_ad_spend_per_ticket=blended_ad_spend_per_ticket,
+            days_until=days_until,
+            sell_through=sell_through,
+            audience=audience,
+            historical_campaigns=historical_campaigns,
+            meta_data_status=meta_data_status,
+        )
+
+        # ── Intervention options ───────────────────────────────────────
+        intervention_options = self._rank_interventions(
+            root_causes=root_causes,
+            gap_tickets=gap_tickets,
+            avg_price=avg_price,
+            days_until=days_until,
+            audience=audience,
+            meta_total=meta_total,
+            blended_ad_spend_per_ticket=blended_ad_spend_per_ticket,
+        )
+
+        recommended = intervention_options[0].intervention_type if intervention_options else None
+        rec_rationale = (
+            intervention_options[0].rationale
+            if intervention_options
+            else "Insufficient data to recommend an intervention."
+        )
+
+        return Diagnosis(
+            event_id=pacing.event_id,
+            event_name=getattr(pacing, "event_name", ""),
+            opportunity_id=opportunity.get("opportunity_id", ""),
+            days_until=days_until,
+            tickets_sold=tickets_sold,
+            capacity=capacity,
+            sell_through_pct=round(sell_through, 1),
+            avg_ticket_price=round(avg_price, 2),
+            recent_velocity=round(recent_velocity, 2) if recent_velocity is not None else None,
+            historical_velocity=None,
+            pace_delta_pct=round(pace_delta, 1),
+            gap_tickets=gap_tickets,
+            revenue_at_risk=round(revenue_at_risk, 2),
+            meta_spend_total=round(meta_total, 2),
+            meta_spend_recent_7d=round(meta_7d_spend, 2),
+            meta_impressions_recent_7d=meta_7d_impressions,
+            meta_clicks_recent_7d=meta_7d_clicks,
+            blended_ad_spend_per_ticket=round(blended_ad_spend_per_ticket, 2),
+            crm_audience_total=audience["total"],
+            crm_past_attendees=audience["past_attendees"],
+            crm_champions=audience["champions"],
+            crm_at_risk=audience["at_risk"],
+            crm_city_prospects=audience["city_prospects"],
+            current_buyers_count=audience["current_buyers"],
+            historical_editions=historical_editions,
+            current_event_campaigns_sent=historical_campaigns,
+            missing_data=missing,
+            root_causes=root_causes,
+            intervention_options=intervention_options,
+            recommended_intervention=recommended,
+            recommendation_rationale=rec_rationale,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
     # Data gathering helpers
     # ─────────────────────────────────────────────────────────────────────
 
@@ -686,3 +810,137 @@ class DiagnosisEngine:
         # Sort by expected_net_value * confidence (same ranking as opportunity engine)
         options.sort(key=lambda o: o.expected_net_value * o.confidence, reverse=True)
         return options
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Grouped-event helper methods
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _compute_velocity_for_ids(self, event_ids: List[str], days: int = 7) -> Optional[float]:
+        """Aggregate recent ticket velocity across multiple constituent event IDs."""
+        if not event_ids:
+            return None
+        total_velocity = 0.0
+        found = False
+        for eid in event_ids:
+            v = self._compute_velocity(eid, days)
+            if v is not None:
+                total_velocity += v
+                found = True
+        return total_velocity if found else None
+
+    def _check_meta_data_status_for_ids(self, event_ids: List[str]) -> str:
+        """Check Meta ad spend data freshness across constituent event IDs.
+
+        Returns the best status found (most informative), preferring
+        'current_has_spend' > 'current_zero_spend' > 'stale' > 'no_records' > 'unavailable'.
+        """
+        if not event_ids:
+            return "unavailable"
+        status_priority = {
+            "current_has_spend": 5,
+            "current_zero_spend": 4,
+            "stale": 3,
+            "no_records": 2,
+            "unavailable": 1,
+        }
+        best_status = "unavailable"
+        best_priority = 0
+        for eid in event_ids:
+            s = self._check_meta_data_status(eid)
+            p = status_priority.get(s, 0)
+            if p > best_priority:
+                best_status = s
+                best_priority = p
+        return best_status
+
+    def _get_meta_spend_for_ids(
+        self, event_ids: List[str]
+    ) -> Tuple[float, float, int, int]:
+        """Aggregate Meta spend across constituent event IDs."""
+        total = 0.0
+        spend_7d = 0.0
+        impressions_7d = 0
+        clicks_7d = 0
+        for eid in event_ids:
+            t, s7, i7, c7 = self._get_meta_spend(eid)
+            total += t
+            spend_7d += s7
+            impressions_7d += i7
+            clicks_7d += c7
+        return total, spend_7d, impressions_7d, clicks_7d
+
+    def _compute_audience_grouped(
+        self, event_ids: List[str], event_context: Dict[str, Any]
+    ) -> Dict[str, int]:
+        """Count CRM audience, excluding buyers from ALL constituent slots.
+
+        Buyers from any constituent event in this logical day-event are
+        excluded — if someone bought a Saturday 10am slot ticket, they are
+        excluded from the Saturday afternoon slot audience too.
+        """
+        result = {
+            "total": 0,
+            "past_attendees": 0,
+            "champions": 0,
+            "at_risk": 0,
+            "city_prospects": 0,
+            "current_buyers": 0,
+        }
+        try:
+            # Collect ALL buyers across all constituent slots
+            buyer_set = set()
+            for eid in event_ids:
+                buyer_set.update(self.db.get_event_buyers(eid))
+            result["current_buyers"] = len(buyer_set)
+
+            # Use first constituent for past-attendee lookup (same event name)
+            first_event = None
+            for eid in event_ids:
+                row = self.db.get_event(eid)
+                if row:
+                    first_event = dict(row)
+                    break
+            if not first_event:
+                first_event = event_context
+
+            buyers_list = list(buyer_set)
+            past_attendees = self.db.get_past_attendees_not_purchased(
+                event_ids[0] if event_ids else "",
+                first_event.get("name", ""),
+                limit=50000,
+                current_buyer_emails=buyers_list,
+            )
+            past_attendee_emails = {
+                c.get("email") for c in past_attendees if c.get("email")
+            }
+            result["past_attendees"] = len(past_attendees)
+            result["champions"] = len([
+                c for c in past_attendees
+                if c.get("rfm_segment") in ("champion", "loyal")
+            ])
+            result["at_risk"] = len([
+                c for c in past_attendees
+                if c.get("rfm_segment") == "at_risk"
+            ])
+
+            city = event_context.get("city", "")
+            if city:
+                exclude_emails = list(buyer_set | past_attendee_emails)
+                city_prospects = self.db.get_city_prospects(
+                    city, exclude_emails=exclude_emails, limit=50000
+                )
+                result["city_prospects"] = len(city_prospects)
+
+            result["total"] = result["past_attendees"] + result["city_prospects"]
+        except Exception as e:
+            log.warning(f"Grouped audience computation failed: {e}")
+        return result
+
+    def _count_campaigns_for_ids(self, event_ids: List[str]) -> int:
+        """Count campaigns sent for any constituent event ID."""
+        if not event_ids:
+            return 0
+        total = 0
+        for eid in event_ids:
+            total += self._count_current_event_campaigns(eid)
+        return total
