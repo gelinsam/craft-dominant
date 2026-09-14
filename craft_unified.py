@@ -3182,7 +3182,20 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             _portfolio_cache['ts'] = now
         return _portfolio_cache['analyses']
     def _do_background_sync():
-        """Run Eventbrite sync in background thread."""
+        """Run Eventbrite sync in background thread.
+
+        The post-sync block below assigns _meta_sync_running, which makes the
+        name local to this whole function unless it is declared nonlocal.
+        Without the declaration, the *read* in `if _meta_sync_running:` raised
+        UnboundLocalError and aborted everything after the Eventbrite phase —
+        including the milestone export and alert checks. The /api/meta-sync
+        endpoint always declared it; this function never did.
+
+        The bug was invisible until the rebuild could finish: before the
+        customer-profile N+1 was fixed, the worker was killed during profile
+        building and execution never reached this block at all.
+        """
+        nonlocal _meta_sync_running
         _sync_state['running'] = True
         try:
             api_key = os.environ.get('EVENTBRITE_API_KEY')
