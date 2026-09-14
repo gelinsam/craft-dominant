@@ -56,6 +56,97 @@ class ResilientDatabase(Database):
         return stats
 
 
+#: Tables that constitute the durable analytical plane. These are the counts
+#: that must survive a Railway redeploy once the SQLite file lives on a volume.
+ANALYTICS_TABLES = (
+    "events",
+    "orders",
+    "customers",
+    "customer_event_profiles",
+    "daily_snapshots",
+    "pacing_curves",
+    "ad_spend",
+    "suppressions",
+)
+
+
+def external_send_enabled() -> bool:
+    """Whether external (real) sending is permitted.
+
+    This is deliberately a mirror of the gate in ExecutionAdapter rather than an
+    independent reading of the environment: if the two ever disagreed, health
+    would report a comforting lie while the adapter did something else. Only the
+    literal string "1" enables sending, so every other value — unset, "0",
+    "true", "yes", "" — fails safe to disabled.
+    """
+    return os.environ.get("V2_ENABLE_EXTERNAL_SEND", "0") == "1"
+
+
+def analytics_storage_info(db) -> dict:
+    """Describe where the analytics SQLite file actually lives.
+
+    Used to prove durability: `directory_is_mount` distinguishes a database on a
+    mounted Railway volume from one sitting on the container's ephemeral
+    filesystem, which is destroyed on every redeploy. Every probe is defensive —
+    diagnostics must never be the reason a health check fails.
+    """
+    path = getattr(db, "path", None) or os.environ.get("DB_PATH", "craft_unified.db")
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path) or "."
+
+    info = {
+        "db_path": abs_path,
+        "db_path_configured": bool(os.environ.get("DB_PATH")),
+        "directory": directory,
+        "directory_is_mount": False,
+        "exists": False,
+        "size_bytes": 0,
+        "wal_present": False,
+        "shm_present": False,
+        "journal_mode": None,
+    }
+
+    try:
+        info["directory_is_mount"] = os.path.ismount(directory)
+    except OSError:
+        pass
+
+    try:
+        if os.path.exists(abs_path):
+            info["exists"] = True
+            info["size_bytes"] = os.path.getsize(abs_path)
+        info["wal_present"] = os.path.exists(abs_path + "-wal")
+        info["shm_present"] = os.path.exists(abs_path + "-shm")
+    except OSError:
+        pass
+
+    try:
+        row = db.conn.execute("PRAGMA journal_mode").fetchone()
+        if row is not None:
+            info["journal_mode"] = row[0]
+    except Exception:
+        pass
+
+    return info
+
+
+def analytics_row_counts(db) -> dict:
+    """Row count per analytical table, or None where the table is unreadable.
+
+    None is used rather than 0 so a missing/broken table is never mistaken for a
+    genuinely empty one — the same false-zero distinction the paid-media work
+    depends on.
+    """
+    counts: dict = {}
+    for table in ANALYTICS_TABLES:
+        try:
+            row = db.conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()
+            counts[table] = int(row[0]) if row is not None else None
+        except Exception:
+            counts[table] = None
+    return counts
+
+
 def _build_app():
     db = ResilientDatabase(os.environ.get("DB_PATH", "craft_unified.db"))
     app = create_app(db, auto_sync=os.environ.get("CRAFT_AUTO_SYNC", "1") == "1")
@@ -608,14 +699,42 @@ def _build_app():
         v2_health_info = v2_repo.health_check()
 
         overall = "ok" if analytics_ok and v2_health_info.get("status") == "ok" else "degraded"
+
+        # Whether real sending is possible must be directly observable rather
+        # than inferred from the absence of evidence. This endpoint is public,
+        # so it exposes only the resolved boolean — never the raw environment.
+        send_enabled = external_send_enabled()
+
+        storage = analytics_storage_info(db)
+
         result = {
             "status": overall,
             "command_configured": bool(os.environ.get("COMMAND_API_KEY")),
-            "db_path_configured": bool(os.environ.get("DB_PATH")),
+            "db_path_configured": storage["db_path_configured"],
             "analytics_backend": "ok" if analytics_ok else "degraded",
+            "external_send_enabled": send_enabled,
+            "execution_mode": "external" if send_enabled else "dry_run",
+            # Durability signal only. The path itself is withheld here because
+            # this route is unauthenticated; full detail lives behind auth on
+            # /api/v2/diagnostics/analytics.
+            "analytics_persistent": storage["directory_is_mount"],
             "v2_state_backend": v2_health_info,
         }
         return jsonify(result), 200 if overall == "ok" else 503
+
+    @app.get("/api/v2/diagnostics/analytics")
+    @require_command_auth
+    def v2_analytics_diagnostics():
+        """Authenticated durability diagnostics for the analytical plane.
+
+        Row counts are business data, so they are deliberately kept off the
+        public health route. This is the evidence used to prove that analytics
+        survive a redeploy: capture counts, restart, compare.
+        """
+        return jsonify({
+            "storage": analytics_storage_info(db),
+            "row_counts": analytics_row_counts(db),
+        }), 200
 
     return app
 
