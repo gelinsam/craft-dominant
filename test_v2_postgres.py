@@ -1075,7 +1075,12 @@ class TestPostgresConfirmedSendRecovery:
             compute_audience_hash, compute_idempotency_key,
         )
 
-        iv = _make_intervention(id="intv-recover", status=InterventionStatus.APPROVED)
+        # Note: Intervention.create() derives the id itself, so it must
+        # not be passed as a kwarg — set it after construction.
+        iv = _make_intervention(
+            opportunity_id="opp-recover",
+            status=InterventionStatus.APPROVED,
+        )
         iv.campaign_draft_id = "draft-recover"
         self.repo.save_intervention(iv)
 
@@ -1169,10 +1174,16 @@ class TestPostgresConfirmedSendRecovery:
         assert {s["email"] for s in sends} == set(emails)
 
     def test_successful_attempt_uniqueness_preserved(self):
-        """A second confirmed_sent for the same generation is rejected."""
-        import psycopg
+        """A second confirmed_sent for the same generation is rejected.
+
+        The partial unique index idx_send_attempts_unique_success is the
+        database-level guarantee behind "at most one successful send per
+        intervention+generation". The repository surfaces the violation
+        as DuplicateClaimError rather than a raw psycopg error.
+        """
         from send_attempt_model import (
-            SendAttempt, SendAttemptStatus, compute_idempotency_key,
+            SendAttempt, SendAttemptStatus, DuplicateClaimError,
+            compute_idempotency_key,
         )
 
         emails = ["a@test.com"]
@@ -1188,5 +1199,5 @@ class TestPostgresConfirmedSendRecovery:
             audience_count=1,
             claimed_at=datetime.now(timezone.utc),
         )
-        with pytest.raises(psycopg.errors.UniqueViolation):
+        with pytest.raises(DuplicateClaimError):
             self.repo.create_send_attempt(dup)
