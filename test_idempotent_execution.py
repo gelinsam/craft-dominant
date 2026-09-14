@@ -9,7 +9,7 @@ import os
 import json
 import sqlite3
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
 
 from send_attempt_model import (
@@ -26,6 +26,7 @@ from send_attempt_model import (
 from execution_adapter import (
     ExecutionAdapter,
     EXECUTION_GENERATION,
+    ATTRIBUTION_WINDOW_DAYS,
     AmbiguousSendOutcome,
 )
 from v2_state_repository import SQLiteV2StateRepository
@@ -684,12 +685,17 @@ class TestIdempotentExecution(unittest.TestCase):
         result1 = adapter.execute(intv_id)
         self.assertEqual(result1["status"], "executed")
 
-        # Second execution: intervention is now in 'measuring' state,
-        # so it should fail the status gate
+        # Second execution must report the real reason — already sent —
+        # rather than the incidental 'illegal_status' that Gate 1 used
+        # to produce once the intervention had moved to 'measuring'.
+        # The proven-send check now runs before every other gate.
         result2 = adapter.execute(intv_id)
         self.assertIn("error", result2)
-        # Status should not be approved anymore
-        self.assertEqual(result2["error"], "illegal_status")
+        self.assertEqual(result2["error"], "already_sent")
+        # Fully finalized, so no repair was needed.
+        self.assertNotIn("recovered", result2)
+        # And no second send was dispatched.
+        self.assertEqual(mc.send_call_count(), 1)
 
     def test_audience_hash_in_response(self):
         """Dry-run and execute responses include audience_hash."""
@@ -1406,6 +1412,381 @@ class TestRetryInvariant(unittest.TestCase):
         # The lossy boolean form must not appear as a call.
         self.assertNotIn("mc.send_campaign(", src)
         self.assertNotIn("mc.create_campaign(", src)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Crash-after-confirmed-send recovery
+# ─────────────────────────────────────────────────────────────────────
+
+def _crash_after_confirmed_send(db, v2_repo, adapter, mc, intv_id):
+    """Drive a real send, then rewind local state to the crash shape.
+
+    Simulates dying between "attempt persisted confirmed_sent" and the
+    local bookkeeping: intervention still approved, recipients still
+    only staged, no attribution rows, no finalization audit.
+
+    The send attempt row is left exactly as the provider path wrote it,
+    because that is what really survives a crash.
+    """
+    result = adapter.execute(intv_id)
+    assert result["status"] == "executed", result
+
+    attempt = v2_repo.get_send_attempts(intv_id)[0]
+    assert attempt.attempt_status == SendAttemptStatus.CONFIRMED_SENT
+
+    # Rewind the LOCAL side only.
+    db.conn.execute("DELETE FROM v2_campaign_sends WHERE intervention_id = ?",
+                    (intv_id,))
+    db.conn.execute(
+        "DELETE FROM intervention_audit_log WHERE intervention_id = ? "
+        "AND action = ?", (intv_id, ExecutionAdapter.FINALIZATION_AUDIT_ACTION))
+    db.conn.commit()
+
+    iv = v2_repo.get_intervention(intv_id)
+    iv.status = InterventionStatus.APPROVED
+    iv.sent_count = None
+    iv.measurement_started_at = None
+    iv.measurement_ends_at = None
+    iv.executed_at = None
+    v2_repo.save_intervention(iv)
+
+    return attempt
+
+
+def _fresh_adapter(db, v2_repo, mc):
+    """A brand-new adapter, as after a process restart."""
+    return ExecutionAdapter(
+        db=db, v2_repo=v2_repo, campaign_engine=FakeCampaignEngine(mc),
+    )
+
+
+class TestCrashAfterConfirmedSend(unittest.TestCase):
+    """MANDATORY: a proven send must converge locally after a restart.
+
+    Before this work the system was duplicate-safe but not recoverable:
+    the successful attempt blocked any resend (good), but the
+    intervention stayed 'approved', recipients stayed in staging, and no
+    attribution rows existed — so measurement could never run and the
+    state was unrepairable without manual SQL.
+    """
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def test_crash_after_confirmed_send_recovers_without_resending(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        attempt = _crash_after_confirmed_send(db, v2_repo, adapter, mc, intv_id)
+        sends_before = mc.send_call_count()
+        self.assertEqual(sends_before, 1)
+
+        # Restart: brand-new adapter, no in-memory state carried over.
+        recovered_adapter = _fresh_adapter(db, v2_repo, mc)
+        result = recovered_adapter.execute(intv_id)
+
+        # 1. NO provider call of any kind.
+        self.assertEqual(mc.send_call_count(), sends_before,
+                         "recovery dispatched another send")
+
+        # 2. Result signals a recovered already-sent state.
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self.assertTrue(result["recovered"])
+        self.assertTrue(result["finalization"]["repaired"])
+
+        # 3. Same successful attempt — no new claim.
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].id, attempt.id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.CONFIRMED_SENT)
+
+        # 4. Intervention advanced to measuring.
+        iv = v2_repo.get_intervention(intv_id)
+        self.assertEqual(iv.status, InterventionStatus.MEASURING)
+
+        # 5. Recipients promoted to attribution.
+        staged = v2_repo.get_attempt_recipients(attempt.id)
+        promoted = {s["email"] for s in v2_repo.get_sends(intv_id)}
+        self.assertEqual(promoted, set(staged))
+        self.assertTrue(promoted)
+
+        # 6. sent_count correct.
+        self.assertEqual(iv.sent_count, len(staged))
+
+        # 7. Measurement window set from the send time.
+        self.assertIsNotNone(iv.measurement_started_at)
+        self.assertIsNotNone(iv.measurement_ends_at)
+
+        # 8. Finalization audited exactly once.
+        finals = [e for e in v2_repo.get_audit_log(intv_id)
+                  if e["action"] == ExecutionAdapter.FINALIZATION_AUDIT_ACTION]
+        self.assertEqual(len(finals), 1)
+
+    def test_repeated_recovery_is_idempotent(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        _crash_after_confirmed_send(db, v2_repo, adapter, mc, intv_id)
+
+        a1 = _fresh_adapter(db, v2_repo, mc)
+        first = a1.execute(intv_id)
+        self.assertEqual(first["error"], "already_sent_recovered")
+
+        sends_after_first = mc.send_call_count()
+        sends_count = len(v2_repo.get_sends(intv_id))
+
+        # Run recovery repeatedly from fresh adapters.
+        for _ in range(3):
+            r = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+            self.assertEqual(r["error"], "already_sent")
+
+        self.assertEqual(mc.send_call_count(), sends_after_first)
+        self.assertEqual(len(v2_repo.get_sends(intv_id)), sends_count)
+        finals = [e for e in v2_repo.get_audit_log(intv_id)
+                  if e["action"] == ExecutionAdapter.FINALIZATION_AUDIT_ACTION]
+        self.assertEqual(len(finals), 1, "duplicate finalization audit")
+
+    def test_recovery_works_even_when_external_send_disabled(self):
+        """Local repair must not be gated behind the send flag.
+
+        Recovery contacts nobody, so a proven send left unfinalized must
+        still be repairable after the flag is turned off.
+        """
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        _crash_after_confirmed_send(db, v2_repo, adapter, mc, intv_id)
+        sends_before = mc.send_call_count()
+
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "0"
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self.assertEqual(mc.send_call_count(), sends_before)
+        self.assertEqual(v2_repo.get_intervention(intv_id).status,
+                         InterventionStatus.MEASURING)
+
+
+class TestPartialFinalizationRecovery(unittest.TestCase):
+    """Every partial-crash boundary must converge safely."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def _sent_env(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        result = adapter.execute(intv_id)
+        self.assertEqual(result["status"], "executed")
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        return db, v2_repo, mc, intv_id, attempt
+
+    def _assert_converged(self, v2_repo, intv_id, attempt, mc, sends_before):
+        self.assertEqual(mc.send_call_count(), sends_before)
+        iv = v2_repo.get_intervention(intv_id)
+        self.assertEqual(iv.status, InterventionStatus.MEASURING)
+        staged = v2_repo.get_attempt_recipients(attempt.id)
+        promoted = [s["email"] for s in v2_repo.get_sends(intv_id)]
+        self.assertEqual(sorted(promoted), sorted(staged))
+        self.assertEqual(len(promoted), len(set(promoted)),
+                         "duplicate recipient rows")
+        self.assertEqual(iv.sent_count, len(staged))
+        finals = [e for e in v2_repo.get_audit_log(intv_id)
+                  if e["action"] == ExecutionAdapter.FINALIZATION_AUDIT_ACTION]
+        self.assertEqual(len(finals), 1)
+
+    def test_a_transitioned_but_recipients_not_promoted(self):
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        db.conn.execute("DELETE FROM v2_campaign_sends WHERE intervention_id = ?",
+                        (intv_id,))
+        db.conn.commit()
+        sends_before = mc.send_call_count()
+
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self._assert_converged(v2_repo, intv_id, attempt, mc, sends_before)
+
+    def test_b_recipients_promoted_but_not_transitioned(self):
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        iv = v2_repo.get_intervention(intv_id)
+        iv.status = InterventionStatus.APPROVED
+        iv.sent_count = None
+        iv.measurement_started_at = None
+        iv.measurement_ends_at = None
+        v2_repo.save_intervention(iv)
+        db.conn.execute(
+            "DELETE FROM intervention_audit_log WHERE intervention_id = ? "
+            "AND action = ?",
+            (intv_id, ExecutionAdapter.FINALIZATION_AUDIT_ACTION))
+        db.conn.commit()
+        sends_before = mc.send_call_count()
+
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self._assert_converged(v2_repo, intv_id, attempt, mc, sends_before)
+
+    def test_c_both_complete_but_audit_missing(self):
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        db.conn.execute(
+            "DELETE FROM intervention_audit_log WHERE intervention_id = ? "
+            "AND action = ?",
+            (intv_id, ExecutionAdapter.FINALIZATION_AUDIT_ACTION))
+        db.conn.commit()
+        sends_before = mc.send_call_count()
+
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self._assert_converged(v2_repo, intv_id, attempt, mc, sends_before)
+
+    def test_d_audit_present_duplicate_recovery_invoked(self):
+        """Audit already recorded — repair the rest without re-auditing."""
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        db.conn.execute("DELETE FROM v2_campaign_sends WHERE intervention_id = ?",
+                        (intv_id,))
+        iv = v2_repo.get_intervention(intv_id)
+        iv.sent_count = None
+        v2_repo.save_intervention(iv)
+        db.conn.commit()
+        sends_before = mc.send_call_count()
+
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        self.assertEqual(result["error"], "already_sent_recovered")
+        self._assert_converged(v2_repo, intv_id, attempt, mc, sends_before)
+
+    def test_promotion_preserves_original_sent_at(self):
+        """Replaying promotion must not rewrite attribution timestamps."""
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        original = {s["email"]: s["sent_at"] for s in v2_repo.get_sends(intv_id)}
+        self.assertTrue(original)
+
+        for _ in range(3):
+            v2_repo.promote_attempt_recipients(
+                attempt.id, intv_id, "draft-001")
+
+        after = {s["email"]: s["sent_at"] for s in v2_repo.get_sends(intv_id)}
+        self.assertEqual(after, original)
+        self.assertEqual(len(after), len(original))
+
+    def test_no_illegal_transition_from_measuring(self):
+        """Recovery on an already-measuring intervention must not blow up."""
+        db, v2_repo, mc, intv_id, attempt = self._sent_env()
+        iv = v2_repo.get_intervention(intv_id)
+        self.assertEqual(iv.status, InterventionStatus.MEASURING)
+
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+        self.assertEqual(result["error"], "already_sent")
+        self.assertEqual(v2_repo.get_intervention(intv_id).status,
+                         InterventionStatus.MEASURING)
+
+
+class TestAuthoritativeSendTimestamp(unittest.TestCase):
+    """Attribution must measure from when the provider actually sent."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def test_direct_send_records_confirmation_time(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        before = datetime.now(timezone.utc)
+        adapter.execute(intv_id)
+        after = datetime.now(timezone.utc)
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        sent_at = ExecutionAdapter._parse_provider_time(attempt.provider_sent_at)
+        self.assertIsNotNone(sent_at)
+        self.assertIsNotNone(sent_at.tzinfo, "must be timezone-aware UTC")
+        self.assertGreaterEqual(sent_at, before.replace(microsecond=0))
+        self.assertLessEqual(sent_at, after)
+
+    def test_measurement_window_starts_at_send_time(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        iv = v2_repo.get_intervention(intv_id)
+        sent_at = ExecutionAdapter._parse_provider_time(attempt.provider_sent_at)
+        started = ExecutionAdapter._parse_provider_time(iv.measurement_started_at)
+        ends = ExecutionAdapter._parse_provider_time(iv.measurement_ends_at)
+
+        self.assertEqual(started, sent_at)
+        self.assertEqual(ends - started,
+                         timedelta(days=ATTRIBUTION_WINDOW_DAYS))
+
+    def test_reconciliation_uses_provider_send_time_not_reconcile_time(self):
+        """A send reconciled hours later still measures from the send.
+
+        This is the case that matters: if the window started at
+        reconciliation time, every order placed between the real send
+        and the reconciliation would fall outside attribution.
+        """
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('timeout',))
+        adapter.execute(intv_id)
+        mc.clear_injections()
+
+        provider_send_time = "2026-01-15T10:00:00+00:00"
+        mc.set_campaign_status("sent", emails_sent=2,
+                               send_time=provider_send_time)
+
+        result = _fresh_adapter(db, v2_repo, mc).reconcile_send_attempt(intv_id)
+        self.assertEqual(result["status"], "reconciled_sent")
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        self.assertEqual(attempt.attempt_status,
+                         SendAttemptStatus.RECONCILED_SENT)
+        stored = ExecutionAdapter._parse_provider_time(attempt.provider_sent_at)
+        self.assertEqual(stored,
+                         datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc))
+
+        iv = v2_repo.get_intervention(intv_id)
+        started = ExecutionAdapter._parse_provider_time(iv.measurement_started_at)
+        ends = ExecutionAdapter._parse_provider_time(iv.measurement_ends_at)
+        self.assertEqual(started, stored)
+        self.assertEqual(ends - started,
+                         timedelta(days=ATTRIBUTION_WINDOW_DAYS))
+
+    def test_reconciled_sent_promotes_and_finalizes_via_shared_path(self):
+        """Reconciliation must reuse the finalizer, not a second copy."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('timeout',))
+        adapter.execute(intv_id)
+        mc.clear_injections()
+        mc.set_campaign_status("sent", emails_sent=2)
+
+        result = _fresh_adapter(db, v2_repo, mc).reconcile_send_attempt(intv_id)
+        self.assertEqual(result["status"], "reconciled_sent")
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        iv = v2_repo.get_intervention(intv_id)
+        staged = v2_repo.get_attempt_recipients(attempt.id)
+        promoted = {s["email"] for s in v2_repo.get_sends(intv_id)}
+
+        self.assertEqual(iv.status, InterventionStatus.MEASURING)
+        self.assertEqual(promoted, set(staged))
+        self.assertEqual(iv.sent_count, len(staged))
+        finals = [e for e in v2_repo.get_audit_log(intv_id)
+                  if e["action"] == ExecutionAdapter.FINALIZATION_AUDIT_ACTION]
+        self.assertEqual(len(finals), 1)
+
+    def test_finalizer_refuses_unproven_attempts(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('timeout',))
+        adapter.execute(intv_id)
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+        iv = v2_repo.get_intervention(intv_id)
+
+        out = adapter.finalize_confirmed_send(attempt, iv)
+        self.assertEqual(out["error"], "attempt_not_successful")
+        self.assertEqual(iv.status, InterventionStatus.APPROVED)
 
 
 if __name__ == '__main__':

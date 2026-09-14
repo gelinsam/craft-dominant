@@ -71,6 +71,15 @@ ATTRIBUTION_WINDOW_DAYS = 7
 # New generation requires explicit future human action.
 EXECUTION_GENERATION = 1
 
+# Statuses that mean the intervention has moved past "waiting to run".
+# A proven send whose intervention is still APPROVED is the crash
+# signature that local finalization repairs.
+_POST_EXECUTION_STATUSES = frozenset({
+    InterventionStatus.EXECUTING,
+    InterventionStatus.MEASURING,
+    InterventionStatus.LEARNED,
+})
+
 
 class ExecutionAdapter:
     """Executes approved CRM interventions safely.
@@ -108,6 +117,57 @@ class ExecutionAdapter:
         intervention = self.v2_repo.get_intervention(intervention_id)
         if not intervention:
             return {"error": "intervention_not_found"}
+
+        # ── Gate 0: proven send already exists → recover, never resend ──
+        # This runs FIRST, before every other gate, because the two
+        # crash shapes it repairs would otherwise be unreachable:
+        #
+        #   * A crash before the intervention advanced leaves it
+        #     'approved'; the dry-run gate below would short-circuit
+        #     when V2_ENABLE_EXTERNAL_SEND is off, so the send would
+        #     never be finalized.
+        #   * A crash midway through finalization leaves it 'measuring',
+        #     which Gate 1 rejects as an illegal status.
+        #
+        # Recovery is local-only and cannot send anything, so it is safe
+        # to run regardless of the send flag or the current status.
+        proven = self._find_successful_attempt(intervention_id)
+        if proven:
+            if self.is_finalization_complete(proven, intervention):
+                return {
+                    "error": "already_sent",
+                    "message": (
+                        f"Intervention {intervention_id} was already "
+                        f"successfully sent (attempt {proven.id})."
+                    ),
+                    "send_attempt": proven.to_dict(),
+                }
+
+            # Proven sent but local state is incomplete — converge it.
+            # No provider call is made anywhere in this branch.
+            log.warning(
+                "Recovering unfinalized proven send for %s (attempt %s, "
+                "status=%s, intervention=%s)",
+                intervention_id, proven.id, proven.attempt_status.value,
+                intervention.status.value,
+            )
+            finalize_result = self.finalize_confirmed_send(
+                proven, intervention, actor=actor,
+            )
+            intervention = self.v2_repo.get_intervention(intervention_id)
+            refreshed = self.v2_repo.get_send_attempt(proven.id) or proven
+            return {
+                "error": "already_sent_recovered",
+                "message": (
+                    f"Intervention {intervention_id} was already sent "
+                    f"(attempt {proven.id}); local state was incomplete and "
+                    f"has been recovered without contacting the provider."
+                ),
+                "recovered": True,
+                "finalization": finalize_result,
+                "send_attempt": refreshed.to_dict(),
+                "intervention": intervention.to_dict() if intervention else None,
+            }
 
         # ── Gate 1: status must be approved ────────────────────────────
         if intervention.status != InterventionStatus.APPROVED:
@@ -258,19 +318,9 @@ class ExecutionAdapter:
                     "send_attempt": existing_attempt.to_dict(),
                 }
 
-        # Check for successful previous attempt (already sent)
-        all_attempts = self.v2_repo.get_send_attempts(intervention_id)
-        for prev in all_attempts:
-            if (prev.execution_generation == EXECUTION_GENERATION
-                    and prev.is_successful and not prev.is_dry_run):
-                return {
-                    "error": "already_sent",
-                    "message": (
-                        f"Intervention {intervention_id} was already "
-                        f"successfully sent (attempt {prev.id})."
-                    ),
-                    "send_attempt": prev.to_dict(),
-                }
+        # Note: the successful-attempt check lives in Gate 0 at the top
+        # of execute(), so a proven send is detected (and recovered)
+        # before any gate can turn it away.
 
         # ── Phase 2: Claim-before-send ────────────────────────────────
         # Create durable claim BEFORE any provider mutation.
@@ -350,38 +400,15 @@ class ExecutionAdapter:
                 "send_attempt": attempt.to_dict(),
             }
 
-        # ── Transition: approved → executing → measuring ───────────────
-        from_status = intervention.status.value
-        intervention.transition_to(InterventionStatus.EXECUTING)
-        intervention.transition_to(InterventionStatus.MEASURING)
-        intervention.sent_count = len(audience_emails)
-        intervention.evidence["execution_result"] = {
-            "send_attempt_id": attempt.id,
-            "mailchimp_campaign_id": attempt.provider_campaign_id,
-        }
-        intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
-        self.v2_repo.save_intervention(intervention)
-
-        # Promote staged recipients to v2_campaign_sends for attribution
-        self.v2_repo.promote_attempt_recipients(
-            attempt.id, intervention_id, intervention.campaign_draft_id,
-        )
-
-        self.v2_repo.append_audit(
-            intervention_id, intervention.event_id,
-            action="executed",
-            from_status=from_status,
-            to_status=intervention.status.value,
-            actor=actor,
-            metadata={
-                "send_attempt_id": attempt.id,
-                "sent_count": len(audience_emails),
-                "campaign_draft_id": intervention.campaign_draft_id,
-                "mailchimp_campaign_id": attempt.provider_campaign_id,
-                "measurement_window_days": ATTRIBUTION_WINDOW_DAYS,
-                "measurement_ends_at": intervention.measurement_ends_at,
-            },
-        )
+        # ── Local finalization ─────────────────────────────────────────
+        # The provider has sent. Everything from here is local
+        # bookkeeping, and it runs through the SAME idempotent finalizer
+        # the crash-recovery and reconciliation paths use, so all three
+        # produce identical state. If the process dies part-way through,
+        # the next execute() detects the proven send at Gate 0 and
+        # converges what is missing.
+        self.finalize_confirmed_send(attempt, intervention, actor=actor)
+        attempt = self.v2_repo.get_send_attempt(attempt.id) or attempt
 
         return {
             "status": "executed",
@@ -778,6 +805,12 @@ class ExecutionAdapter:
             )
 
         # CHECKPOINT: confirmed sent
+        # Mailchimp's send action returns 204 with no body, so it gives
+        # us no send timestamp. The moment we received the success
+        # response is the closest defensible answer, and it is recorded
+        # here — at the boundary — rather than derived later, so a
+        # delayed recovery cannot drift the attribution window forward.
+        attempt.provider_sent_at = datetime.now(timezone.utc)
         attempt.transition_to(SendAttemptStatus.CONFIRMED_SENT)
         self.v2_repo.update_send_attempt(attempt)
         log.info(f"Checkpoint: confirmed_sent for attempt {attempt.id}, "
@@ -800,6 +833,246 @@ class ExecutionAdapter:
             "mailchimp_campaign_id": mc_campaign_id,
             "member_stats": member_stats,
             "tag_name": tag_name,
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Local finalization after a PROVEN provider send
+    # ─────────────────────────────────────────────────────────────────
+    #
+    # Splitting the send into "provider call" and "local bookkeeping"
+    # creates a window: the provider has sent, the attempt says
+    # confirmed_sent, but the intervention has not advanced, recipients
+    # are still only staged, and no attribution rows exist.  A crash in
+    # that window leaves the system duplicate-safe (the successful
+    # attempt blocks any resend) but with permanently incomplete local
+    # state — measurement would never run.
+    #
+    # finalize_confirmed_send converges that state.  It is idempotent,
+    # it never contacts the provider, and it is the single owner of
+    # post-send local work for BOTH the direct-confirmed and the
+    # reconciled-confirmed paths, so the two cannot drift.
+
+    FINALIZATION_AUDIT_ACTION = "send_finalized"
+
+    def _find_successful_attempt(
+        self, intervention_id: str,
+    ) -> Optional[SendAttempt]:
+        """Return the proven-sent attempt for this generation, if any.
+
+        Successful means confirmed_sent or reconciled_sent — i.e. the
+        provider is known to have sent. Dry runs never count.
+        """
+        for prev in self.v2_repo.get_send_attempts(intervention_id):
+            if (prev.execution_generation == EXECUTION_GENERATION
+                    and prev.is_successful and not prev.is_dry_run):
+                return prev
+        return None
+
+    def _finalization_audit_exists(self, intervention_id: str,
+                                   attempt_id: int) -> bool:
+        """Has this attempt already been finalized, per the audit log?
+
+        Existence check rather than a DB constraint: the audit table is
+        append-only by design, so we keep it that way and simply refuse
+        to append a second finalization entry for the same attempt.
+        """
+        for entry in self.v2_repo.get_audit_log(intervention_id):
+            if entry.get("action") != self.FINALIZATION_AUDIT_ACTION:
+                continue
+            meta = entry.get("metadata") or {}
+            if isinstance(meta, dict) and meta.get("send_attempt_id") == attempt_id:
+                return True
+        return False
+
+    def is_finalization_complete(
+        self, attempt: SendAttempt, intervention: Intervention,
+    ) -> bool:
+        """Is local state fully converged for a proven-sent attempt?
+
+        Deliberately checks several independent indicators. Any single
+        one could be true while the rest are missing — that is exactly
+        the partial-crash shape this exists to detect.
+        """
+        if not attempt.is_successful:
+            return False
+
+        # 1. Intervention has advanced past approved.
+        if intervention.status not in _POST_EXECUTION_STATUSES:
+            return False
+
+        # 2. sent_count reflects the staged audience.
+        staged = self.v2_repo.get_attempt_recipients(attempt.id)
+        if intervention.sent_count != len(staged):
+            return False
+
+        # 3. Attribution rows exist for every staged recipient.
+        promoted = {
+            (s.get("email") or "").lower().strip()
+            for s in self.v2_repo.get_sends(intervention.id)
+        }
+        if not {e.lower().strip() for e in staged}.issubset(promoted):
+            return False
+
+        # 4. Measurement window is set.
+        if not intervention.measurement_started_at or not intervention.measurement_ends_at:
+            return False
+
+        # 5. Finalization is recorded in the audit trail.
+        if not self._finalization_audit_exists(intervention.id, attempt.id):
+            return False
+
+        return True
+
+    @staticmethod
+    def _parse_provider_time(value: Any) -> Optional[datetime]:
+        """Parse a provider timestamp into an aware UTC datetime."""
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _resolve_provider_sent_at(self, attempt: SendAttempt) -> datetime:
+        """Best-known moment the provider actually sent.
+
+        Priority:
+          1. Already-persisted provider_sent_at (never re-derive; the
+             first answer is the closest to the event).
+          2. Mailchimp's own send_time from reconciliation.
+          3. The moment we received the provider's success response,
+             i.e. completed_at on the direct path.
+          4. send_requested_at — a lower bound, used only when nothing
+             better exists.
+          5. Now, if the attempt carries no usable timestamp at all.
+
+        Never the claim time: that precedes the send by the whole
+        campaign-setup sequence.
+        """
+        existing = self._parse_provider_time(attempt.provider_sent_at)
+        if existing:
+            return existing
+
+        detail = attempt.reconciliation_detail or {}
+        if isinstance(detail, dict):
+            from_provider = self._parse_provider_time(detail.get("send_time"))
+            if from_provider:
+                return from_provider
+
+        completed = self._parse_provider_time(attempt.completed_at)
+        if completed:
+            return completed
+
+        requested = self._parse_provider_time(attempt.send_requested_at)
+        if requested:
+            return requested
+
+        return datetime.now(timezone.utc)
+
+    def finalize_confirmed_send(
+        self,
+        attempt: SendAttempt,
+        intervention: Intervention,
+        actor: str = "system",
+    ) -> Dict[str, Any]:
+        """Idempotently converge local state for a proven-sent attempt.
+
+        Never contacts the provider. Safe to call repeatedly. Returns a
+        dict describing what (if anything) it had to repair.
+        """
+        if not attempt.is_successful:
+            return {
+                "error": "attempt_not_successful",
+                "message": (
+                    f"Finalization requires a proven send; attempt "
+                    f"{attempt.id} is '{attempt.attempt_status.value}'."
+                ),
+            }
+
+        if self.is_finalization_complete(attempt, intervention):
+            return {"status": "already_finalized", "repaired": False}
+
+        # Authoritative send time drives the attribution window. Persist
+        # it on the attempt so later passes reuse the same answer rather
+        # than drifting toward the current clock.
+        provider_sent_at = self._resolve_provider_sent_at(attempt)
+        if not attempt.provider_sent_at:
+            attempt.provider_sent_at = provider_sent_at
+            self.v2_repo.update_send_attempt(attempt)
+
+        staged = self.v2_repo.get_attempt_recipients(attempt.id)
+        from_status = intervention.status.value
+
+        # Advance the intervention if it has not already moved. A crash
+        # may have left it anywhere between approved and measuring.
+        if intervention.status == InterventionStatus.APPROVED:
+            intervention.transition_to(InterventionStatus.EXECUTING)
+        if intervention.status == InterventionStatus.EXECUTING:
+            intervention.transition_to(InterventionStatus.MEASURING)
+
+        # transition_to() stamps the window from "now", which for a
+        # reconciled send can be hours after the mail actually went out.
+        # Overwrite with the authoritative provider send time so
+        # attribution measures from when customers received it.
+        intervention.executed_at = provider_sent_at.isoformat()
+        intervention.measurement_started_at = provider_sent_at.isoformat()
+        intervention.measurement_ends_at = (
+            provider_sent_at + timedelta(days=ATTRIBUTION_WINDOW_DAYS)
+        ).isoformat()
+        intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
+        intervention.sent_count = len(staged)
+        intervention.evidence["execution_result"] = {
+            "send_attempt_id": attempt.id,
+            "mailchimp_campaign_id": attempt.provider_campaign_id,
+            "provider_sent_at": provider_sent_at.isoformat(),
+            "attempt_status": attempt.attempt_status.value,
+        }
+
+        audit_already_present = self._finalization_audit_exists(
+            intervention.id, attempt.id,
+        )
+
+        if audit_already_present:
+            # Everything except the audit entry may still need repair,
+            # but we must not append a second finalization record.
+            self.v2_repo.promote_attempt_recipients(
+                attempt.id, intervention.id, intervention.campaign_draft_id,
+            )
+            self.v2_repo.save_intervention(intervention)
+        else:
+            # One transaction: promote recipients, save intervention,
+            # record finalization.
+            self.v2_repo.finalize_send_locally(
+                attempt_id=attempt.id,
+                intervention=intervention,
+                event_id=intervention.event_id,
+                audit_action=self.FINALIZATION_AUDIT_ACTION,
+                from_status=from_status,
+                actor=actor,
+                audit_metadata={
+                    "send_attempt_id": attempt.id,
+                    "attempt_status": attempt.attempt_status.value,
+                    "provider_campaign_id": attempt.provider_campaign_id,
+                    "provider_sent_at": provider_sent_at.isoformat(),
+                    "sent_count": len(staged),
+                    "measurement_window_days": ATTRIBUTION_WINDOW_DAYS,
+                    "measurement_ends_at": intervention.measurement_ends_at,
+                    "execution_generation": attempt.execution_generation,
+                },
+            )
+
+        log.info(
+            "Finalized send attempt %s for %s (status=%s, recipients=%s)",
+            attempt.id, intervention.id, intervention.status.value, len(staged),
+        )
+        return {
+            "status": "finalized",
+            "repaired": True,
+            "sent_count": len(staged),
+            "provider_sent_at": provider_sent_at.isoformat(),
         }
 
     def reconcile_send_attempt(
@@ -927,48 +1200,50 @@ class ExecutionAdapter:
             }
 
         if verdict == ReconciliationVerdict.SENT:
-            # Provider confirms: campaign was sent
+            # Provider confirms: campaign was sent.
+            #
+            # Adopt the provider's own send_time as the authoritative
+            # moment BEFORE finalizing, so the attribution window starts
+            # when customers actually received the email rather than
+            # whenever this reconciliation happens to run — which could
+            # be hours later.
+            provider_time = self._parse_provider_time(send_time)
+            if provider_time:
+                ambiguous.provider_sent_at = provider_time
+
             ambiguous.transition_to(SendAttemptStatus.RECONCILED_SENT)
             ambiguous.reconciled_by = actor
             self.v2_repo.update_send_attempt(ambiguous)
 
-            # Advance intervention state and promote recipients
-            if intervention.status == InterventionStatus.APPROVED:
-                from_status = intervention.status.value
-                intervention.transition_to(InterventionStatus.EXECUTING)
-                intervention.transition_to(InterventionStatus.MEASURING)
-                intervention.sent_count = ambiguous.audience_count
-                intervention.evidence["execution_result"] = {
+            self.v2_repo.append_audit(
+                intervention_id, intervention.event_id,
+                action="send_attempt_reconciled_sent",
+                actor=actor,
+                metadata={
                     "send_attempt_id": ambiguous.id,
-                    "mailchimp_campaign_id": ambiguous.provider_campaign_id,
-                    "reconciled": True,
-                }
-                intervention.measurement_window = ATTRIBUTION_WINDOW_DAYS
-                self.v2_repo.save_intervention(intervention)
+                    "provider_campaign_id": ambiguous.provider_campaign_id,
+                    "provider_status": campaign_status,
+                    "provider_send_time": send_time,
+                },
+            )
 
-                self.v2_repo.promote_attempt_recipients(
-                    ambiguous.id, intervention_id,
-                    intervention.campaign_draft_id,
-                )
-
-                self.v2_repo.append_audit(
-                    intervention_id, intervention.event_id,
-                    action="send_attempt_reconciled_sent",
-                    from_status=from_status,
-                    to_status=intervention.status.value,
-                    actor=actor,
-                    metadata={
-                        "send_attempt_id": ambiguous.id,
-                        "provider_campaign_id": ambiguous.provider_campaign_id,
-                        "provider_status": campaign_status,
-                    },
-                )
+            # Exactly the same local finalization the direct-confirmed
+            # and crash-recovery paths use. One owner for intervention
+            # advancement, recipient promotion, measurement setup and
+            # the finalization audit, so the paths cannot diverge.
+            finalize_result = self.finalize_confirmed_send(
+                ambiguous, intervention, actor=actor,
+            )
+            intervention = self.v2_repo.get_intervention(intervention_id)
+            refreshed = self.v2_repo.get_send_attempt(ambiguous.id) or ambiguous
 
             return {
                 "status": "reconciled_sent",
                 "message": "Provider confirms campaign was sent.",
-                "send_attempt": ambiguous.to_dict(),
-                "intervention": intervention.to_dict(),
+                "provider_status": campaign_status,
+                "finalization": finalize_result,
+                "send_attempt": refreshed.to_dict(),
+                "intervention": intervention.to_dict() if intervention else None,
             }
         else:
             # verdict is DEFINITELY_NOT_SENT — the provider proved the

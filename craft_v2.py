@@ -446,6 +446,10 @@ def _build_app():
                 "duplicate_claim": 409,
                 "attempt_in_progress": 409,
                 "already_sent": 409,
+                # Already sent, and local state was repaired on the way
+                # through. 409 because the send is not repeatable — but
+                # the body carries the recovered state, not a failure.
+                "already_sent_recovered": 409,
                 "reconciliation_required": 409,
                 # 409, never 5xx: a 5xx invites a retry, and a retry here
                 # could double-send. The condition is not transient —

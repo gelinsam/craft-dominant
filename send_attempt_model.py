@@ -173,6 +173,12 @@ class SendAttempt:
     send_requested_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
+    # Best-known moment the PROVIDER actually sent.  Distinct from
+    # completed_at (when we finished locally, possibly much later for a
+    # reconciled send) and from send_requested_at (before we knew the
+    # outcome).  The attribution window starts from this value.
+    provider_sent_at: Optional[datetime] = None
+
     # Reconciliation
     reconciled_at: Optional[datetime] = None
     reconciled_by: Optional[str] = None
@@ -249,6 +255,7 @@ class SendAttempt:
             'audience_configured_at': _ts(self.audience_configured_at),
             'send_requested_at': _ts(self.send_requested_at),
             'completed_at': _ts(self.completed_at),
+            'provider_sent_at': _ts(self.provider_sent_at),
             'reconciled_at': _ts(self.reconciled_at),
             'reconciled_by': self.reconciled_by,
             'is_dry_run': self.is_dry_run,

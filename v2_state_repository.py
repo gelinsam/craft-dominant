@@ -233,6 +233,32 @@ class V2StateRepository(abc.ABC):
         Idempotent: uses INSERT ... ON CONFLICT DO NOTHING.
         """
 
+    @abc.abstractmethod
+    def finalize_send_locally(
+        self,
+        attempt_id: int,
+        intervention: Intervention,
+        event_id: str,
+        audit_action: str,
+        audit_metadata: Optional[Dict[str, Any]] = None,
+        from_status: Optional[str] = None,
+        actor: str = "system",
+    ) -> None:
+        """Atomically converge local state after a PROVEN provider send.
+
+        In ONE transaction:
+          1. promote staged recipients → v2_campaign_sends (idempotent)
+          2. upsert the intervention
+          3. append the finalization audit entry
+
+        Contacts no external provider — the send already happened. Safe to
+        call repeatedly: recipient promotion conflicts are ignored and the
+        intervention upsert is by primary key.
+
+        Callers are responsible for not appending a duplicate audit entry;
+        see ExecutionAdapter._finalization_audit_exists.
+        """
+
     # ── Health ────────────────────────────────────────────────────────────
 
     @abc.abstractmethod
@@ -300,6 +326,7 @@ class SQLiteV2StateRepository(V2StateRepository):
                 audience_configured_at TEXT,
                 send_requested_at TEXT,
                 completed_at TEXT,
+                provider_sent_at TEXT,
                 reconciled_at TEXT,
                 reconciled_by TEXT,
                 reconciliation_detail TEXT,
@@ -315,7 +342,31 @@ class SQLiteV2StateRepository(V2StateRepository):
                 UNIQUE(send_attempt_id, email)
             );
         """)
+        # Additive column guard: CREATE TABLE IF NOT EXISTS will not add a
+        # column to a table an earlier revision already created, so bring
+        # pre-existing dev databases forward explicitly. Mirrors Postgres
+        # migration 003.
+        self._ensure_column("v2_send_attempts", "provider_sent_at", "TEXT")
         self.db.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        """Add a column if the table exists and lacks it. No-op otherwise."""
+        try:
+            cols = {
+                r[1] for r in
+                self.db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except Exception:
+            return
+        if not cols or column in cols:
+            return
+        try:
+            self.db.conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+            )
+            log.info("Added missing column %s.%s", table, column)
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("Could not add column %s.%s: %s", table, column, e)
 
     # ── Interventions ─────────────────────────────────────────────────────
 
@@ -455,6 +506,52 @@ class SQLiteV2StateRepository(V2StateRepository):
 
     # ── Atomic Transition ─────────────────────────────────────────────────
 
+    # Single definition of the intervention upsert, shared by
+    # save_intervention_with_audit and finalize_send_locally so the two
+    # transactional paths cannot drift apart.
+    _INTERVENTION_UPSERT_SQL = """INSERT OR REPLACE INTO interventions
+                   (id, opportunity_id, event_id, intervention_type, status,
+                    rationale, audience_definition, expected_revenue, expected_cost,
+                    expected_net_value, confidence, approval_required, created_at,
+                    approved_at, executed_at, measurement_window, actual_revenue,
+                    actual_cost, actual_net_value, outcome_status, evidence,
+                    campaign_draft_id, measurement_started_at, measurement_ends_at,
+                    attributed_orders, attributed_tickets, attributed_revenue, sent_count)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    @staticmethod
+    def _intervention_params(intervention: Intervention, evidence_json):
+        return (
+            intervention.id,
+            intervention.opportunity_id,
+            intervention.event_id,
+            intervention.intervention_type,
+            intervention.status.value,
+            intervention.rationale,
+            intervention.audience_definition,
+            intervention.expected_revenue,
+            intervention.expected_cost,
+            intervention.expected_net_value,
+            intervention.confidence,
+            1 if intervention.approval_required else 0,
+            intervention.created_at,
+            intervention.approved_at,
+            intervention.executed_at,
+            intervention.measurement_window,
+            intervention.actual_revenue,
+            intervention.actual_cost,
+            intervention.actual_net_value,
+            intervention.outcome_status,
+            evidence_json,
+            intervention.campaign_draft_id,
+            intervention.measurement_started_at,
+            intervention.measurement_ends_at,
+            intervention.attributed_orders,
+            intervention.attributed_tickets,
+            intervention.attributed_revenue,
+            intervention.sent_count,
+        )
+
     def save_intervention_with_audit(
         self,
         intervention: Intervention,
@@ -476,45 +573,8 @@ class SQLiteV2StateRepository(V2StateRepository):
         meta_json = json.dumps(metadata) if metadata else "{}"
         try:
             self.db.conn.execute(
-                """INSERT OR REPLACE INTO interventions
-                   (id, opportunity_id, event_id, intervention_type, status,
-                    rationale, audience_definition, expected_revenue, expected_cost,
-                    expected_net_value, confidence, approval_required, created_at,
-                    approved_at, executed_at, measurement_window, actual_revenue,
-                    actual_cost, actual_net_value, outcome_status, evidence,
-                    campaign_draft_id, measurement_started_at, measurement_ends_at,
-                    attributed_orders, attributed_tickets, attributed_revenue, sent_count)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    intervention.id,
-                    intervention.opportunity_id,
-                    intervention.event_id,
-                    intervention.intervention_type,
-                    intervention.status.value,
-                    intervention.rationale,
-                    intervention.audience_definition,
-                    intervention.expected_revenue,
-                    intervention.expected_cost,
-                    intervention.expected_net_value,
-                    intervention.confidence,
-                    1 if intervention.approval_required else 0,
-                    intervention.created_at,
-                    intervention.approved_at,
-                    intervention.executed_at,
-                    intervention.measurement_window,
-                    intervention.actual_revenue,
-                    intervention.actual_cost,
-                    intervention.actual_net_value,
-                    intervention.outcome_status,
-                    evidence_json,
-                    intervention.campaign_draft_id,
-                    intervention.measurement_started_at,
-                    intervention.measurement_ends_at,
-                    intervention.attributed_orders,
-                    intervention.attributed_tickets,
-                    intervention.attributed_revenue,
-                    intervention.sent_count,
-                ),
+                self._INTERVENTION_UPSERT_SQL,
+                self._intervention_params(intervention, evidence_json),
             )
             self.db.conn.execute(
                 """INSERT INTO intervention_audit_log
@@ -797,6 +857,7 @@ class SQLiteV2StateRepository(V2StateRepository):
                    audience_configured_at = ?,
                    send_requested_at = ?,
                    completed_at = ?,
+                   provider_sent_at = ?,
                    reconciled_at = ?,
                    reconciled_by = ?,
                    reconciliation_detail = ?,
@@ -810,6 +871,7 @@ class SQLiteV2StateRepository(V2StateRepository):
              _ts(attempt.audience_configured_at),
              _ts(attempt.send_requested_at),
              _ts(attempt.completed_at),
+             _ts(attempt.provider_sent_at),
              _ts(attempt.reconciled_at),
              attempt.reconciled_by, recon_detail,
              attempt.error_message, err_detail,
@@ -886,6 +948,54 @@ class SQLiteV2StateRepository(V2StateRepository):
             )
         self.db.conn.commit()
 
+    def finalize_send_locally(
+        self,
+        attempt_id: int,
+        intervention: Intervention,
+        event_id: str,
+        audit_action: str,
+        audit_metadata: Optional[Dict[str, Any]] = None,
+        from_status: Optional[str] = None,
+        actor: str = "system",
+    ) -> None:
+        """Promote recipients + save intervention + audit in one transaction."""
+        now = datetime.now(timezone.utc).isoformat()
+        emails = self.get_attempt_recipients(attempt_id)
+        meta_json = json.dumps(audit_metadata) if audit_metadata else "{}"
+        evidence_json = (
+            json.dumps(intervention.evidence)
+            if isinstance(intervention.evidence, dict)
+            else intervention.evidence
+        )
+        try:
+            for email in emails:
+                # ON CONFLICT DO NOTHING semantics: an already-promoted
+                # recipient keeps its ORIGINAL sent_at, so replaying
+                # finalization never rewrites attribution timestamps.
+                self.db.conn.execute(
+                    """INSERT OR IGNORE INTO v2_campaign_sends
+                       (intervention_id, campaign_draft_id, email, sent_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (intervention.id, intervention.campaign_draft_id,
+                     email, now),
+                )
+            self.db.conn.execute(
+                self._INTERVENTION_UPSERT_SQL,
+                self._intervention_params(intervention, evidence_json),
+            )
+            self.db.conn.execute(
+                """INSERT INTO intervention_audit_log
+                   (intervention_id, event_id, action, from_status, to_status,
+                    actor, timestamp, metadata, error)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (intervention.id, event_id, audit_action, from_status,
+                 intervention.status.value, actor, now, meta_json, None),
+            )
+            self.db.conn.commit()
+        except Exception:
+            self.db.conn.rollback()
+            raise
+
     # ── Health ────────────────────────────────────────────────────────────
 
     def health_check(self) -> Dict[str, Any]:
@@ -945,6 +1055,7 @@ class SQLiteV2StateRepository(V2StateRepository):
             provider_campaign_created_at=d.get("provider_campaign_created_at"),
             audience_configured_at=d.get("audience_configured_at"),
             send_requested_at=d.get("send_requested_at"),
+            provider_sent_at=d.get("provider_sent_at"),
             completed_at=d.get("completed_at"),
             reconciled_at=d.get("reconciled_at"),
             reconciled_by=d.get("reconciled_by"),
@@ -1605,6 +1716,7 @@ class PostgresV2StateRepository(V2StateRepository):
                        audience_configured_at = %s,
                        send_requested_at = %s,
                        completed_at = %s,
+                       provider_sent_at = %s,
                        reconciled_at = %s,
                        reconciled_by = %s,
                        reconciliation_detail = %s,
@@ -1618,6 +1730,7 @@ class PostgresV2StateRepository(V2StateRepository):
                  self._to_utc(attempt.audience_configured_at),
                  self._to_utc(attempt.send_requested_at),
                  self._to_utc(attempt.completed_at),
+                 self._to_utc(attempt.provider_sent_at),
                  self._to_utc(attempt.reconciled_at),
                  attempt.reconciled_by,
                  Json(attempt.reconciliation_detail) if attempt.reconciliation_detail else None,
@@ -1708,6 +1821,65 @@ class PostgresV2StateRepository(V2StateRepository):
                 )
             conn.commit()
 
+    def finalize_send_locally(
+        self,
+        attempt_id: int,
+        intervention: Intervention,
+        event_id: str,
+        audit_action: str,
+        audit_metadata: Optional[Dict[str, Any]] = None,
+        from_status: Optional[str] = None,
+        actor: str = "system",
+    ) -> None:
+        """Promote recipients + save intervention + audit in ONE transaction.
+
+        Postgres gives us real atomicity here: either the intervention
+        advances AND its recipients land in attribution AND the audit
+        records it, or none of it happens and the next recovery pass
+        retries cleanly.
+        """
+        from psycopg.types.json import Json
+
+        now = datetime.now(timezone.utc)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT email FROM v2_send_attempt_recipients
+                   WHERE send_attempt_id = %s""",
+                (attempt_id,),
+            ).fetchall()
+            for r in rows:
+                # DO NOTHING, never DO UPDATE: an already-promoted
+                # recipient keeps its ORIGINAL sent_at so replaying
+                # finalization cannot rewrite attribution timestamps.
+                conn.execute(
+                    """INSERT INTO v2_campaign_sends
+                       (intervention_id, campaign_draft_id, email, sent_at)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (intervention_id, email) DO NOTHING""",
+                    (intervention.id, intervention.campaign_draft_id,
+                     r["email"], now),
+                )
+            conn.execute(
+                self._INTERVENTION_UPSERT,
+                self._intervention_params(intervention),
+            )
+            conn.execute(
+                """INSERT INTO intervention_audit_log
+                   (intervention_id, event_id, action, from_status, to_status,
+                    actor, timestamp, metadata, error)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (intervention.id, event_id, audit_action, from_status,
+                 intervention.status.value, actor, now,
+                 Json(audit_metadata) if audit_metadata else Json({}), None),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     # ── Health ────────────────────────────────────────────────────────────
 
     def health_check(self) -> Dict[str, Any]:
@@ -1785,6 +1957,7 @@ class PostgresV2StateRepository(V2StateRepository):
             provider_campaign_created_at=d.get("provider_campaign_created_at"),
             audience_configured_at=d.get("audience_configured_at"),
             send_requested_at=d.get("send_requested_at"),
+            provider_sent_at=d.get("provider_sent_at"),
             completed_at=d.get("completed_at"),
             reconciled_at=d.get("reconciled_at"),
             reconciled_by=d.get("reconciled_by"),
