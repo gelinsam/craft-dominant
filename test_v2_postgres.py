@@ -57,6 +57,25 @@ def sqlite_repo(tmp_path):
     db.conn.close()
 
 
+def _as_utc(value):
+    """Normalise a repository timestamp to an aware UTC datetime.
+
+    get_sends() returns ISO strings (Postgres converts via _ts_to_iso so
+    both backends look the same to callers), while send-attempt rows come
+    back as datetimes. Tests should assert on the instant, not the
+    representation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _make_intervention(**overrides) -> Intervention:
     """Create a test intervention with sensible defaults."""
     defaults = dict(
@@ -325,6 +344,10 @@ def _clean_pg_tables(pg_url: str):
         conn.execute("DELETE FROM v2_campaign_sends")
         conn.execute("DELETE FROM v2_learning_records")
         conn.execute("DELETE FROM v2_suppression_sync")
+        # Send-attempt tables before interventions: recipients FK to
+        # attempts, attempts FK to interventions.
+        conn.execute("DELETE FROM v2_send_attempt_recipients")
+        conn.execute("DELETE FROM v2_send_attempts")
         conn.execute("DELETE FROM interventions")
         conn.commit()
 
@@ -428,7 +451,7 @@ class TestPostgresV2Repository:
         assert health["status"] == "ok"
         assert health["backend"] == "postgres"
         assert health["tables_ok"] is True
-        assert health["schema_version"] == 1
+        assert health["schema_version"] == 3
 
     def test_legal_transition_persists(self):
         """Verify a legal state transition round-trips through Postgres."""
@@ -1032,3 +1055,336 @@ class TestSplitBrainPrevention:
         assert "v2_repo" in params
         assert "store" not in params
         assert "audit" not in params
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crash-after-confirmed-send recovery against REAL Postgres
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@requires_postgres
+class TestPostgresConfirmedSendRecovery:
+    """The critical recovery case, proven against Postgres 16.
+
+    The repository transaction and the partial unique indexes are part
+    of the safety proof, so this case must run against the real engine
+    rather than SQLite alone.
+    """
+
+    @pytest.fixture(autouse=True)
+    def pg_repo(self):
+        migrations_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "migrations", "v2_postgres",
+        )
+        run_postgres_migrations(PG_URL, migrations_dir)
+        _clean_pg_tables(PG_URL)
+        self.repo = PostgresV2StateRepository(PG_URL)
+        yield
+        _clean_pg_tables(PG_URL)
+
+    def _seed_confirmed_send(self, emails):
+        """Intervention + proven-sent attempt + staged recipients.
+
+        Deliberately stops BEFORE any local finalization, which is
+        exactly the state a crash in that window leaves behind.
+        """
+        from send_attempt_model import (
+            SendAttempt, SendAttemptStatus,
+            compute_audience_hash, compute_idempotency_key,
+        )
+
+        # Note: Intervention.create() derives the id itself, so it must
+        # not be passed as a kwarg — set it after construction.
+        iv = _make_intervention(
+            opportunity_id="opp-recover",
+            status=InterventionStatus.APPROVED,
+        )
+        iv.campaign_draft_id = "draft-recover"
+        self.repo.save_intervention(iv)
+
+        audience_hash = compute_audience_hash(emails)
+        attempt = SendAttempt(
+            id=None,
+            intervention_id=iv.id,
+            execution_generation=1,
+            attempt_status=SendAttemptStatus.CLAIMED,
+            idempotency_key=compute_idempotency_key(
+                iv.id, 1, "draft-recover", audience_hash),
+            audience_hash=audience_hash,
+            audience_count=len(emails),
+            claimed_at=datetime.now(timezone.utc),
+        )
+        attempt = self.repo.create_send_attempt(attempt)
+        self.repo.stage_attempt_recipients(attempt.id, emails)
+
+        attempt.provider_campaign_id = "mc-recover-1"
+        attempt.transition_to(SendAttemptStatus.PROVIDER_CAMPAIGN_CREATED)
+        attempt.transition_to(SendAttemptStatus.AUDIENCE_CONFIGURED)
+        attempt.transition_to(SendAttemptStatus.SEND_REQUESTED)
+        attempt.provider_sent_at = datetime.now(timezone.utc)
+        attempt.transition_to(SendAttemptStatus.CONFIRMED_SENT)
+        self.repo.update_send_attempt(attempt)
+        return iv, attempt
+
+    def test_provider_sent_at_roundtrips(self):
+        emails = ["a@test.com", "b@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+
+        stored = self.repo.get_send_attempt(attempt.id)
+        assert stored.provider_sent_at is not None
+        assert _as_utc(stored.provider_sent_at).tzinfo is not None
+        assert stored.attempt_status.value == "confirmed_sent"
+
+    def test_finalize_send_locally_is_atomic_and_idempotent(self):
+        emails = ["a@test.com", "b@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+
+        # Pre-state: nothing finalized.
+        assert self.repo.get_sends(iv.id) == []
+        assert self.repo.get_intervention(iv.id).status == InterventionStatus.APPROVED
+
+        iv.transition_to(InterventionStatus.EXECUTING)
+        iv.transition_to(InterventionStatus.MEASURING)
+        iv.sent_count = len(emails)
+
+        self.repo.finalize_send_locally(
+            attempt_id=attempt.id,
+            intervention=iv,
+            event_id=iv.event_id,
+            sent_at=attempt.provider_sent_at,
+            audit_action="send_finalized",
+            from_status="approved",
+            audit_metadata={"send_attempt_id": attempt.id},
+        )
+
+        got = self.repo.get_intervention(iv.id)
+        assert got.status == InterventionStatus.MEASURING
+        assert got.sent_count == len(emails)
+        sends = self.repo.get_sends(iv.id)
+        assert {s["email"] for s in sends} == set(emails)
+        first_sent_at = {s["email"]: s["sent_at"] for s in sends}
+
+        # Replay: no duplicates, timestamps preserved.
+        for _ in range(3):
+            self.repo.finalize_send_locally(
+                attempt_id=attempt.id,
+                intervention=got,
+                event_id=got.event_id,
+                sent_at=attempt.provider_sent_at,
+                audit_action="send_finalized",
+                from_status="approved",
+                audit_metadata={"send_attempt_id": attempt.id},
+            )
+
+        sends_after = self.repo.get_sends(iv.id)
+        assert len(sends_after) == len(emails)
+        assert {s["email"]: s["sent_at"] for s in sends_after} == first_sent_at
+
+    def test_promotion_idempotent_under_unique_constraint(self):
+        """UNIQUE(intervention_id, email) must absorb replays silently."""
+        emails = ["a@test.com", "b@test.com", "c@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+
+        for _ in range(4):
+            self.repo.promote_attempt_recipients(
+                attempt.id, iv.id, "draft-recover",
+                sent_at=attempt.provider_sent_at)
+
+        sends = self.repo.get_sends(iv.id)
+        assert len(sends) == len(emails)
+        assert {s["email"] for s in sends} == set(emails)
+
+    def test_successful_attempt_uniqueness_preserved(self):
+        """A second confirmed_sent for the same generation is rejected.
+
+        The partial unique index idx_send_attempts_unique_success is the
+        database-level guarantee behind "at most one successful send per
+        intervention+generation". The repository surfaces the violation
+        as DuplicateClaimError rather than a raw psycopg error.
+        """
+        from send_attempt_model import (
+            SendAttempt, SendAttemptStatus, DuplicateClaimError,
+            compute_idempotency_key,
+        )
+
+        emails = ["a@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+
+        dup = SendAttempt(
+            id=None,
+            intervention_id=iv.id,
+            execution_generation=1,
+            attempt_status=SendAttemptStatus.CONFIRMED_SENT,
+            idempotency_key=compute_idempotency_key(iv.id, 1, "draft-recover", "h2"),
+            audience_hash="h2",
+            audience_count=1,
+            claimed_at=datetime.now(timezone.utc),
+        )
+        with pytest.raises(DuplicateClaimError):
+            self.repo.create_send_attempt(dup)
+
+    def test_promotion_stamps_provider_send_time_not_now(self):
+        """TIMESTAMPTZ round-trip: rows carry the provider send time.
+
+        The defect this guards: promotion used datetime.now() at
+        finalization, so a send recovered hours after a crash produced
+        recipient rows stamped with the recovery time — and attribution
+        measured from there.
+        """
+        emails = ["a@test.com", "b@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+
+        # Backdate the provider send well before "now".
+        real_send = datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)
+        attempt.provider_sent_at = real_send
+        self.repo.update_send_attempt(attempt)
+
+        self.repo.promote_attempt_recipients(
+            attempt.id, iv.id, "draft-recover", sent_at=real_send)
+
+        sends = self.repo.get_sends(iv.id)
+        assert len(sends) == len(emails)
+        for row in sends:
+            ts = _as_utc(row["sent_at"])
+            assert ts is not None and ts.tzinfo is not None
+            assert ts == real_send, (
+                f"recipient row stamped {ts} instead of the provider "
+                f"send time {real_send}"
+            )
+
+    def test_finalize_transaction_uses_provider_send_time(self):
+        emails = ["a@test.com", "b@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+        real_send = datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)
+        attempt.provider_sent_at = real_send
+        self.repo.update_send_attempt(attempt)
+
+        iv.transition_to(InterventionStatus.EXECUTING)
+        iv.transition_to(InterventionStatus.MEASURING)
+        iv.measurement_started_at = real_send.isoformat()
+        iv.sent_count = len(emails)
+
+        self.repo.finalize_send_locally(
+            attempt_id=attempt.id,
+            intervention=iv,
+            event_id=iv.event_id,
+            sent_at=real_send,
+            audit_action="send_finalized",
+            from_status="approved",
+            audit_metadata={"send_attempt_id": attempt.id},
+        )
+
+        for row in self.repo.get_sends(iv.id):
+            assert _as_utc(row["sent_at"]) == real_send
+
+        # Attempt and intervention agree with the rows.
+        stored = self.repo.get_send_attempt(attempt.id)
+        assert _as_utc(stored.provider_sent_at) == real_send
+
+    def test_replay_preserves_original_row_timestamp(self):
+        """A later replay with a wrong clock must not rewrite rows."""
+        emails = ["a@test.com"]
+        iv, attempt = self._seed_confirmed_send(emails)
+        real_send = datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)
+
+        self.repo.promote_attempt_recipients(
+            attempt.id, iv.id, "draft-recover", sent_at=real_send)
+        before = [_as_utc(r["sent_at"]) for r in self.repo.get_sends(iv.id)]
+
+        # Hostile replay with the current clock.
+        for _ in range(3):
+            self.repo.promote_attempt_recipients(
+                attempt.id, iv.id, "draft-recover",
+                sent_at=datetime.now(timezone.utc))
+
+        after = [_as_utc(r["sent_at"]) for r in self.repo.get_sends(iv.id)]
+        assert after == before
+        assert after[0] == real_send
+
+    def test_health_requires_full_phase_2_schema(self):
+        """Migrations are applied, so health must report ready."""
+        h = self.repo.health_check()
+        assert h["ready"] is True
+        assert h["status"] == "ok"
+        assert h["tables_ok"] is True
+        assert "missing_tables" not in h
+        assert h["schema_version"] >= 3
+        assert h["required_schema_version"] == 3
+        assert h["schema_ok"] is True
+        assert "v2_send_attempts" in h["tables_found"]
+        assert "v2_send_attempt_recipients" in h["tables_found"]
+
+
+@requires_postgres
+class TestMigration003ProviderSentAt:
+    """Migration 003 upgrade behaviour against real Postgres."""
+
+    def test_provider_sent_at_column_exists_and_rerun_is_noop(self):
+        migrations_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "migrations", "v2_postgres",
+        )
+        run_postgres_migrations(PG_URL, migrations_dir)
+
+        import psycopg
+        with psycopg.connect(PG_URL) as conn:
+            row = conn.execute(
+                """SELECT data_type, is_nullable
+                   FROM information_schema.columns
+                   WHERE table_name = 'v2_send_attempts'
+                     AND column_name = 'provider_sent_at'"""
+            ).fetchone()
+            assert row is not None, "provider_sent_at column missing"
+            assert row[0] == "timestamp with time zone"
+            assert row[1] == "YES", "nullable: old rows have no known send time"
+
+            ver = conn.execute(
+                "SELECT MAX(version) FROM v2_schema_version").fetchone()
+            assert ver[0] >= 3
+
+        # Rerunning applies nothing.
+        assert run_postgres_migrations(PG_URL, migrations_dir) == 0
+
+    def test_existing_attempt_rows_survive_upgrade(self):
+        """Rows written before 003 keep their data, with a NULL column."""
+        migrations_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "migrations", "v2_postgres",
+        )
+        run_postgres_migrations(PG_URL, migrations_dir)
+        _clean_pg_tables(PG_URL)
+        repo = PostgresV2StateRepository(PG_URL)
+
+        from send_attempt_model import (
+            SendAttempt, SendAttemptStatus, compute_idempotency_key,
+        )
+        iv = _make_intervention(opportunity_id="opp-migrate")
+        iv.campaign_draft_id = "draft-migrate"
+        repo.save_intervention(iv)
+
+        attempt = SendAttempt(
+            id=None,
+            intervention_id=iv.id,
+            execution_generation=1,
+            attempt_status=SendAttemptStatus.CLAIMED,
+            idempotency_key=compute_idempotency_key(iv.id, 1, "draft-migrate", "h"),
+            audience_hash="h",
+            audience_count=1,
+            claimed_at=datetime.now(timezone.utc),
+        )
+        attempt = repo.create_send_attempt(attempt)
+
+        # A pre-003-style row: no provider_sent_at recorded.
+        stored = repo.get_send_attempt(attempt.id)
+        assert stored is not None
+        assert stored.provider_sent_at is None
+        assert stored.attempt_status == SendAttemptStatus.CLAIMED
+
+        # Rerunning migrations does not disturb it.
+        assert run_postgres_migrations(PG_URL, migrations_dir) == 0
+        again = repo.get_send_attempt(attempt.id)
+        assert again.idempotency_key == stored.idempotency_key
+        assert again.provider_sent_at is None
+
+        _clean_pg_tables(PG_URL)
