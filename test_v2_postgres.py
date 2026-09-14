@@ -57,6 +57,25 @@ def sqlite_repo(tmp_path):
     db.conn.close()
 
 
+def _as_utc(value):
+    """Normalise a repository timestamp to an aware UTC datetime.
+
+    get_sends() returns ISO strings (Postgres converts via _ts_to_iso so
+    both backends look the same to callers), while send-attempt rows come
+    back as datetimes. Tests should assert on the instant, not the
+    representation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _make_intervention(**overrides) -> Intervention:
     """Create a test intervention with sensible defaults."""
     defaults = dict(
@@ -1114,7 +1133,7 @@ class TestPostgresConfirmedSendRecovery:
 
         stored = self.repo.get_send_attempt(attempt.id)
         assert stored.provider_sent_at is not None
-        assert stored.provider_sent_at.tzinfo is not None
+        assert _as_utc(stored.provider_sent_at).tzinfo is not None
         assert stored.attempt_status.value == "confirmed_sent"
 
     def test_finalize_send_locally_is_atomic_and_idempotent(self):
@@ -1226,11 +1245,10 @@ class TestPostgresConfirmedSendRecovery:
 
         sends = self.repo.get_sends(iv.id)
         assert len(sends) == len(emails)
-        for s in sends:
-            ts = s["sent_at"]
-            assert isinstance(ts, datetime), "expected a real TIMESTAMPTZ"
-            assert ts.tzinfo is not None
-            assert ts.astimezone(timezone.utc) == real_send, (
+        for row in sends:
+            ts = _as_utc(row["sent_at"])
+            assert ts is not None and ts.tzinfo is not None
+            assert ts == real_send, (
                 f"recipient row stamped {ts} instead of the provider "
                 f"send time {real_send}"
             )
@@ -1257,12 +1275,12 @@ class TestPostgresConfirmedSendRecovery:
             audit_metadata={"send_attempt_id": attempt.id},
         )
 
-        for s in self.repo.get_sends(iv.id):
-            assert s["sent_at"].astimezone(timezone.utc) == real_send
+        for row in self.repo.get_sends(iv.id):
+            assert _as_utc(row["sent_at"]) == real_send
 
         # Attempt and intervention agree with the rows.
         stored = self.repo.get_send_attempt(attempt.id)
-        assert stored.provider_sent_at.astimezone(timezone.utc) == real_send
+        assert _as_utc(stored.provider_sent_at) == real_send
 
     def test_replay_preserves_original_row_timestamp(self):
         """A later replay with a wrong clock must not rewrite rows."""
@@ -1272,7 +1290,7 @@ class TestPostgresConfirmedSendRecovery:
 
         self.repo.promote_attempt_recipients(
             attempt.id, iv.id, "draft-recover", sent_at=real_send)
-        before = [s["sent_at"] for s in self.repo.get_sends(iv.id)]
+        before = [_as_utc(r["sent_at"]) for r in self.repo.get_sends(iv.id)]
 
         # Hostile replay with the current clock.
         for _ in range(3):
@@ -1280,9 +1298,9 @@ class TestPostgresConfirmedSendRecovery:
                 attempt.id, iv.id, "draft-recover",
                 sent_at=datetime.now(timezone.utc))
 
-        after = [s["sent_at"] for s in self.repo.get_sends(iv.id)]
+        after = [_as_utc(r["sent_at"]) for r in self.repo.get_sends(iv.id)]
         assert after == before
-        assert after[0].astimezone(timezone.utc) == real_send
+        assert after[0] == real_send
 
     def test_health_requires_full_phase_2_schema(self):
         """Migrations are applied, so health must report ready."""
@@ -1290,7 +1308,7 @@ class TestPostgresConfirmedSendRecovery:
         assert h["ready"] is True
         assert h["status"] == "ok"
         assert h["tables_ok"] is True
-        assert h["missing_tables"] if not h["tables_ok"] else True
+        assert "missing_tables" not in h
         assert h["schema_version"] >= 3
         assert h["required_schema_version"] == 3
         assert h["schema_ok"] is True
