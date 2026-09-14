@@ -1665,7 +1665,8 @@ class TestPartialFinalizationRecovery(unittest.TestCase):
 
         for _ in range(3):
             v2_repo.promote_attempt_recipients(
-                attempt.id, intv_id, "draft-001")
+                attempt.id, intv_id, "draft-001",
+                sent_at=attempt.provider_sent_at)
 
         after = {s["email"]: s["sent_at"] for s in v2_repo.get_sends(intv_id)}
         self.assertEqual(after, original)
@@ -1787,6 +1788,342 @@ class TestAuthoritativeSendTimestamp(unittest.TestCase):
         out = adapter.finalize_confirmed_send(attempt, iv)
         self.assertEqual(out["error"], "attempt_not_successful")
         self.assertEqual(iv.status, InterventionStatus.APPROVED)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Attribution clock — provider_sent_at must be the ONE authority
+# ─────────────────────────────────────────────────────────────────────
+
+REAL_SEND = datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)
+
+
+def _force_provider_sent_at(db, v2_repo, intv_id, when):
+    """Rewrite the attempt's provider send time, then rewind local state.
+
+    Produces the crash shape: provider proven to have sent at `when`,
+    nothing finalized locally yet.
+    """
+    attempt = v2_repo.get_send_attempts(intv_id)[0]
+    attempt.provider_sent_at = when
+    v2_repo.update_send_attempt(attempt)
+
+    db.conn.execute("DELETE FROM v2_campaign_sends WHERE intervention_id = ?",
+                    (intv_id,))
+    db.conn.execute(
+        "DELETE FROM intervention_audit_log WHERE intervention_id = ? "
+        "AND action = ?", (intv_id, ExecutionAdapter.FINALIZATION_AUDIT_ACTION))
+    db.conn.commit()
+
+    iv = v2_repo.get_intervention(intv_id)
+    iv.status = InterventionStatus.APPROVED
+    iv.sent_count = None
+    iv.measurement_started_at = None
+    iv.measurement_ends_at = None
+    iv.executed_at = None
+    v2_repo.save_intervention(iv)
+    return attempt
+
+
+class TestAttributionClockConsistency(unittest.TestCase):
+    """Recipient send rows must carry the PROVIDER send time.
+
+    The defect: promotion stamped rows with datetime.now() at
+    finalization. measure() then read those rows as the window start, so
+    a send recovered six hours after a crash started its attribution
+    window six hours late and silently dropped every order in between.
+    """
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def _sent_at_values(self, v2_repo, intv_id):
+        return {
+            ExecutionAdapter._parse_provider_time(r["sent_at"])
+            for r in v2_repo.get_sends(intv_id)
+        }
+
+    def test_crash_recovery_stamps_rows_with_provider_send_time(self):
+        """MANDATORY: send 10:00, recover later, rows must say 10:00."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, REAL_SEND)
+
+        # Recovery happens "now", hours after the real send.
+        result = _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+        self.assertEqual(result["error"], "already_sent_recovered")
+
+        stamped = self._sent_at_values(v2_repo, intv_id)
+        self.assertEqual(stamped, {REAL_SEND},
+                         "recipient rows must carry the provider send time, "
+                         "not the recovery time")
+
+        # And the row time is nowhere near the recovery clock.
+        self.assertGreater(datetime.now(timezone.utc) - REAL_SEND,
+                           timedelta(hours=0))
+
+    def test_all_three_clocks_agree_after_recovery(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, REAL_SEND)
+        _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        iv = v2_repo.get_intervention(intv_id)
+
+        provider = ExecutionAdapter._parse_provider_time(attempt.provider_sent_at)
+        started = ExecutionAdapter._parse_provider_time(iv.measurement_started_at)
+        rows = self._sent_at_values(v2_repo, intv_id)
+
+        self.assertEqual(provider, REAL_SEND)
+        self.assertEqual(started, REAL_SEND)
+        self.assertEqual(rows, {REAL_SEND})
+
+    def test_clock_report_flags_consistency(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, REAL_SEND)
+        a = _fresh_adapter(db, v2_repo, mc)
+        a.execute(intv_id)
+
+        report = a.attribution_clock_report(intv_id)
+        self.assertTrue(report["consistent"])
+        self.assertEqual(report["provider_sent_at"], REAL_SEND.isoformat())
+        self.assertEqual(report["recipient_sent_at_min"], REAL_SEND.isoformat())
+        self.assertEqual(report["recipient_sent_at_max"], REAL_SEND.isoformat())
+
+    def test_direct_send_rows_match_confirmation_time(self):
+        """Normal path: recipient rows equal attempt.provider_sent_at."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        provider = ExecutionAdapter._parse_provider_time(attempt.provider_sent_at)
+        rows = self._sent_at_values(v2_repo, intv_id)
+
+        self.assertEqual(rows, {provider})
+
+    def test_late_reconciliation_rows_use_provider_send_time(self):
+        """Ambiguous send reconciled hours later still stamps T, not T+N."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('timeout',))
+        adapter.execute(intv_id)
+        mc.clear_injections()
+
+        mc.set_campaign_status("sent", emails_sent=2,
+                               send_time=REAL_SEND.isoformat())
+        result = _fresh_adapter(db, v2_repo, mc).reconcile_send_attempt(intv_id)
+        self.assertEqual(result["status"], "reconciled_sent")
+
+        rows = self._sent_at_values(v2_repo, intv_id)
+        self.assertEqual(rows, {REAL_SEND},
+                         "reconciled rows must use the provider send time, "
+                         "not the reconciliation time")
+
+    def test_replay_preserves_provider_timestamp(self):
+        """Repeated promotion must not rewrite an existing row."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, REAL_SEND)
+        _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        before = {s["email"]: s["sent_at"] for s in v2_repo.get_sends(intv_id)}
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        for _ in range(3):
+            v2_repo.promote_attempt_recipients(
+                attempt.id, intv_id, "draft-001",
+                sent_at=datetime.now(timezone.utc),  # hostile: wrong clock
+            )
+        after = {s["email"]: s["sent_at"] for s in v2_repo.get_sends(intv_id)}
+        self.assertEqual(after, before,
+                         "existing rows must keep their original timestamp")
+
+    def test_partial_promotion_fills_gaps_with_provider_time(self):
+        """Missing rows get provider time; existing rows are untouched."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, REAL_SEND)
+        _fresh_adapter(db, v2_repo, mc).execute(intv_id)
+
+        rows = v2_repo.get_sends(intv_id)
+        self.assertGreaterEqual(len(rows), 2)
+        victim = rows[0]["email"]
+        db.conn.execute(
+            "DELETE FROM v2_campaign_sends WHERE intervention_id = ? AND email = ?",
+            (intv_id, victim))
+        db.conn.commit()
+
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        v2_repo.promote_attempt_recipients(
+            attempt.id, intv_id, "draft-001",
+            sent_at=attempt.provider_sent_at)
+
+        self.assertEqual(self._sent_at_values(v2_repo, intv_id), {REAL_SEND})
+        self.assertEqual(len(v2_repo.get_sends(intv_id)), len(rows))
+
+    def test_repository_refuses_to_invent_a_send_time(self):
+        """A None send time must raise, never silently become now()."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        attempt = v2_repo.get_send_attempts(intv_id)[0]
+        with self.assertRaises(ValueError):
+            v2_repo.promote_attempt_recipients(
+                attempt.id, intv_id, "draft-001", sent_at=None)
+
+    def test_execute_response_reflects_persisted_state(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        result = adapter.execute(intv_id)
+
+        iv = v2_repo.get_intervention(intv_id)
+        self.assertEqual(result["measurement_started_at"],
+                         iv.measurement_started_at)
+        self.assertEqual(result["measurement_ends_at"], iv.measurement_ends_at)
+        self.assertEqual(result["sent_count"], iv.sent_count)
+        self.assertIsNotNone(result["provider_sent_at"])
+        self.assertEqual(result["intervention"]["status"], "measuring")
+
+
+class TestAttributionWindowAgainstProviderTime(unittest.TestCase):
+    """Orders must be attributed against the send, not the finalization."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def _order(self, db, order_id, email, when, tickets=1, amount=100.0):
+        db.conn.execute(
+            """INSERT INTO orders (order_id, event_id, email,
+               order_timestamp, ticket_count, gross_amount)
+               VALUES (?,?,?,?,?,?)""",
+            (order_id, "evt1", email, when.isoformat(), tickets, amount),
+        )
+        db.conn.commit()
+
+    def _recovered_env(self, send_time):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        adapter.execute(intv_id)
+        _force_provider_sent_at(db, v2_repo, intv_id, send_time)
+        a = _fresh_adapter(db, v2_repo, mc)
+        a.execute(intv_id)
+        return db, v2_repo, a, intv_id
+
+    def test_orders_measured_against_send_not_finalization(self):
+        """Send 10:00, finalize later. 09:59 out, 12:00 in, 17:00 in."""
+        db, v2_repo, adapter, intv_id = self._recovered_env(REAL_SEND)
+
+        self._order(db, "before", "alice@example.com",
+                    REAL_SEND - timedelta(minutes=1))
+        self._order(db, "during", "alice@example.com",
+                    REAL_SEND + timedelta(hours=2))
+        self._order(db, "after_recovery", "bob@example.com",
+                    REAL_SEND + timedelta(hours=7))
+
+        result = adapter.measure(intv_id)
+        self.assertNotIn("error", result)
+
+        # Two included (12:00 and 17:00), the 09:59 one excluded.
+        self.assertEqual(result["actual"]["attributed_orders"], 2)
+
+    def test_pre_send_order_excluded(self):
+        db, v2_repo, adapter, intv_id = self._recovered_env(REAL_SEND)
+        self._order(db, "before", "alice@example.com",
+                    REAL_SEND - timedelta(minutes=1))
+        result = adapter.measure(intv_id)
+        self.assertEqual(result["actual"]["attributed_orders"], 0)
+
+    def test_seven_day_boundary_uses_provider_send_time(self):
+        """Sept 1 10:00 send: Sept 8 09:59 in, Sept 8 10:01 out.
+
+        Both orders are seeded before a single measure() call — the
+        first measurement completes the window and moves the
+        intervention to 'learned', so it can only be measured once.
+        """
+        send = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        db, v2_repo, adapter, intv_id = self._recovered_env(send)
+
+        self._order(db, "inside", "alice@example.com",
+                    datetime(2026, 9, 8, 9, 59, tzinfo=timezone.utc))
+        self._order(db, "outside", "bob@example.com",
+                    datetime(2026, 9, 8, 10, 1, tzinfo=timezone.utc))
+
+        result = adapter.measure(intv_id)
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            result["actual"]["attributed_orders"], 1,
+            "exactly the order inside the 7-day window from the PROVIDER "
+            "send time should count")
+
+    def test_boundary_is_measured_from_send_not_finalization(self):
+        """The same order flips in/out purely on the send timestamp.
+
+        Identical order, two environments differing only in
+        provider_sent_at. Proves the boundary tracks the send.
+        """
+        order_at = datetime(2026, 9, 8, 9, 59, tzinfo=timezone.utc)
+
+        # Sent Sept 1 10:00 -> order is 6d23h59m later: inside.
+        db_a, repo_a, adapter_a, id_a = self._recovered_env(
+            datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc))
+        self._order(db_a, "o", "alice@example.com", order_at)
+        self.assertEqual(
+            adapter_a.measure(id_a)["actual"]["attributed_orders"], 1)
+
+        # Sent Sept 1 09:00 -> the same order is 7d0h59m later: outside.
+        db_b, repo_b, adapter_b, id_b = self._recovered_env(
+            datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc))
+        self._order(db_b, "o", "alice@example.com", order_at)
+        self.assertEqual(
+            adapter_b.measure(id_b)["actual"]["attributed_orders"], 0)
+
+    def test_window_does_not_shift_when_finalized_days_later(self):
+        send = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        db, v2_repo, adapter, intv_id = self._recovered_env(send)
+
+        iv = v2_repo.get_intervention(intv_id)
+        started = ExecutionAdapter._parse_provider_time(iv.measurement_started_at)
+        ends = ExecutionAdapter._parse_provider_time(iv.measurement_ends_at)
+        self.assertEqual(started, send)
+        self.assertEqual(ends - started,
+                         timedelta(days=ATTRIBUTION_WINDOW_DAYS))
+
+
+class TestHealthReadiness(unittest.TestCase):
+    """Health must not report ready without the Phase 2 schema."""
+
+    def test_sqlite_healthy_with_all_tables(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        h = v2_repo.health_check()
+        self.assertTrue(h["ready"])
+        self.assertTrue(h["tables_ok"])
+        self.assertEqual(h["status"], "ok")
+        self.assertEqual(h["tables_expected"], 7)
+
+    def test_sqlite_degraded_when_send_attempts_missing(self):
+        """Dropping the idempotency table must break readiness."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        db.conn.execute("DROP TABLE v2_send_attempt_recipients")
+        db.conn.execute("DROP TABLE v2_send_attempts")
+        db.conn.commit()
+
+        h = v2_repo.health_check()
+        self.assertFalse(h["ready"])
+        self.assertFalse(h["tables_ok"])
+        self.assertEqual(h["status"], "degraded")
+        self.assertIn("v2_send_attempts", h["missing_tables"])
+        self.assertIn("v2_send_attempts", h["error"])
+
+    def test_expected_tables_include_phase_2(self):
+        from v2_state_repository import (
+            _V2_EXPECTED_TABLES, REQUIRED_SCHEMA_VERSION,
+        )
+        self.assertIn("v2_send_attempts", _V2_EXPECTED_TABLES)
+        self.assertIn("v2_send_attempt_recipients", _V2_EXPECTED_TABLES)
+        self.assertEqual(len(_V2_EXPECTED_TABLES), 7)
+        self.assertEqual(REQUIRED_SCHEMA_VERSION, 3)
 
 
 if __name__ == '__main__':

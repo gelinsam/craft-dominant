@@ -37,6 +37,56 @@ from intervention_model import (
 log = logging.getLogger("craft.v2_state")
 
 
+# Every table V2 operational state depends on. Readiness requires ALL of
+# them: v2_send_attempts and v2_send_attempt_recipients are what make the
+# duplicate-send guarantee enforceable, so a database without them is not
+# healthy for this code even though simpler queries would still work.
+_V2_EXPECTED_TABLES = (
+    "interventions",
+    "intervention_audit_log",
+    "v2_campaign_sends",
+    "v2_learning_records",
+    "v2_suppression_sync",
+    "v2_send_attempts",
+    "v2_send_attempt_recipients",
+)
+
+# Highest migration this code requires:
+#   001 base schema
+#   002 send attempts (durable claims)
+#   003 provider_sent_at (authoritative attribution clock)
+REQUIRED_SCHEMA_VERSION = 3
+
+
+def _iso_utc(value: Any) -> str:
+    """Normalise a timestamp to a UTC-aware ISO 8601 string for SQLite.
+
+    SQLite stores timestamps as text and attribution compares them as
+    strings, so the representation has to be consistent or range queries
+    silently misbehave. Naive input is treated as UTC.
+
+    Raises on None: every caller passing a send timestamp is describing a
+    real provider event, and quietly substituting now() there is exactly
+    the bug this helper exists to prevent.
+    """
+    if value is None:
+        raise ValueError(
+            "A send timestamp is required; refusing to substitute the "
+            "current clock for a provider send time."
+        )
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Protocol (Abstract Base)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +181,13 @@ class V2StateRepository(abc.ABC):
         """Record sent recipients for attribution tracking.
 
         Idempotent: duplicate (intervention_id, email) pairs are ignored.
+
+        LEGACY. Stamps rows with the current clock, which is only correct
+        when called at the moment of sending. The Phase 2 execution path
+        does NOT use this — it goes through promote_attempt_recipients /
+        finalize_send_locally, which carry the authoritative
+        provider_sent_at so a delayed recovery cannot move the
+        attribution window. Retained for pre-Phase-2 callers and tests.
         """
 
     @abc.abstractmethod
@@ -225,12 +282,20 @@ class V2StateRepository(abc.ABC):
 
     @abc.abstractmethod
     def promote_attempt_recipients(
-        self, attempt_id: int, intervention_id: str, campaign_draft_id: str
+        self, attempt_id: int, intervention_id: str, campaign_draft_id: str,
+        sent_at: Any,
     ) -> None:
         """Copy staged recipients to v2_campaign_sends for attribution.
 
         Called only after confirmed_sent or reconciled_sent.
         Idempotent: uses INSERT ... ON CONFLICT DO NOTHING.
+
+        `sent_at` is REQUIRED and must be the authoritative moment the
+        PROVIDER sent — attempt.provider_sent_at. It is not optional and
+        the repository never substitutes now(): these rows describe a
+        historical event, and attribution reads them. Stamping them with
+        the time bookkeeping happened would silently move the attribution
+        window to whenever recovery ran.
         """
 
     @abc.abstractmethod
@@ -239,6 +304,7 @@ class V2StateRepository(abc.ABC):
         attempt_id: int,
         intervention: Intervention,
         event_id: str,
+        sent_at: Any,
         audit_action: str,
         audit_metadata: Optional[Dict[str, Any]] = None,
         from_status: Optional[str] = None,
@@ -247,7 +313,8 @@ class V2StateRepository(abc.ABC):
         """Atomically converge local state after a PROVEN provider send.
 
         In ONE transaction:
-          1. promote staged recipients → v2_campaign_sends (idempotent)
+          1. promote staged recipients → v2_campaign_sends (idempotent),
+             stamped with `sent_at`, the authoritative provider send time
           2. upsert the intervention
           3. append the finalization audit entry
 
@@ -606,6 +673,9 @@ class SQLiteV2StateRepository(V2StateRepository):
         campaign_draft_id: str,
         emails: List[str],
     ) -> None:
+        # LEGACY path — current clock. Not used by Phase 2 execution;
+        # see promote_attempt_recipients for the authoritative-timestamp
+        # version that attribution depends on.
         now = datetime.now(timezone.utc).isoformat()
         try:
             for email in emails:
@@ -622,7 +692,8 @@ class SQLiteV2StateRepository(V2StateRepository):
 
     def get_sends(self, intervention_id: str) -> List[Dict[str, Any]]:
         rows = self.db.conn.execute(
-            "SELECT email, sent_at FROM v2_campaign_sends WHERE intervention_id = ?",
+            """SELECT email, sent_at FROM v2_campaign_sends
+               WHERE intervention_id = ? ORDER BY sent_at ASC, email ASC""",
             (intervention_id,),
         ).fetchall()
         return [{"email": r["email"], "sent_at": r["sent_at"]} for r in rows]
@@ -935,16 +1006,17 @@ class SQLiteV2StateRepository(V2StateRepository):
         return [r['email'] for r in rows]
 
     def promote_attempt_recipients(
-        self, attempt_id: int, intervention_id: str, campaign_draft_id: str
+        self, attempt_id: int, intervention_id: str, campaign_draft_id: str,
+        sent_at: Any,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        ts = _iso_utc(sent_at)
         emails = self.get_attempt_recipients(attempt_id)
         for email in emails:
             self.db.conn.execute(
                 """INSERT OR IGNORE INTO v2_campaign_sends
                    (intervention_id, campaign_draft_id, email, sent_at)
                    VALUES (?, ?, ?, ?)""",
-                (intervention_id, campaign_draft_id, email, now),
+                (intervention_id, campaign_draft_id, email, ts),
             )
         self.db.conn.commit()
 
@@ -953,12 +1025,17 @@ class SQLiteV2StateRepository(V2StateRepository):
         attempt_id: int,
         intervention: Intervention,
         event_id: str,
+        sent_at: Any,
         audit_action: str,
         audit_metadata: Optional[Dict[str, Any]] = None,
         from_status: Optional[str] = None,
         actor: str = "system",
     ) -> None:
         """Promote recipients + save intervention + audit in one transaction."""
+        # Two distinct clocks, deliberately kept apart:
+        #   sent_ts — when the PROVIDER sent. Attribution reads this.
+        #   now     — when this bookkeeping ran. Audit only.
+        sent_ts = _iso_utc(sent_at)
         now = datetime.now(timezone.utc).isoformat()
         emails = self.get_attempt_recipients(attempt_id)
         meta_json = json.dumps(audit_metadata) if audit_metadata else "{}"
@@ -977,7 +1054,7 @@ class SQLiteV2StateRepository(V2StateRepository):
                        (intervention_id, campaign_draft_id, email, sent_at)
                        VALUES (?, ?, ?, ?)""",
                     (intervention.id, intervention.campaign_draft_id,
-                     email, now),
+                     email, sent_ts),
                 )
             self.db.conn.execute(
                 self._INTERVENTION_UPSERT_SQL,
@@ -1003,24 +1080,32 @@ class SQLiteV2StateRepository(V2StateRepository):
             self.db.conn.execute("SELECT 1").fetchone()
             # Verify V2 tables exist
             tables = []
-            for tbl in ["interventions", "intervention_audit_log",
-                        "v2_campaign_sends", "v2_learning_records",
-                        "v2_suppression_sync", "v2_send_attempts",
-                        "v2_send_attempt_recipients"]:
+            for tbl in _V2_EXPECTED_TABLES:
                 try:
                     self.db.conn.execute(f"SELECT 1 FROM {tbl} LIMIT 1")
                     tables.append(tbl)
                 except Exception:
                     pass
-            return {
-                "status": "ok",
+            missing = [t for t in _V2_EXPECTED_TABLES if t not in tables]
+            ready = not missing
+            result = {
+                "status": "ok" if ready else "degraded",
                 "backend": "sqlite",
                 "tables_found": tables,
-                "tables_expected": 7,
-                "tables_ok": len(tables) == 7,
+                "tables_expected": len(_V2_EXPECTED_TABLES),
+                "tables_ok": ready,
+                "ready": ready,
             }
+            if missing:
+                result["missing_tables"] = missing
+                result["error"] = (
+                    f"missing operational tables: {', '.join(missing)}")
+            return result
         except Exception as e:
-            return {"status": "degraded", "backend": "sqlite", "error": str(e)}
+            return {
+                "status": "degraded", "backend": "sqlite",
+                "ready": False, "error": str(e),
+            }
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -1441,6 +1526,9 @@ class PostgresV2StateRepository(V2StateRepository):
         campaign_draft_id: str,
         emails: List[str],
     ) -> None:
+        # LEGACY path — current clock. Not used by Phase 2 execution;
+        # see promote_attempt_recipients for the authoritative-timestamp
+        # version that attribution depends on.
         now = datetime.now(timezone.utc)
         with self._connect() as conn:
             try:
@@ -1460,7 +1548,8 @@ class PostgresV2StateRepository(V2StateRepository):
     def get_sends(self, intervention_id: str) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT email, sent_at FROM v2_campaign_sends WHERE intervention_id = %s",
+                """SELECT email, sent_at FROM v2_campaign_sends
+                   WHERE intervention_id = %s ORDER BY sent_at ASC, email ASC""",
                 (intervention_id,),
             ).fetchall()
         return [
@@ -1802,9 +1891,10 @@ class PostgresV2StateRepository(V2StateRepository):
         return [r["email"] for r in rows]
 
     def promote_attempt_recipients(
-        self, attempt_id: int, intervention_id: str, campaign_draft_id: str
+        self, attempt_id: int, intervention_id: str, campaign_draft_id: str,
+        sent_at: Any,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        ts = self._to_utc(sent_at)
         with self._connect() as conn:
             emails = conn.execute(
                 """SELECT email FROM v2_send_attempt_recipients
@@ -1817,7 +1907,7 @@ class PostgresV2StateRepository(V2StateRepository):
                        (intervention_id, campaign_draft_id, email, sent_at)
                        VALUES (%s, %s, %s, %s)
                        ON CONFLICT (intervention_id, email) DO NOTHING""",
-                    (intervention_id, campaign_draft_id, r["email"], now),
+                    (intervention_id, campaign_draft_id, r["email"], ts),
                 )
             conn.commit()
 
@@ -1826,6 +1916,7 @@ class PostgresV2StateRepository(V2StateRepository):
         attempt_id: int,
         intervention: Intervention,
         event_id: str,
+        sent_at: Any,
         audit_action: str,
         audit_metadata: Optional[Dict[str, Any]] = None,
         from_status: Optional[str] = None,
@@ -1840,6 +1931,10 @@ class PostgresV2StateRepository(V2StateRepository):
         """
         from psycopg.types.json import Json
 
+        # Two distinct clocks, deliberately kept apart:
+        #   sent_ts — when the PROVIDER sent. Attribution reads this.
+        #   now     — when this bookkeeping ran. Audit only.
+        sent_ts = self._to_utc(sent_at)
         now = datetime.now(timezone.utc)
         conn = self._connect()
         try:
@@ -1858,7 +1953,7 @@ class PostgresV2StateRepository(V2StateRepository):
                        VALUES (%s, %s, %s, %s)
                        ON CONFLICT (intervention_id, email) DO NOTHING""",
                     (intervention.id, intervention.campaign_draft_id,
-                     r["email"], now),
+                     r["email"], sent_ts),
                 )
             conn.execute(
                 self._INTERVENTION_UPSERT,
@@ -1887,12 +1982,7 @@ class PostgresV2StateRepository(V2StateRepository):
             with self._connect() as conn:
                 conn.execute("SELECT 1").fetchone()
                 tables = []
-                for tbl in [
-                    "interventions", "intervention_audit_log",
-                    "v2_campaign_sends", "v2_learning_records",
-                    "v2_suppression_sync", "v2_send_attempts",
-                    "v2_send_attempt_recipients",
-                ]:
+                for tbl in _V2_EXPECTED_TABLES:
                     try:
                         conn.execute(f"SELECT 1 FROM {tbl} LIMIT 1")
                         tables.append(tbl)
@@ -1907,16 +1997,48 @@ class PostgresV2StateRepository(V2StateRepository):
                 except Exception:
                     schema_version = None
 
-            return {
-                "status": "ok",
+            missing = [t for t in _V2_EXPECTED_TABLES if t not in tables]
+            schema_ok = (
+                schema_version is not None
+                and schema_version >= REQUIRED_SCHEMA_VERSION
+            )
+            # Fail closed. Previously this accepted any 5 of 7 tables, so
+            # a database missing v2_send_attempts — the table the
+            # duplicate-send guarantee depends on — still reported
+            # healthy. Readiness must mean the idempotency machinery is
+            # actually present, not merely that the connection works.
+            ready = not missing and schema_ok
+
+            result = {
+                "status": "ok" if ready else "degraded",
                 "backend": "postgres",
                 "tables_found": tables,
-                "tables_expected": 7,
-                "tables_ok": len(tables) >= 5,  # graceful: Phase 2 tables may not exist yet
+                "tables_expected": len(_V2_EXPECTED_TABLES),
+                "tables_ok": not missing,
                 "schema_version": schema_version,
+                "required_schema_version": REQUIRED_SCHEMA_VERSION,
+                "schema_ok": schema_ok,
+                "ready": ready,
             }
+            if missing:
+                result["missing_tables"] = missing
+            if not ready:
+                reasons = []
+                if missing:
+                    reasons.append(
+                        f"missing operational tables: {', '.join(missing)}")
+                if not schema_ok:
+                    reasons.append(
+                        f"schema version {schema_version} < required "
+                        f"{REQUIRED_SCHEMA_VERSION}; run migrations")
+                result["error"] = "; ".join(reasons)
+                log.error("V2 Postgres not ready: %s", result["error"])
+            return result
         except Exception as e:
-            return {"status": "degraded", "backend": "postgres", "error": str(e)}
+            return {
+                "status": "degraded", "backend": "postgres",
+                "ready": False, "error": str(e),
+            }
 
     # ── Internal helpers ──────────────────────────────────────────────────
 

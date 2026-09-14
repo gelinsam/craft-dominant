@@ -408,16 +408,154 @@ class ExecutionAdapter:
         # the next execute() detects the proven send at Gate 0 and
         # converges what is missing.
         self.finalize_confirmed_send(attempt, intervention, actor=actor)
+
+        # Reload both records from the repository rather than returning
+        # the pre-finalization objects still in memory, so the response
+        # reports what was actually persisted — measurement window,
+        # sent_count and evidence included.
         attempt = self.v2_repo.get_send_attempt(attempt.id) or attempt
+        intervention = self.v2_repo.get_intervention(intervention_id) or intervention
 
         return {
             "status": "executed",
             "intervention_id": intervention_id,
-            "sent_count": len(audience_emails),
+            "sent_count": intervention.sent_count,
             "measurement_window_days": ATTRIBUTION_WINDOW_DAYS,
+            "measurement_started_at": intervention.measurement_started_at,
             "measurement_ends_at": intervention.measurement_ends_at,
+            "provider_sent_at": attempt.to_dict().get("provider_sent_at"),
             "send_attempt": attempt.to_dict(),
             "intervention": intervention.to_dict(),
+        }
+
+    # Clocks are compared with a tolerance rather than for equality:
+    # Postgres TIMESTAMPTZ and SQLite ISO text round-trip at different
+    # precisions, so sub-second drift is representation noise. Anything
+    # larger means two different clocks were used and attribution would
+    # be measured against the wrong instant.
+    CLOCK_CONSISTENCY_TOLERANCE = timedelta(seconds=1)
+
+    def _resolve_attribution_start(
+        self, intervention: Intervention, sent_rows: List[Dict[str, Any]],
+    ) -> datetime:
+        """The one instant attribution measures from.
+
+        Priority:
+          1. The successful attempt's provider_sent_at — canonical, and
+             the only source the finalizer also writes into the
+             intervention and the recipient rows, so all three agree.
+          2. The EARLIEST recipient row. For interventions predating
+             Phase 2 there is no attempt, and these rows are the actual
+             record of when mail went out. Earliest rather than
+             arbitrary, so the answer is deterministic.
+          3. measurement_started_at, then executed_at.
+
+        Note the ordering of 2 and 3: measurement_started_at is set by
+        the status transition, which for a legacy intervention can be
+        later than the send. Preferring it would move those windows
+        forward, so the send rows win when no attempt exists.
+        """
+        canonical: Optional[datetime] = None
+        attempt = self._find_successful_attempt(intervention.id)
+        provider_sent = (
+            self._parse_provider_time(attempt.provider_sent_at)
+            if attempt is not None else None
+        )
+        if provider_sent is not None:
+            canonical = provider_sent
+
+        if canonical is None:
+            candidates = [
+                self._parse_provider_time(r.get("sent_at")) for r in sent_rows
+            ]
+            candidates = [c for c in candidates if c is not None]
+            if candidates:
+                canonical = min(candidates)
+
+        if canonical is None:
+            canonical = self._parse_provider_time(
+                intervention.measurement_started_at)
+
+        if canonical is None:
+            canonical = self._parse_provider_time(intervention.executed_at)
+
+        if canonical is None:
+            log.warning(
+                "No usable send timestamp for %s; falling back to a "
+                "full window before now, which may under-attribute.",
+                intervention.id,
+            )
+            return datetime.now(timezone.utc) - timedelta(
+                days=ATTRIBUTION_WINDOW_DAYS)
+
+        # Only meaningful once a proven send exists: that is when all
+        # three clocks are written from one source and must agree.
+        if provider_sent is not None:
+            self._warn_on_clock_disagreement(intervention, sent_rows, canonical)
+        return canonical
+
+    def _warn_on_clock_disagreement(
+        self,
+        intervention: Intervention,
+        sent_rows: List[Dict[str, Any]],
+        canonical: datetime,
+    ) -> None:
+        """Report, rather than silently tolerate, disagreeing clocks."""
+        started = self._parse_provider_time(intervention.measurement_started_at)
+        if started and abs(started - canonical) > self.CLOCK_CONSISTENCY_TOLERANCE:
+            log.error(
+                "Attribution clock disagreement for %s: "
+                "measurement_started_at=%s but authoritative send=%s",
+                intervention.id, started.isoformat(), canonical.isoformat(),
+            )
+        for row in sent_rows:
+            row_ts = self._parse_provider_time(row.get("sent_at"))
+            if row_ts and abs(row_ts - canonical) > self.CLOCK_CONSISTENCY_TOLERANCE:
+                log.error(
+                    "Attribution clock disagreement for %s: recipient "
+                    "send row at %s but authoritative send=%s",
+                    intervention.id, row_ts.isoformat(), canonical.isoformat(),
+                )
+                break
+
+    def attribution_clock_report(self, intervention_id: str) -> Dict[str, Any]:
+        """Diagnostic: are all send clocks for this intervention agreed?
+
+        Read-only. Exposes the invariant so a drift can be detected
+        without inferring it from attribution numbers.
+        """
+        intervention = self.v2_repo.get_intervention(intervention_id)
+        if not intervention:
+            return {"error": "intervention_not_found"}
+
+        attempt = self._find_successful_attempt(intervention_id)
+        sent_rows = self.v2_repo.get_sends(intervention_id)
+
+        provider = self._parse_provider_time(
+            attempt.provider_sent_at) if attempt else None
+        started = self._parse_provider_time(intervention.measurement_started_at)
+        row_times = [
+            t for t in (self._parse_provider_time(r.get("sent_at"))
+                        for r in sent_rows) if t is not None
+        ]
+
+        reference = provider or started
+        consistent = True
+        if reference is not None:
+            for other in ([started] if started else []) + row_times:
+                if abs(other - reference) > self.CLOCK_CONSISTENCY_TOLERANCE:
+                    consistent = False
+                    break
+
+        return {
+            "intervention_id": intervention_id,
+            "provider_sent_at": provider.isoformat() if provider else None,
+            "measurement_started_at": started.isoformat() if started else None,
+            "recipient_sent_at_min": min(row_times).isoformat() if row_times else None,
+            "recipient_sent_at_max": max(row_times).isoformat() if row_times else None,
+            "recipient_rows": len(row_times),
+            "tolerance_seconds": self.CLOCK_CONSISTENCY_TOLERANCE.total_seconds(),
+            "consistent": consistent,
         }
 
     def measure(self, intervention_id: str, actor: str = "system") -> Dict[str, Any]:
@@ -442,16 +580,21 @@ class ExecutionAdapter:
         # Get sent recipients from v2_repo
         sent_rows = self.v2_repo.get_sends(intervention_id)
         sent_emails = {row["email"] for row in sent_rows}
-        sent_at_str = sent_rows[0]["sent_at"] if sent_rows else intervention.executed_at
 
         if not sent_emails:
             return {"error": "no_sends", "message": "No campaign sends recorded for this intervention"}
 
-        # Parse measurement window
-        try:
-            executed_dt = datetime.fromisoformat(sent_at_str)
-        except (ValueError, TypeError):
-            executed_dt = datetime.now(timezone.utc) - timedelta(days=ATTRIBUTION_WINDOW_DAYS)
+        # ── Attribution clock ──────────────────────────────────────────
+        # The successful attempt's provider_sent_at is the SINGLE
+        # authority for when the campaign reached customers. Recipient
+        # rows carry the same value and are treated as evidence, not
+        # authority: previously this read sent_rows[0]["sent_at"], which
+        # was both an arbitrary row (no ordering) and — before the
+        # promotion fix — the time bookkeeping ran rather than the time
+        # the provider sent. A send recovered hours after a crash would
+        # start its window at recovery time and silently drop every order
+        # placed in between.
+        executed_dt = self._resolve_attribution_start(intervention, sent_rows)
 
         window_end = executed_dt + timedelta(days=intervention.measurement_window)
         now = datetime.now(timezone.utc)
@@ -1040,6 +1183,7 @@ class ExecutionAdapter:
             # but we must not append a second finalization record.
             self.v2_repo.promote_attempt_recipients(
                 attempt.id, intervention.id, intervention.campaign_draft_id,
+                sent_at=provider_sent_at,
             )
             self.v2_repo.save_intervention(intervention)
         else:
@@ -1049,6 +1193,11 @@ class ExecutionAdapter:
                 attempt_id=attempt.id,
                 intervention=intervention,
                 event_id=intervention.event_id,
+                # Recipient rows are stamped with when the PROVIDER sent,
+                # not when this transaction runs. Attribution reads those
+                # rows, so using the transaction clock would move the
+                # window to whenever recovery happened to occur.
+                sent_at=provider_sent_at,
                 audit_action=self.FINALIZATION_AUDIT_ACTION,
                 from_status=from_status,
                 actor=actor,
