@@ -26,7 +26,7 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest
       - name: Run SQLite unit tests
-        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py test_meta_spend_correctness.py test_analytics_durability.py test_import_side_effects.py test_customer_profile_performance.py test_post_sync_completion.py test_profile_write_batching.py -v --tb=short -k "not TestPostgresV2Repository and not TestPostgresBackfill and not TestMigrationCorrectness and not TestPostgresAtomicity" test_idempotent_execution.py
+        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py test_meta_spend_correctness.py test_analytics_durability.py test_import_side_effects.py test_customer_profile_performance.py test_post_sync_completion.py test_profile_write_batching.py test_profile_write_concurrency.py -v --tb=short -k "not TestPostgresV2Repository and not TestPostgresBackfill and not TestMigrationCorrectness and not TestPostgresAtomicity" test_idempotent_execution.py
 
   v2-postgres-integration:
     name: V2 Postgres Integration Tests
@@ -78,7 +78,7 @@ jobs:
           assert applied == 0, 'Migration rerun should apply 0 (already applied)'
           "
       - name: Run ALL tests including Postgres integration
-        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py test_meta_spend_correctness.py test_analytics_durability.py test_import_side_effects.py test_customer_profile_performance.py test_post_sync_completion.py test_profile_write_batching.py -v --tb=short test_idempotent_execution.py
+        run: python -m pytest test_dominant_agent.py test_diagnosis.py test_intervention.py test_v2_postgres.py test_meta_spend_correctness.py test_analytics_durability.py test_import_side_effects.py test_customer_profile_performance.py test_post_sync_completion.py test_profile_write_batching.py test_profile_write_concurrency.py -v --tb=short test_idempotent_execution.py
       - name: Verify zero skips for Postgres integration tests
         run: |
           python -m pytest test_v2_postgres.py -v --tb=short 2>&1 | tee pg_test_output.txt
