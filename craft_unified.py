@@ -348,17 +348,66 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA busy_timeout = 30000")  # 30s retry on lock
+        # When true, row-level writers skip their own commit so a whole phase
+        # can be committed once. Only deferred_commit() sets this.
+        self._defer_commits = False
         self._init_schema()
     def _init_schema(self):
         self.conn.executescript(UNIFIED_SCHEMA)
         self.conn.commit()
+    def _maybe_commit(self):
+        """Commit unless a deferred_commit() block owns the transaction."""
+        if not self._defer_commits:
+            self.conn.commit()
+    @contextmanager
+    def deferred_commit(self):
+        """Run a batch of row writes inside ONE transaction.
+
+        Writers that normally commit per row call _maybe_commit(), which does
+        nothing while this is active; the single commit happens here on exit.
+
+        Why: building customer profiles issued one commit per row — 63,675 for
+        the global phase and 64,997 for the event-scoped phase, ~128,672 for a
+        rebuild. Each commit fsyncs the WAL, and on a network-backed volume
+        that dominated the phase: measured at ~90% of its runtime.
+
+        Failure semantics change deliberately. Per-row commits left a half-
+        rebuilt table behind when an exception hit partway; one transaction per
+        phase rolls the phase back whole, so the table keeps its previous
+        complete contents instead of a silent mixture of old and new rows.
+
+        WAL readers are not blocked by a write transaction, so the dashboard
+        keeps serving during the phase. Other *writers* wait, which is already
+        the case under a single gunicorn worker.
+
+        Re-entrant: nesting yields without taking a second transaction, so the
+        outermost block owns the commit.
+        """
+        if self._defer_commits:
+            yield self
+            return
+        self._defer_commits = True
+        try:
+            yield self
+        except Exception:
+            # Undo the whole phase, not just the row that failed.
+            self._defer_commits = False
+            self.conn.rollback()
+            raise
+        else:
+            self._defer_commits = False
+            self.conn.commit()
     @contextmanager
     def transaction(self):
         try:
             yield self.conn
-            self.conn.commit()
+            self._maybe_commit()
         except Exception as e:
-            self.conn.rollback()
+            # Inside deferred_commit() the enclosing block owns the rollback;
+            # rolling back here would be redundant and would hide the scope of
+            # what was discarded.
+            if not self._defer_commits:
+                self.conn.rollback()
             raise e
     # === Events ===
     def upsert_event(self, event: dict):
@@ -659,7 +708,7 @@ class Database:
             profile.get('daypart_preference'), profile.get('group_size_segment'),
             datetime.now().isoformat()
         ))
-        self.conn.commit()
+        self._maybe_commit()
 
     def get_event_profiles(self, event_type: str, city: str,
                            segment: str = None, min_ltv: float = None,
@@ -1635,16 +1684,20 @@ class EventbriteSync:
                 elif pct >= 0.2:
                     return 2
                 return 1
-        for c_data in all_customers_data:
-            customer = self._build_customer_profile(
-                c_data['email'], c_data['orders'],
-                get_quintile(c_data['days_since'], recency_values, reverse=True),
-                get_quintile(c_data['order_count'], frequency_values),
-                get_quintile(c_data['total_spent'], monetary_values)
-            )
-            if customer:
-                self.db.upsert_customer(customer)
-                count += 1
+        # One transaction for the whole phase. Per-row commits made this the
+        # dominant cost of the rebuild, and a mid-phase failure used to leave
+        # customers half old and half new; now it rolls back whole.
+        with self.db.deferred_commit():
+            for c_data in all_customers_data:
+                customer = self._build_customer_profile(
+                    c_data['email'], c_data['orders'],
+                    get_quintile(c_data['days_since'], recency_values, reverse=True),
+                    get_quintile(c_data['order_count'], frequency_values),
+                    get_quintile(c_data['total_spent'], monetary_values)
+                )
+                if customer:
+                    self.db.upsert_customer(customer)
+                    count += 1
         # After building global profiles, build event-scoped profiles
         self._build_event_profiles()
         return count
@@ -1754,156 +1807,161 @@ class EventbriteSync:
             }
         # Build and upsert each profile
         count = 0
-        for (email, etype, city), orders in groups.items():
-            n_orders = len(orders)
-            total_tickets = sum(o['ticket_count'] or 1 for o in orders)
-            total_spent = sum(o['gross_amount'] or 0 for o in orders)
-            event_ids = set(o['event_id'] for o in orders)
-            timestamps = [o['order_timestamp'] for o in orders]
-            first_date = min(timestamps)
-            last_date = max(timestamps)
-            try:
-                days_since = (datetime.now() - datetime.fromisoformat(last_date)).days
-            except:
-                days_since = 0
-            avg_order = total_spent / n_orders if n_orders > 0 else 0
-            avg_tickets = total_tickets / n_orders if n_orders > 0 else 0
-            # Days between orders (scoped)
-            avg_gap = 0
-            if n_orders > 1:
+        # One transaction for the whole phase, matching the global phase above.
+        # 64,997 individual commits made this the slowest part of the rebuild;
+        # a mid-phase failure now discards the phase instead of leaving a mix
+        # of old and new scoped profiles.
+        with self.db.deferred_commit():
+            for (email, etype, city), orders in groups.items():
+                n_orders = len(orders)
+                total_tickets = sum(o['ticket_count'] or 1 for o in orders)
+                total_spent = sum(o['gross_amount'] or 0 for o in orders)
+                event_ids = set(o['event_id'] for o in orders)
+                timestamps = [o['order_timestamp'] for o in orders]
+                first_date = min(timestamps)
+                last_date = max(timestamps)
                 try:
-                    sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
-                    gaps = [(sorted_dates[i+1] - sorted_dates[i]).days for i in range(len(sorted_dates)-1)]
-                    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                    days_since = (datetime.now() - datetime.fromisoformat(last_date)).days
                 except:
-                    avg_gap = 0
-            # Avg days before event (scoped)
-            dbefore = [o['days_before_event'] for o in orders if o['days_before_event'] is not None]
-            avg_days_before = sum(dbefore) / len(dbefore) if dbefore else 0
-            # Timing segment
-            if avg_days_before >= 45: timing = 'super_early_bird'
-            elif avg_days_before >= 28: timing = 'early_bird'
-            elif avg_days_before >= 14: timing = 'planner'
-            elif avg_days_before >= 7: timing = 'spontaneous'
-            else: timing = 'last_minute'
-            # Scoped RFM
-            q = quintile_map.get((email, etype, city), {'rfm_r': 3, 'rfm_f': 3, 'rfm_m': 3})
-            rfm_r, rfm_f, rfm_m = q['rfm_r'], q['rfm_f'], q['rfm_m']
-            if rfm_r >= 4 and rfm_f >= 4 and rfm_m >= 4: segment = 'champion'
-            elif rfm_r >= 3 and rfm_f >= 3: segment = 'loyal'
-            elif rfm_r >= 3 and rfm_f <= 2: segment = 'potential'
-            elif rfm_r <= 2 and rfm_f >= 3 and rfm_m >= 3: segment = 'at_risk'
-            elif rfm_r <= 2 and rfm_f <= 2: segment = 'hibernating'
-            else: segment = 'other'
-            # Scoped LTV
-            ltv_score = ((rfm_r * 15) + (rfm_f * 10) + (rfm_m * 15) + min(25, n_orders * 5)) / 2.25
-            ltv_score = min(100, max(0, ltv_score))
-            # Superspreader flag (avg 1.5+ tickets per order, 2+ orders in scope)
-            is_superspreader = 1 if avg_tickets >= 1.5 and n_orders >= 2 else 0
-            # VIP flag (3+ events in scope, $200+ spent in scope)
-            is_vip = 1 if len(event_ids) >= 3 and total_spent >= 200 else 0
-            # Churn risk (scoped)
-            churn_risk_level = None
-            days_until_churn = None
-            gap_ratio = 0.0
-            if n_orders >= 2 and avg_gap > 0 and days_since >= (avg_gap * 0.7):
-                gap_ratio = days_since / avg_gap
-                churn_threshold = avg_gap * 2.0
-                days_until_churn = max(0, int(churn_threshold - days_since))
-                if days_until_churn < 14: churn_risk_level = 'critical'
-                elif days_until_churn < 30: churn_risk_level = 'urgent'
-                elif days_until_churn < 60: churn_risk_level = 'watch'
-                else: churn_risk_level = 'healthy'
+                    days_since = 0
+                avg_order = total_spent / n_orders if n_orders > 0 else 0
+                avg_tickets = total_tickets / n_orders if n_orders > 0 else 0
+                # Days between orders (scoped)
+                avg_gap = 0
+                if n_orders > 1:
+                    try:
+                        sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
+                        gaps = [(sorted_dates[i+1] - sorted_dates[i]).days for i in range(len(sorted_dates)-1)]
+                        avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                    except:
+                        avg_gap = 0
+                # Avg days before event (scoped)
+                dbefore = [o['days_before_event'] for o in orders if o['days_before_event'] is not None]
+                avg_days_before = sum(dbefore) / len(dbefore) if dbefore else 0
+                # Timing segment
+                if avg_days_before >= 45: timing = 'super_early_bird'
+                elif avg_days_before >= 28: timing = 'early_bird'
+                elif avg_days_before >= 14: timing = 'planner'
+                elif avg_days_before >= 7: timing = 'spontaneous'
+                else: timing = 'last_minute'
+                # Scoped RFM
+                q = quintile_map.get((email, etype, city), {'rfm_r': 3, 'rfm_f': 3, 'rfm_m': 3})
+                rfm_r, rfm_f, rfm_m = q['rfm_r'], q['rfm_f'], q['rfm_m']
+                if rfm_r >= 4 and rfm_f >= 4 and rfm_m >= 4: segment = 'champion'
+                elif rfm_r >= 3 and rfm_f >= 3: segment = 'loyal'
+                elif rfm_r >= 3 and rfm_f <= 2: segment = 'potential'
+                elif rfm_r <= 2 and rfm_f >= 3 and rfm_m >= 3: segment = 'at_risk'
+                elif rfm_r <= 2 and rfm_f <= 2: segment = 'hibernating'
+                else: segment = 'other'
+                # Scoped LTV
+                ltv_score = ((rfm_r * 15) + (rfm_f * 10) + (rfm_m * 15) + min(25, n_orders * 5)) / 2.25
+                ltv_score = min(100, max(0, ltv_score))
+                # Superspreader flag (avg 1.5+ tickets per order, 2+ orders in scope)
+                is_superspreader = 1 if avg_tickets >= 1.5 and n_orders >= 2 else 0
+                # VIP flag (3+ events in scope, $200+ spent in scope)
+                is_vip = 1 if len(event_ids) >= 3 and total_spent >= 200 else 0
+                # Churn risk (scoped)
+                churn_risk_level = None
+                days_until_churn = None
+                gap_ratio = 0.0
+                if n_orders >= 2 and avg_gap > 0 and days_since >= (avg_gap * 0.7):
+                    gap_ratio = days_since / avg_gap
+                    churn_threshold = avg_gap * 2.0
+                    days_until_churn = max(0, int(churn_threshold - days_since))
+                    if days_until_churn < 14: churn_risk_level = 'critical'
+                    elif days_until_churn < 30: churn_risk_level = 'urgent'
+                    elif days_until_churn < 60: churn_risk_level = 'watch'
+                    else: churn_risk_level = 'healthy'
 
-            # ---- BEHAVIORAL MICRO-SEGMENTS ----
-            # 1. Price sensitivity: check for promo usage
-            price_sensitivity = 0.0
-            promo_orders = sum(1 for o in orders if o.get('promo_code'))
-            if n_orders > 0:
-                price_sensitivity = min(1.0, promo_orders / n_orders)
+                # ---- BEHAVIORAL MICRO-SEGMENTS ----
+                # 1. Price sensitivity: check for promo usage
+                price_sensitivity = 0.0
+                promo_orders = sum(1 for o in orders if o.get('promo_code'))
+                if n_orders > 0:
+                    price_sensitivity = min(1.0, promo_orders / n_orders)
 
-            # 2. Social influence score: based on group size, frequency, and recency
-            social_influence_score = min(100, (avg_tickets * n_orders * max(1, 5 - rfm_r)) * 2)
+                # 2. Social influence score: based on group size, frequency, and recency
+                social_influence_score = min(100, (avg_tickets * n_orders * max(1, 5 - rfm_r)) * 2)
 
-            # 3. Cross-event affinity: distinct event types in this city
-            cross_event_affinity = 0.0
-            if etype and city:
-                customer_events = types_by_customer_city.get(
-                    (lower_email_of.get(email, email.lower()), city), ()
-                )
-                event_types_in_city = types_by_city.get(city, ())
-                if event_types_in_city:
-                    cross_event_affinity = len(customer_events) / len(event_types_in_city)
+                # 3. Cross-event affinity: distinct event types in this city
+                cross_event_affinity = 0.0
+                if etype and city:
+                    customer_events = types_by_customer_city.get(
+                        (lower_email_of.get(email, email.lower()), city), ()
+                    )
+                    event_types_in_city = types_by_city.get(city, ())
+                    if event_types_in_city:
+                        cross_event_affinity = len(customer_events) / len(event_types_in_city)
 
-            # 4. Buying momentum: compare order gaps
-            buying_momentum = 'new'
-            if n_orders >= 2 and avg_gap > 0:
-                try:
-                    sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
-                    if len(sorted_dates) >= 2:
-                        last_gap = (sorted_dates[-1] - sorted_dates[-2]).days
-                        if last_gap < avg_gap * 0.7:
-                            buying_momentum = 'accelerating'
-                        elif last_gap <= avg_gap * 1.3:
-                            buying_momentum = 'stable'
-                        elif last_gap > avg_gap * 1.3:
-                            buying_momentum = 'decelerating'
-                        elif days_since > avg_gap * 2:
-                            buying_momentum = 'dormant'
-                except:
-                    pass
-            elif n_orders == 1:
+                # 4. Buying momentum: compare order gaps
                 buying_momentum = 'new'
-            elif days_since > avg_gap * 2 if avg_gap > 0 else False:
-                buying_momentum = 'dormant'
+                if n_orders >= 2 and avg_gap > 0:
+                    try:
+                        sorted_dates = sorted([datetime.fromisoformat(t) for t in timestamps])
+                        if len(sorted_dates) >= 2:
+                            last_gap = (sorted_dates[-1] - sorted_dates[-2]).days
+                            if last_gap < avg_gap * 0.7:
+                                buying_momentum = 'accelerating'
+                            elif last_gap <= avg_gap * 1.3:
+                                buying_momentum = 'stable'
+                            elif last_gap > avg_gap * 1.3:
+                                buying_momentum = 'decelerating'
+                            elif days_since > avg_gap * 2:
+                                buying_momentum = 'dormant'
+                    except:
+                        pass
+                elif n_orders == 1:
+                    buying_momentum = 'new'
+                elif days_since > avg_gap * 2 if avg_gap > 0 else False:
+                    buying_momentum = 'dormant'
 
-            # 5. Purchase velocity: orders per year
-            tenure_days = (datetime.now() - datetime.fromisoformat(first_date)).days if first_date else 1
-            purchase_velocity = min(12, (n_orders / (tenure_days / 365)) if tenure_days > 0 else 0)
+                # 5. Purchase velocity: orders per year
+                tenure_days = (datetime.now() - datetime.fromisoformat(first_date)).days if first_date else 1
+                purchase_velocity = min(12, (n_orders / (tenure_days / 365)) if tenure_days > 0 else 0)
 
-            # 6. Upgrade likelihood: based on last order vs average
-            upgrade_likelihood = 0.0
-            if n_orders > 0 and avg_order > 0:
-                last_order_amount = max(o['gross_amount'] or 0 for o in orders)
-                upgrade_likelihood = min(1.0, (last_order_amount / avg_order - 1) if avg_order > 0 else 0)
+                # 6. Upgrade likelihood: based on last order vs average
+                upgrade_likelihood = 0.0
+                if n_orders > 0 and avg_order > 0:
+                    last_order_amount = max(o['gross_amount'] or 0 for o in orders)
+                    upgrade_likelihood = min(1.0, (last_order_amount / avg_order - 1) if avg_order > 0 else 0)
 
-            # 7. Daypart preference: from event times (if available)
-            daypart_preference = None
-            # This requires event start time data; if not available, set to NULL
+                # 7. Daypart preference: from event times (if available)
+                daypart_preference = None
+                # This requires event start time data; if not available, set to NULL
 
-            # 8. Group size segment
-            group_size_segment = 'solo'
-            if avg_tickets < 1.5: group_size_segment = 'solo'
-            elif avg_tickets < 2.5: group_size_segment = 'duo'
-            elif avg_tickets < 5.5: group_size_segment = 'small_group'
-            else: group_size_segment = 'large_group'
+                # 8. Group size segment
+                group_size_segment = 'solo'
+                if avg_tickets < 1.5: group_size_segment = 'solo'
+                elif avg_tickets < 2.5: group_size_segment = 'duo'
+                elif avg_tickets < 5.5: group_size_segment = 'small_group'
+                else: group_size_segment = 'large_group'
 
-            self.db.upsert_event_profile({
-                'email': email, 'event_type': etype, 'city': city,
-                'orders_in_scope': n_orders, 'tickets_in_scope': total_tickets,
-                'spent_in_scope': total_spent, 'events_in_scope': len(event_ids),
-                'first_order_date': first_date, 'last_order_date': last_date,
-                'days_since_last': days_since, 'avg_order_value': round(avg_order, 2),
-                'avg_tickets_per_order': round(avg_tickets, 2),
-                'avg_days_between_orders': round(avg_gap, 1),
-                'avg_days_before_event': round(avg_days_before, 1),
-                'timing_segment': timing,
-                'rfm_r': rfm_r, 'rfm_f': rfm_f, 'rfm_m': rfm_m,
-                'rfm_segment': segment, 'ltv_score': round(ltv_score, 1),
-                'is_superspreader': is_superspreader, 'is_vip': is_vip,
-                'churn_risk_level': churn_risk_level,
-                'days_until_churn': days_until_churn,
-                'gap_ratio': round(gap_ratio, 2),
-                'price_sensitivity': round(price_sensitivity, 2),
-                'social_influence_score': round(social_influence_score, 1),
-                'cross_event_affinity': round(cross_event_affinity, 2),
-                'buying_momentum': buying_momentum,
-                'purchase_velocity': round(purchase_velocity, 2),
-                'upgrade_likelihood': round(upgrade_likelihood, 2),
-                'daypart_preference': daypart_preference,
-                'group_size_segment': group_size_segment,
-            })
-            count += 1
+                self.db.upsert_event_profile({
+                    'email': email, 'event_type': etype, 'city': city,
+                    'orders_in_scope': n_orders, 'tickets_in_scope': total_tickets,
+                    'spent_in_scope': total_spent, 'events_in_scope': len(event_ids),
+                    'first_order_date': first_date, 'last_order_date': last_date,
+                    'days_since_last': days_since, 'avg_order_value': round(avg_order, 2),
+                    'avg_tickets_per_order': round(avg_tickets, 2),
+                    'avg_days_between_orders': round(avg_gap, 1),
+                    'avg_days_before_event': round(avg_days_before, 1),
+                    'timing_segment': timing,
+                    'rfm_r': rfm_r, 'rfm_f': rfm_f, 'rfm_m': rfm_m,
+                    'rfm_segment': segment, 'ltv_score': round(ltv_score, 1),
+                    'is_superspreader': is_superspreader, 'is_vip': is_vip,
+                    'churn_risk_level': churn_risk_level,
+                    'days_until_churn': days_until_churn,
+                    'gap_ratio': round(gap_ratio, 2),
+                    'price_sensitivity': round(price_sensitivity, 2),
+                    'social_influence_score': round(social_influence_score, 1),
+                    'cross_event_affinity': round(cross_event_affinity, 2),
+                    'buying_momentum': buying_momentum,
+                    'purchase_velocity': round(purchase_velocity, 2),
+                    'upgrade_likelihood': round(upgrade_likelihood, 2),
+                    'daypart_preference': daypart_preference,
+                    'group_size_segment': group_size_segment,
+                })
+                count += 1
         log.info(f"Built {count} event-scoped customer profiles across {len(set((e,c) for (_, e, c) in groups.keys()))} scopes")
 
     def _build_customer_profile(self, email: str, orders: List[dict],
