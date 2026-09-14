@@ -70,24 +70,42 @@ class SendAttemptStatus(str, Enum):
 
 # Legal state transitions
 _ATTEMPT_TRANSITIONS: Dict[SendAttemptStatus, FrozenSet[SendAttemptStatus]] = {
+    # AMBIGUOUS is reachable from every pre-send state, not just
+    # SEND_REQUESTED.  Any provider call can lose its response, and the
+    # earlier steps have their own uncertainty: a lost campaign-creation
+    # response can leave a campaign at the provider whose ID we never
+    # learned, which we can never reconcile.  Forcing those cases into
+    # FAILED_PRE_SEND would quietly mark them retryable.
     SendAttemptStatus.CLAIMED: frozenset({
         SendAttemptStatus.PROVIDER_CAMPAIGN_CREATED,
         SendAttemptStatus.FAILED_PRE_SEND,
+        SendAttemptStatus.AMBIGUOUS,
         SendAttemptStatus.CANCELLED,
     }),
     SendAttemptStatus.PROVIDER_CAMPAIGN_CREATED: frozenset({
         SendAttemptStatus.AUDIENCE_CONFIGURED,
         SendAttemptStatus.FAILED_PRE_SEND,
+        SendAttemptStatus.AMBIGUOUS,
         SendAttemptStatus.CANCELLED,
     }),
     SendAttemptStatus.AUDIENCE_CONFIGURED: frozenset({
         SendAttemptStatus.SEND_REQUESTED,
         SendAttemptStatus.FAILED_PRE_SEND,
+        SendAttemptStatus.AMBIGUOUS,
         SendAttemptStatus.CANCELLED,
     }),
     SendAttemptStatus.SEND_REQUESTED: frozenset({
         SendAttemptStatus.CONFIRMED_SENT,
         SendAttemptStatus.AMBIGUOUS,
+        # FAILED_PRE_SEND is reachable here ONLY when the provider
+        # returned a status code that proves it rejected the request
+        # before acting on it (see DEFINITE_SEND_REJECTION_CODES in
+        # provider_outcome.py — 400/401/403/404/405/422).  Every other
+        # response, including all 5xx and every transport failure, must
+        # go to AMBIGUOUS instead.  The state machine cannot enforce
+        # that distinction on its own, so the narrow classifier and its
+        # tests are what keep this edge honest.
+        SendAttemptStatus.FAILED_PRE_SEND,
         SendAttemptStatus.CANCELLED,
     }),
     SendAttemptStatus.AMBIGUOUS: frozenset({

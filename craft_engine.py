@@ -35,6 +35,18 @@ from typing import Optional, Dict, List, Any, Tuple
 from collections import defaultdict
 from contextlib import contextmanager
 from suppression_guard import SuppressionGuard
+from provider_outcome import (
+    ProviderResponse,
+    ProviderError,
+    ProviderTransportError,
+    ProviderHTTPError,
+    ProviderMalformedResponseError,
+    ProviderSendOutcome,
+    ProviderSendStatus,
+    ProviderCreateOutcome,
+    ProviderCreateStatus,
+    classify_send_http_error,
+)
 
 log = logging.getLogger('craft.engine')
 
@@ -269,28 +281,117 @@ class MailchimpClient:
     def _auth(self) -> Tuple:
         return ('anystring', self.api_key)
 
-    def _request(self, method: str, path: str, data: Dict = None,
-                 timeout: int = 30) -> Optional[Dict]:
-        """Make an authenticated Mailchimp API request."""
+    def _request_strict(self, method: str, path: str, data: Dict = None,
+                        timeout: int = 30) -> ProviderResponse:
+        """Authenticated Mailchimp request that PRESERVES failure kind.
+
+        This is the single HTTP implementation.  Unlike ``_request`` it
+        never collapses distinct failures into one sentinel value:
+
+          transport failure (timeout, reset, DNS, socket)
+              → ProviderTransportError    — proves NOTHING about whether
+                                            the provider acted
+          non-2xx HTTP response
+              → ProviderHTTPError(status) — caller decides, per
+                                            operation, whether that code
+                                            proves rejection
+          2xx with unparseable body
+              → ProviderMalformedResponseError — provider accepted it
+          2xx (including 204 No Content)
+              → ProviderResponse(body={} when there is no content)
+
+        Any code deciding whether an external send happened MUST use
+        this method, never ``_request``.
+        """
         try:
             import requests as req
         except ImportError:
-            log.error("requests library required for Mailchimp API")
-            return None
+            # No transport available: nothing was ever dispatched, so
+            # this is a definite local failure, not provider ambiguity.
+            raise ProviderHTTPError(
+                "requests library required for Mailchimp API",
+                http_status=0,
+                detail="requests_not_installed",
+            )
 
         url = f"{self.base_url}{path}"
-        resp = req.request(
-            method, url,
-            auth=self._auth(),
-            headers=self._headers(),
-            json=data,
-            timeout=timeout,
+
+        try:
+            resp = req.request(
+                method, url,
+                auth=self._auth(),
+                headers=self._headers(),
+                json=data,
+                timeout=timeout,
+            )
+        except Exception as e:
+            # The request may or may not have reached Mailchimp, and if
+            # it did, Mailchimp may or may not have acted on it.
+            error_type = type(e).__name__
+            log.error(
+                f"Mailchimp {method} {path} → transport failure "
+                f"({error_type}) — outcome UNKNOWN"
+            )
+            raise ProviderTransportError(
+                f"Transport failure during {method} {path}: {error_type}",
+                error_type=error_type,
+            ) from e
+
+        status = resp.status_code
+
+        if status in (200, 201, 204):
+            if not resp.content:
+                # 204 No Content is the documented success shape for
+                # several action endpoints, including campaign send.
+                return ProviderResponse(http_status=status, body={})
+            try:
+                parsed = resp.json()
+            except Exception as e:
+                log.error(
+                    f"Mailchimp {method} {path} → {status} with unparseable "
+                    f"body — outcome UNKNOWN"
+                )
+                raise ProviderMalformedResponseError(
+                    f"Unparseable 2xx body from {method} {path}: "
+                    f"{type(e).__name__}",
+                    http_status=status,
+                ) from e
+            if not isinstance(parsed, dict):
+                parsed = {"_raw": parsed}
+            return ProviderResponse(http_status=status, body=parsed)
+
+        # Non-2xx: surface the code so the caller can classify it.
+        detail = resp.text[:500] if resp.text else ""
+        log.error(f"Mailchimp {method} {path} → {status}: {detail}")
+        raise ProviderHTTPError(
+            f"Mailchimp {method} {path} returned HTTP {status}",
+            http_status=status,
+            detail=detail,
         )
 
-        if resp.status_code in (200, 201, 204):
-            return resp.json() if resp.content else {}
-        else:
-            log.error(f"Mailchimp {method} {path} → {resp.status_code}: {resp.text[:500]}")
+    def _request(self, method: str, path: str, data: Dict = None,
+                 timeout: int = 30) -> Optional[Dict]:
+        """LEGACY lossy wrapper — returns a dict on success, else None.
+
+        WARNING: ``None`` conflates "Mailchimp rejected this" with
+        "we never found out".  That distinction is load-bearing for
+        anything that mutates customer-visible state, so this method
+        MUST NOT be used to decide whether an email was sent.
+        Use ``_request_strict`` there.
+
+        Retained unchanged in behaviour for read paths (suppression
+        sync, segment lookup, reports) where a lost response and a
+        rejection are both simply "no authoritative answer", and both
+        correctly fail closed.
+        """
+        try:
+            return self._request_strict(method, path, data, timeout).body
+        except ProviderHTTPError:
+            return None
+        except (ProviderTransportError, ProviderMalformedResponseError):
+            # Historically these propagated. Callers of the legacy
+            # contract treat None as "no authoritative answer", which is
+            # the correct fail-closed reading for read-only paths.
             return None
 
     # ── Member management ──────────────────────────────────
@@ -419,30 +520,223 @@ class MailchimpClient:
             },
         }
 
-        result = self._request('POST', '/campaigns', data)
-        if result:
-            mc_campaign_id = result.get('id')
-            log.info(f"Mailchimp campaign created: {mc_campaign_id}")
+        outcome = self._create_campaign_strict(data, html)
+        return outcome.provider_campaign_id if outcome.is_created else None
 
-            # Set the HTML content
-            content_result = self._request('PUT', f'/campaigns/{mc_campaign_id}/content', {
-                'html': html,
-            })
-            if not content_result:
-                log.error(f"Failed to set campaign content for {mc_campaign_id}")
-                return None
+    def create_campaign_strict(self, subject: str, preview_text: str, html: str,
+                               tag: str = None, segment_id: int = None,
+                               campaign_title: str = '') -> ProviderCreateOutcome:
+        """Create a campaign, returning a lossless outcome.
 
-            return mc_campaign_id
+        Two distinct uncertainty modes exist here:
 
-        return None
+        1. The POST /campaigns response is lost.  A campaign may now
+           exist at Mailchimp whose ID we never learned.  We cannot
+           reconcile what we cannot name, so this is AMBIGUOUS with no
+           provider_campaign_id.
+
+        2. The POST succeeds but the content PUT fails.  The campaign
+           exists and we DO know its ID.  Nothing has been sent — a
+           campaign with no content cannot have reached anyone — so this
+           is a DEFINITE_FAILURE, but we return the ID so the orphan can
+           be cleaned up or reused rather than silently leaked.
+        """
+        recipients = {'list_id': self.audience_id}
+
+        if segment_id:
+            recipients['segment_opts'] = {'saved_segment_id': segment_id}
+        elif tag:
+            recipients['segment_opts'] = {
+                'match': 'all',
+                'conditions': [{
+                    'condition_type': 'StaticSegment',
+                    'field': 'static_segment',
+                    'op': 'static_is',
+                    'value': tag,
+                }],
+            }
+
+        data = {
+            'type': 'regular',
+            'recipients': recipients,
+            'settings': {
+                'subject_line': subject,
+                'preview_text': preview_text or '',
+                'title': campaign_title or subject[:50],
+                'from_name': self.from_name,
+                'reply_to': self.from_email,
+                'auto_footer': True,
+            },
+            'tracking': {
+                'opens': True,
+                'html_clicks': True,
+                'text_clicks': True,
+            },
+        }
+        return self._create_campaign_strict(data, html)
+
+    def _create_campaign_strict(self, data: Dict,
+                                html: str) -> ProviderCreateOutcome:
+        # ── Step A: create the campaign shell ──────────────────────
+        try:
+            resp = self._request_strict('POST', '/campaigns', data)
+        except ProviderTransportError as e:
+            # A campaign may exist that we cannot name.
+            log.error("AMBIGUOUS campaign creation: response lost, "
+                      "a provider campaign may exist with an unknown ID")
+            return ProviderCreateOutcome(
+                status=ProviderCreateStatus.AMBIGUOUS,
+                error_type=e.error_type,
+                error_message=(
+                    "Campaign creation response was lost. A campaign may "
+                    "exist at the provider with an ID we never received."
+                ),
+            )
+        except ProviderMalformedResponseError as e:
+            return ProviderCreateOutcome(
+                status=ProviderCreateStatus.AMBIGUOUS,
+                http_status=e.http_status,
+                error_type="malformed_success_response",
+                error_message=(
+                    "Campaign creation returned success with an unparseable "
+                    "body; the provider campaign ID is unknown."
+                ),
+            )
+        except ProviderHTTPError as e:
+            # No campaign was created; nothing was sent.
+            return ProviderCreateOutcome(
+                status=ProviderCreateStatus.DEFINITE_FAILURE,
+                http_status=e.http_status,
+                error_type="provider_rejected",
+                error_message=f"Campaign creation rejected: HTTP {e.http_status}",
+            )
+
+        mc_campaign_id = resp.body.get('id')
+        if not mc_campaign_id:
+            return ProviderCreateOutcome(
+                status=ProviderCreateStatus.AMBIGUOUS,
+                http_status=resp.http_status,
+                error_type="missing_campaign_id",
+                error_message=(
+                    "Provider returned success but no campaign ID; a "
+                    "campaign may exist that we cannot address."
+                ),
+            )
+
+        log.info(f"Mailchimp campaign created: {mc_campaign_id}")
+
+        # ── Step B: attach content ─────────────────────────────────
+        # A campaign with no content has not been sent to anyone, so any
+        # failure here is safe — but we keep the ID either way.
+        try:
+            self._request_strict(
+                'PUT', f'/campaigns/{mc_campaign_id}/content', {'html': html},
+            )
+        except ProviderError as e:
+            log.error(f"Failed to set campaign content for {mc_campaign_id}: "
+                      f"{type(e).__name__}")
+            return ProviderCreateOutcome(
+                status=ProviderCreateStatus.DEFINITE_FAILURE,
+                provider_campaign_id=mc_campaign_id,
+                error_type="content_set_failed",
+                error_message=(
+                    f"Campaign {mc_campaign_id} was created but its content "
+                    f"could not be set. It was never sent."
+                ),
+                content_set=False,
+            )
+
+        return ProviderCreateOutcome(
+            status=ProviderCreateStatus.CREATED,
+            provider_campaign_id=mc_campaign_id,
+            http_status=resp.http_status,
+            content_set=True,
+        )
+
+    def send_campaign_strict(self, mc_campaign_id: str,
+                             timeout: int = 30) -> ProviderSendOutcome:
+        """Send a campaign, returning a lossless three-valued outcome.
+
+        POST /campaigns/{id}/actions/send returns 204 No Content on
+        success, so an empty body IS the success signal — we must not
+        require JSON to be present.
+
+        Classification:
+          2xx                      → CONFIRMED_SENT
+          400/401/403/404/405/422  → DEFINITE_FAILURE (rejected pre-processing)
+          any other HTTP status    → AMBIGUOUS (incl. every 5xx)
+          transport failure        → AMBIGUOUS
+          unparseable 2xx body     → AMBIGUOUS (leaning accepted)
+
+        This is the ONLY send method safe for the execution path.
+        """
+        path = f'/campaigns/{mc_campaign_id}/actions/send'
+        try:
+            resp = self._request_strict('POST', path, timeout=timeout)
+        except ProviderTransportError as e:
+            log.error(
+                f"AMBIGUOUS send for campaign {mc_campaign_id}: "
+                f"{e.error_type} — provider may have accepted the send"
+            )
+            return ProviderSendOutcome(
+                status=ProviderSendStatus.AMBIGUOUS,
+                provider_campaign_id=mc_campaign_id,
+                error_type=e.error_type,
+                error_message=(
+                    "Send request was dispatched but no response was "
+                    "received. The provider may have sent the campaign."
+                ),
+                detail="transport_failure_after_dispatch",
+            )
+        except ProviderHTTPError as e:
+            return classify_send_http_error(
+                http_status=e.http_status,
+                provider_campaign_id=mc_campaign_id,
+                detail=e.detail,
+            )
+        except ProviderMalformedResponseError as e:
+            log.error(
+                f"AMBIGUOUS send for campaign {mc_campaign_id}: 2xx with "
+                f"unparseable body"
+            )
+            return ProviderSendOutcome(
+                status=ProviderSendStatus.AMBIGUOUS,
+                http_status=e.http_status,
+                provider_campaign_id=mc_campaign_id,
+                error_type="malformed_success_response",
+                error_message=(
+                    "Provider returned success but the body could not be "
+                    "parsed. The send was likely accepted."
+                ),
+                detail="unparseable_2xx_body",
+            )
+
+        log.info(f"Mailchimp campaign {mc_campaign_id} sent "
+                 f"(HTTP {resp.http_status})")
+        return ProviderSendOutcome(
+            status=ProviderSendStatus.CONFIRMED_SENT,
+            http_status=resp.http_status,
+            provider_campaign_id=mc_campaign_id,
+        )
 
     def send_campaign(self, mc_campaign_id: str) -> bool:
-        """Send a Mailchimp campaign. Returns True on success."""
-        result = self._request('POST', f'/campaigns/{mc_campaign_id}/actions/send')
-        if result is not None:
-            log.info(f"Mailchimp campaign {mc_campaign_id} sent!")
-            return True
-        return False
+        """DEPRECATED lossy send. Do NOT use in the execution path.
+
+        Collapses AMBIGUOUS into False, which reads as "definitely not
+        sent" and would let a caller retry a send that may already have
+        reached customers.  Kept only for non-V2 callers.
+        Use ``send_campaign_strict``.
+        """
+        return self.send_campaign_strict(mc_campaign_id).is_confirmed_sent
+
+    def get_campaign_status(self, mc_campaign_id: str) -> ProviderResponse:
+        """Fetch campaign info for reconciliation. Raises on failure.
+
+        Deliberately strict: reconciliation must distinguish "provider
+        says X" from "we could not ask", because only the former may
+        resolve an ambiguous attempt.
+        """
+        return self._request_strict('GET', f'/campaigns/{mc_campaign_id}')
 
     def get_campaign_report(self, mc_campaign_id: str) -> Optional[Dict]:
         """Get campaign performance report from Mailchimp."""

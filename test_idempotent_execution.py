@@ -6,6 +6,7 @@ the V2 CRM execution pipeline.
 """
 
 import os
+import json
 import sqlite3
 import unittest
 from datetime import datetime, timezone
@@ -22,36 +23,96 @@ from send_attempt_model import (
     ACTIVE_ATTEMPT_STATES,
     SUCCESSFUL_SEND_STATES,
 )
-from execution_adapter import ExecutionAdapter, EXECUTION_GENERATION
+from execution_adapter import (
+    ExecutionAdapter,
+    EXECUTION_GENERATION,
+    AmbiguousSendOutcome,
+)
 from v2_state_repository import SQLiteV2StateRepository
 from intervention_model import Intervention, InterventionStatus
 from suppression_guard import SuppressionGuard, SENTINEL_TABLE_SCHEMA
+from craft_engine import MailchimpClient
+from provider_outcome import (
+    ProviderResponse,
+    ProviderTransportError,
+    ProviderHTTPError,
+    ProviderMalformedResponseError,
+    ProviderSendStatus,
+    ProviderCreateStatus,
+    ReconciliationVerdict,
+    classify_reconciliation_status,
+    classify_send_http_error,
+    DEFINITE_SEND_REJECTION_CODES,
+    RECONCILE_NOT_SENT_STATUSES,
+    RECONCILE_KNOWN_UNSAFE_STATUSES,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Fake provider infrastructure
 # ─────────────────────────────────────────────────────────────────────
 
-class FakeDeterministicMailchimp:
-    """Fake Mailchimp client with controllable behavior for testing.
+class FakeDeterministicMailchimp(MailchimpClient):
+    """Mailchimp double that stubs the HTTP TRANSPORT, not the API methods.
 
-    Tracks all calls made and allows injecting failures at specific
-    steps (ensure_members, create_campaign, send_campaign).
+    This subclasses the real ``MailchimpClient`` and overrides only
+    ``_request_strict`` — the single place where bytes would go on the
+    wire.  Everything above it (``send_campaign_strict``,
+    ``create_campaign_strict``, ``get_campaign_status``, and all the
+    outcome classification) is the real production code.
+
+    That matters: an earlier version of this fake reimplemented the
+    high-level methods, so the tests validated the test double's model
+    of the provider rather than the shipped contract.  A lost HTTP
+    response was never exercised against the real classifier at all.
+    By faking only the transport we can inject genuine timeouts,
+    connection resets, 5xx responses and 204 No Content bodies and
+    watch the real code classify them.
     """
 
     def __init__(self):
+        super().__init__(api_key="test-key-us16", audience_id="test-audience")
         self.calls = []
-        self._fail_at = None          # 'members', 'segment', 'campaign', 'send'
-        self._raise_at = None         # 'members', 'segment', 'campaign', 'send'
-        self._raise_exception = None  # Exception class/instance to raise
-        self._send_return = True
         self._campaign_counter = 0
-        self._campaign_status = "sent"  # For reconciliation queries
+        self._campaign_status = "sent"
+        self._campaign_emails_sent = 50
+        self._campaign_send_time = "2026-01-15T10:00:00+00:00"
+        # transport injection: path-substring -> behaviour
+        self._transport_overrides = []
+        self._fail_at = None
+        self._raise_at = None
+        self._raise_exception = None
 
-    # ── controllable behavior ────────────────────────────────────────
+    # ── transport injection ──────────────────────────────────────────
+
+    def inject(self, path_contains, behaviour, method=None):
+        """Make matching requests behave a particular way.
+
+        behaviour is one of:
+          ('timeout',)                     -> requests.Timeout
+          ('conn_reset',)                  -> requests.ConnectionError
+          ('exception', exc)               -> raise exc verbatim
+          ('http', status_code)            -> non-2xx HTTP response
+          ('ok', status_code, body)        -> 2xx response
+          ('malformed', status_code)       -> 2xx with unparseable body
+        """
+        self._transport_overrides.append((method, path_contains, behaviour))
+
+    def clear_injections(self):
+        self._transport_overrides = []
+
+    def set_campaign_status(self, status, emails_sent=50,
+                            send_time="2026-01-15T10:00:00+00:00"):
+        """Status returned by GET /campaigns/{id} during reconciliation."""
+        self._campaign_status = status
+        self._campaign_emails_sent = emails_sent
+        self._campaign_send_time = send_time
 
     def set_fail_at(self, step, exception=None):
-        """Configure which step fails. step: 'members'|'segment'|'campaign'|'send'"""
+        """Legacy helper: fail a named pipeline step.
+
+        step: 'members' | 'segment' | 'campaign' | 'send'
+        """
         self._fail_at = step
         if exception:
             self._raise_at = step
@@ -60,25 +121,108 @@ class FakeDeterministicMailchimp:
             self._raise_at = None
             self._raise_exception = None
 
-    def set_send_return(self, value):
-        """Control whether send_campaign returns True or False."""
-        self._send_return = value
-
-    def set_campaign_status(self, status):
-        """Set the status returned by _request (for reconciliation)."""
-        self._campaign_status = status
-
     def reset(self):
-        """Reset all state."""
         self.calls = []
+        self._campaign_counter = 0
+        self._campaign_status = "sent"
+        self._campaign_emails_sent = 50
+        self._campaign_send_time = "2026-01-15T10:00:00+00:00"
+        self._transport_overrides = []
         self._fail_at = None
         self._raise_at = None
         self._raise_exception = None
-        self._send_return = True
-        self._campaign_counter = 0
-        self._campaign_status = "sent"
 
-    # ── Mailchimp API surface ────────────────────────────────────────
+    # ── the ONLY stubbed layer: HTTP transport ───────────────────────
+
+    def _request_strict(self, method, path, data=None, timeout=30):
+        self.calls.append(('_request_strict', {'method': method, 'path': path}))
+
+        for m, needle, behaviour in self._transport_overrides:
+            if m is not None and m != method:
+                continue
+            if needle not in path:
+                continue
+            return self._apply_behaviour(behaviour, path)
+
+        return self._default_response(method, path)
+
+    def _apply_behaviour(self, behaviour, path):
+        kind = behaviour[0]
+        if kind == 'timeout':
+            raise ProviderTransportError(
+                f"timeout on {path}", error_type="Timeout")
+        if kind == 'conn_reset':
+            raise ProviderTransportError(
+                f"connection reset on {path}", error_type="ConnectionError")
+        if kind == 'exception':
+            raise behaviour[1]
+        if kind == 'http':
+            raise ProviderHTTPError(
+                f"HTTP {behaviour[1]} on {path}",
+                http_status=behaviour[1], detail="injected")
+        if kind == 'malformed':
+            raise ProviderMalformedResponseError(
+                f"unparseable body on {path}", http_status=behaviour[1])
+        if kind == 'ok':
+            return ProviderResponse(http_status=behaviour[1],
+                                    body=behaviour[2] or {})
+        raise AssertionError(f"unknown injected behaviour {kind!r}")
+
+    def _default_response(self, method, path):
+        # Legacy step-based failure injection, mapped onto transport.
+        if self._raise_at and self._step_matches(self._raise_at, method, path):
+            raise self._raise_exception
+        if self._fail_at and self._step_matches(self._fail_at, method, path):
+            # A plain "failure" with no specific exception means the
+            # provider answered and rejected it.
+            raise ProviderHTTPError(
+                f"simulated {self._fail_at} failure",
+                http_status=422, detail="simulated")
+
+        if method == 'POST' and path == '/campaigns':
+            self._campaign_counter += 1
+            return ProviderResponse(
+                http_status=200,
+                body={'id': f'mc-campaign-{self._campaign_counter}'})
+
+        if method == 'PUT' and '/content' in path:
+            return ProviderResponse(http_status=200, body={'html': 'ok'})
+
+        if '/actions/send' in path:
+            # Mailchimp's documented success shape: 204 No Content.
+            return ProviderResponse(http_status=204, body={})
+
+        if method == 'GET' and path.startswith('/campaigns/'):
+            return ProviderResponse(http_status=200, body={
+                'status': self._campaign_status,
+                'emails_sent': self._campaign_emails_sent,
+                'send_time': self._campaign_send_time,
+            })
+
+        if method == 'GET' and '/segments' in path:
+            return ProviderResponse(http_status=200, body={
+                'segments': [{'id': 12345, 'name': 'seg'}]})
+
+        if method == 'POST' and path.startswith('/lists/'):
+            return ProviderResponse(http_status=200, body={
+                'total_created': 1, 'total_updated': 0, 'error_count': 0})
+
+        return ProviderResponse(http_status=200, body={})
+
+    @staticmethod
+    def _step_matches(step, method, path):
+        if step == 'members':
+            return path.startswith('/lists/') and method == 'POST' \
+                and '/segments' not in path
+        if step == 'segment':
+            return '/segments' in path
+        if step == 'campaign':
+            return path == '/campaigns' and method == 'POST'
+        if step == 'send':
+            return '/actions/send' in path
+        return False
+
+    # ── convenience used by existing tests ───────────────────────────
 
     def ensure_members(self, emails, tag=None):
         self.calls.append(('ensure_members', {'emails': emails, 'tag': tag}))
@@ -96,38 +240,16 @@ class FakeDeterministicMailchimp:
             raise RuntimeError("get_tag_segment_id simulated failure")
         return 12345
 
-    def create_campaign(self, subject="", preview_text="", html="", segment_id=None):
-        self.calls.append(('create_campaign', {
-            'subject': subject, 'preview_text': preview_text,
-            'html': html, 'segment_id': segment_id,
-        }))
-        if self._raise_at == 'campaign':
-            raise self._raise_exception
-        if self._fail_at == 'campaign':
-            raise RuntimeError("create_campaign simulated failure")
-        self._campaign_counter += 1
-        return f"mc-campaign-{self._campaign_counter}"
+    def sent_campaign_ids(self):
+        """Campaign IDs for which a send was actually dispatched."""
+        return [
+            c[1]['path'].split('/')[2]
+            for c in self.calls
+            if c[0] == '_request_strict' and '/actions/send' in c[1]['path']
+        ]
 
-    def send_campaign(self, mc_campaign_id):
-        self.calls.append(('send_campaign', {'mc_campaign_id': mc_campaign_id}))
-        if self._raise_at == 'send':
-            raise self._raise_exception
-        if self._fail_at == 'send':
-            return False
-        return self._send_return
-
-    def get_campaign_report(self, mc_campaign_id):
-        self.calls.append(('get_campaign_report', {'mc_campaign_id': mc_campaign_id}))
-        return {'status': self._campaign_status, 'emails_sent': 50}
-
-    def _request(self, method, path):
-        """Low-level request used by reconciliation."""
-        self.calls.append(('_request', {'method': method, 'path': path}))
-        return {
-            'status': self._campaign_status,
-            'emails_sent': 50,
-            'send_time': '2026-01-15T10:00:00+00:00',
-        }
+    def send_call_count(self):
+        return len(self.sent_campaign_ids())
 
 
 class FakeCampaignEngine:
@@ -331,16 +453,22 @@ class TestSendAttemptModel(unittest.TestCase):
 
     def test_illegal_transitions(self):
         """Invalid state machine transitions raise IllegalAttemptTransition."""
+        # Note: AMBIGUOUS is now reachable from every pre-send state,
+        # because any provider call can lose its response. And
+        # SEND_REQUESTED -> FAILED_PRE_SEND is permitted, reachable only
+        # via a documented rejection code. Both are covered by their own
+        # tests below; neither can be entered from uncertainty.
         illegal_paths = [
             (SendAttemptStatus.CLAIMED, SendAttemptStatus.CONFIRMED_SENT),
-            (SendAttemptStatus.CLAIMED, SendAttemptStatus.AMBIGUOUS),
             (SendAttemptStatus.CLAIMED, SendAttemptStatus.SEND_REQUESTED),
             (SendAttemptStatus.PROVIDER_CAMPAIGN_CREATED, SendAttemptStatus.CONFIRMED_SENT),
-            (SendAttemptStatus.AUDIENCE_CONFIGURED, SendAttemptStatus.AMBIGUOUS),
-            (SendAttemptStatus.SEND_REQUESTED, SendAttemptStatus.FAILED_PRE_SEND),
             (SendAttemptStatus.CONFIRMED_SENT, SendAttemptStatus.AMBIGUOUS),
+            # The critical one: ambiguity may never become "sent" or
+            # retryable without going through reconciliation.
             (SendAttemptStatus.AMBIGUOUS, SendAttemptStatus.CONFIRMED_SENT),
             (SendAttemptStatus.AMBIGUOUS, SendAttemptStatus.FAILED_PRE_SEND),
+            (SendAttemptStatus.AMBIGUOUS, SendAttemptStatus.CANCELLED),
+            (SendAttemptStatus.AMBIGUOUS, SendAttemptStatus.SEND_REQUESTED),
         ]
         for from_status, to_status in illegal_paths:
             attempt = SendAttempt(
@@ -523,10 +651,14 @@ class TestIdempotentExecution(unittest.TestCase):
 
         # Verify Mailchimp was called in order
         call_names = [c[0] for c in mc.calls]
-        self.assertEqual(call_names, [
-            'ensure_members', 'get_tag_segment_id',
-            'create_campaign', 'send_campaign',
-        ])
+        self.assertEqual(call_names[:2], ['ensure_members', 'get_tag_segment_id'])
+
+        # Provider operations are asserted at the transport layer, which
+        # is where the real client actually issues them.
+        paths = [c[1]['path'] for c in mc.calls if c[0] == '_request_strict']
+        self.assertIn('/campaigns', paths)                 # create shell
+        self.assertTrue(any('/content' in p for p in paths))   # set content
+        self.assertEqual(mc.send_call_count(), 1)              # exactly one send
 
     def test_successful_execution_promotes_recipients(self):
         """After success, v2_campaign_sends is populated via promote."""
@@ -724,9 +856,15 @@ class TestReconciliation(unittest.TestCase):
         self.assertEqual(intervention.status, InterventionStatus.MEASURING)
 
     def test_reconcile_not_sent(self):
-        """Ambiguous + Mailchimp says 'save' -> reconciled_not_sent, safe to retry."""
+        """Ambiguous + Mailchimp proves draft -> reconciled_not_sent, safe to retry.
+
+        A genuine draft reports status 'save' AND zero delivered mail AND
+        no send_time. All three must line up; 'save' alone alongside
+        evidence of delivery is contradictory and stays ambiguous
+        (see test_reconcile_save_with_delivery_evidence_stays_ambiguous).
+        """
         db, v2_repo, adapter, mc, intv_id = self._make_ambiguous()
-        mc.set_campaign_status("save")
+        mc.set_campaign_status("save", emails_sent=0, send_time=None)
 
         result = adapter.reconcile_send_attempt(intv_id)
         self.assertEqual(result["status"], "reconciled_not_sent")
@@ -802,6 +940,472 @@ class TestDuplicateClaimPrevention(unittest.TestCase):
         )
         with self.assertRaises(DuplicateClaimError):
             v2_repo.create_send_attempt(attempt2)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Provider uncertainty — the blocker this module exists to prevent
+# ─────────────────────────────────────────────────────────────────────
+
+class TestLostSendResponse(unittest.TestCase):
+    """MANDATORY regression: a lost send response must never unlock retry.
+
+    The failure this guards against: Mailchimp accepts and sends the
+    campaign, the HTTP response is lost, the client reports failure, the
+    adapter releases the claim, a later execute retries, and every
+    recipient gets a second email.
+    """
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def test_provider_accepted_but_response_lost_blocks_retry(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+
+        # Provider ACCEPTS and sends; we simply never hear back.
+        mc.inject('/actions/send', ('timeout',))
+
+        result = adapter.execute(intv_id)
+
+        # 1. Reported as ambiguous, not as a retryable failure.
+        self.assertEqual(result["error"], "execution_outcome_ambiguous")
+        self.assertTrue(result["reconciliation_required"])
+
+        # 2. The send WAS dispatched exactly once.
+        self.assertEqual(mc.send_call_count(), 1)
+
+        # 3. Attempt is ambiguous and the campaign ID was retained, so
+        #    the send can be reconciled later.
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].attempt_status, SendAttemptStatus.AMBIGUOUS)
+        self.assertIsNotNone(attempts[0].provider_campaign_id)
+        self.assertTrue(attempts[0].requires_reconciliation)
+
+        # 4. The claim is NOT released — it is still active.
+        self.assertTrue(attempts[0].is_active)
+        self.assertFalse(attempts[0].is_terminal)
+
+        # ── Second execute attempt ────────────────────────────────────
+        sends_before = mc.send_call_count()
+        second = adapter.execute(intv_id)
+
+        # 5. The second execute must NOT contact the provider to send.
+        self.assertEqual(mc.send_call_count(), sends_before,
+                         "second execute dispatched another send")
+
+        # 6. It must report that reconciliation is required.
+        self.assertIn("error", second)
+        self.assertIn(second["error"],
+                      ("reconciliation_required", "attempt_in_progress",
+                       "execution_outcome_ambiguous"))
+
+        # 7. Still exactly one attempt — no new claim was created.
+        self.assertEqual(len(v2_repo.get_send_attempts(intv_id)), 1)
+
+    def test_request_returning_none_equivalent_is_ambiguous(self):
+        """The historical None path must classify as AMBIGUOUS.
+
+        The legacy client collapsed a 5xx into None, send_campaign
+        turned None into False, and the adapter read False as
+        "definitely not sent". A 500 proves nothing.
+        """
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('http', 500))
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["error"], "execution_outcome_ambiguous")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status, SendAttemptStatus.AMBIGUOUS)
+        self.assertNotEqual(attempts[0].attempt_status,
+                            SendAttemptStatus.FAILED_PRE_SEND)
+
+
+class TestSendHttpFailureMatrix(unittest.TestCase):
+    """Per-status classification of the send action."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def _run_with(self, behaviour):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', behaviour)
+        result = adapter.execute(intv_id)
+        attempts = v2_repo.get_send_attempts(intv_id)
+        return result, attempts[0], mc
+
+    def test_timeout_is_ambiguous(self):
+        _, attempt, _ = self._run_with(('timeout',))
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+
+    def test_connection_reset_is_ambiguous(self):
+        _, attempt, _ = self._run_with(('conn_reset',))
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+
+    def test_http_500_is_ambiguous(self):
+        _, attempt, _ = self._run_with(('http', 500))
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+
+    def test_http_502_503_504_are_ambiguous(self):
+        for code in (502, 503, 504):
+            with self.subTest(code=code):
+                _, attempt, _ = self._run_with(('http', code))
+                self.assertEqual(attempt.attempt_status,
+                                 SendAttemptStatus.AMBIGUOUS)
+
+    def test_http_429_is_ambiguous(self):
+        """Rate limiting is not proof of rejection for our purposes."""
+        _, attempt, _ = self._run_with(('http', 429))
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+
+    def test_malformed_success_body_is_ambiguous(self):
+        """2xx we could not parse leans accepted, so it is never a failure."""
+        _, attempt, _ = self._run_with(('malformed', 200))
+        self.assertEqual(attempt.attempt_status, SendAttemptStatus.AMBIGUOUS)
+
+    def test_documented_rejection_codes_are_definite_failure(self):
+        for code in sorted(DEFINITE_SEND_REJECTION_CODES):
+            with self.subTest(code=code):
+                _, attempt, _ = self._run_with(('http', code))
+                self.assertEqual(
+                    attempt.attempt_status, SendAttemptStatus.FAILED_PRE_SEND,
+                    f"HTTP {code} should prove rejection")
+
+    def test_204_no_content_is_confirmed_sent(self):
+        """Mailchimp's documented success shape for the send action."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('ok', 204, {}))
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["status"], "executed")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.CONFIRMED_SENT)
+
+    def test_definite_failure_releases_claim_and_allows_retry(self):
+        """Only a proven rejection may unlock a retry."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('http', 422))
+
+        first = adapter.execute(intv_id)
+        self.assertEqual(first["error"], "execution_failed")
+
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.FAILED_PRE_SEND)
+        self.assertTrue(attempts[0].is_terminal)
+
+        # Claim released: a retry may now proceed and create a new claim.
+        mc.clear_injections()
+        second = adapter.execute(intv_id)
+        self.assertEqual(second["status"], "executed")
+        self.assertEqual(len(v2_repo.get_send_attempts(intv_id)), 2)
+
+
+class TestSendOutcomeClassifier(unittest.TestCase):
+    """Unit-level coverage of the send HTTP classifier."""
+
+    def test_rejection_codes_classify_as_definite_failure(self):
+        for code in sorted(DEFINITE_SEND_REJECTION_CODES):
+            with self.subTest(code=code):
+                outcome = classify_send_http_error(code)
+                self.assertEqual(outcome.status,
+                                 ProviderSendStatus.DEFINITE_FAILURE)
+
+    def test_server_errors_classify_as_ambiguous(self):
+        for code in (500, 502, 503, 504, 408, 409, 429, 418, 599):
+            with self.subTest(code=code):
+                outcome = classify_send_http_error(code)
+                self.assertEqual(outcome.status,
+                                 ProviderSendStatus.AMBIGUOUS)
+
+    def test_outcome_dict_carries_no_secrets(self):
+        outcome = classify_send_http_error(500, provider_campaign_id="mc-1")
+        d = outcome.to_dict()
+        blob = json.dumps(d).lower()
+        for forbidden in ("api_key", "apikey", "authorization", "bearer",
+                          "password", "@"):
+            self.assertNotIn(forbidden, blob)
+
+
+class TestReconciliationAllowlist(unittest.TestCase):
+    """Status classification must be allowlist-based, never `!= sent`."""
+
+    def test_sent_is_sent(self):
+        self.assertEqual(
+            classify_reconciliation_status("sent"),
+            ReconciliationVerdict.SENT)
+
+    def test_save_with_no_delivery_is_definitely_not_sent(self):
+        self.assertEqual(
+            classify_reconciliation_status("save", emails_sent=0,
+                                           send_time=None),
+            ReconciliationVerdict.DEFINITELY_NOT_SENT)
+
+    def test_known_unsafe_statuses_are_unknown(self):
+        """sending / canceling / canceled / paused / schedule / archived.
+
+        'canceled' and 'canceling' matter most: Mailchimp's cancel
+        endpoint is documented as cancelling a campaign AFTER you send,
+        before all recipients receive it. Reaching those states means
+        delivery already began.
+        """
+        for status in sorted(RECONCILE_KNOWN_UNSAFE_STATUSES):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_reconciliation_status(status),
+                    ReconciliationVerdict.UNKNOWN,
+                    f"{status!r} must not unlock a retry")
+
+    def test_unrecognised_and_empty_statuses_are_unknown(self):
+        for status in (None, "", "   ", "unknown", "wat", "SENT_MAYBE",
+                       "delivered", "queued"):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_reconciliation_status(status),
+                    ReconciliationVerdict.UNKNOWN)
+
+    def test_status_matching_is_case_and_whitespace_insensitive(self):
+        self.assertEqual(classify_reconciliation_status("  SENT "),
+                         ReconciliationVerdict.SENT)
+
+    def test_save_contradicted_by_delivery_is_unknown(self):
+        """Draft status plus evidence of delivery is contradictory."""
+        self.assertEqual(
+            classify_reconciliation_status("save", emails_sent=50),
+            ReconciliationVerdict.UNKNOWN)
+        self.assertEqual(
+            classify_reconciliation_status(
+                "save", emails_sent=0, send_time="2026-01-15T10:00:00Z"),
+            ReconciliationVerdict.UNKNOWN)
+
+    def test_only_save_is_in_the_not_sent_allowlist(self):
+        self.assertEqual(RECONCILE_NOT_SENT_STATUSES, frozenset({"save"}))
+
+
+class TestReconciliationTransitionalStatuses(unittest.TestCase):
+    """End-to-end: transitional provider states keep the attempt blocked."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def _ambiguous_env(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/actions/send', ('timeout',))
+        adapter.execute(intv_id)
+        mc.clear_injections()
+        return db, v2_repo, adapter, mc, intv_id
+
+    def test_sending_status_stays_ambiguous(self):
+        """Delivery is in flight right now — retry would duplicate."""
+        db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+        mc.set_campaign_status("sending", emails_sent=12, send_time=None)
+
+        result = adapter.reconcile_send_attempt(intv_id)
+
+        self.assertEqual(result["status"], "provider_state_still_ambiguous")
+        self.assertTrue(result["reconciliation_required"])
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+
+    def test_canceled_status_stays_ambiguous(self):
+        """Cancel happens AFTER send begins — partial delivery occurred."""
+        db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+        mc.set_campaign_status("canceled", emails_sent=30)
+
+        result = adapter.reconcile_send_attempt(intv_id)
+
+        self.assertEqual(result["status"], "provider_state_still_ambiguous")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+
+    def test_all_transitional_statuses_stay_ambiguous(self):
+        for status in sorted(RECONCILE_KNOWN_UNSAFE_STATUSES):
+            with self.subTest(status=status):
+                db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+                mc.set_campaign_status(status, emails_sent=0, send_time=None)
+
+                result = adapter.reconcile_send_attempt(intv_id)
+
+                self.assertEqual(
+                    result["status"], "provider_state_still_ambiguous",
+                    f"{status!r} must not resolve the attempt")
+                attempts = v2_repo.get_send_attempts(intv_id)
+                self.assertEqual(attempts[0].attempt_status,
+                                 SendAttemptStatus.AMBIGUOUS)
+
+    def test_missing_status_field_stays_ambiguous(self):
+        """A campaign object with no status must not read as not-sent."""
+        db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+        mc.inject('/campaigns/', ('ok', 200, {'emails_sent': 0}), method='GET')
+
+        result = adapter.reconcile_send_attempt(intv_id)
+
+        self.assertEqual(result["status"], "provider_state_still_ambiguous")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+
+    def test_unreachable_provider_stays_ambiguous(self):
+        """Failing to ask is not an answer."""
+        db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+        mc.inject('/campaigns/', ('timeout',), method='GET')
+
+        result = adapter.reconcile_send_attempt(intv_id)
+
+        self.assertEqual(result["error"], "provider_query_failed")
+        self.assertTrue(result["reconciliation_required"])
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+
+    def test_inconclusive_reconciliation_does_not_permit_resend(self):
+        """After an inconclusive reconcile, execute still must not send."""
+        db, v2_repo, adapter, mc, intv_id = self._ambiguous_env()
+        mc.set_campaign_status("sending")
+        adapter.reconcile_send_attempt(intv_id)
+
+        sends_before = mc.send_call_count()
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(mc.send_call_count(), sends_before)
+        self.assertIn("error", result)
+
+
+class TestCampaignCreationUncertainty(unittest.TestCase):
+    """Creation whose outcome is unknown must not silently retry."""
+
+    def setUp(self):
+        os.environ["V2_ENABLE_EXTERNAL_SEND"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("V2_ENABLE_EXTERNAL_SEND", None)
+
+    def test_lost_creation_response_is_ambiguous_not_retryable(self):
+        """A campaign may exist whose ID we never learned."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/campaigns', ('timeout',), method='POST')
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["error"], "execution_outcome_ambiguous")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+        # No send was ever dispatched.
+        self.assertEqual(mc.send_call_count(), 0)
+
+    def test_creation_rejected_is_failed_pre_send(self):
+        """A rejected creation proves nothing was sent."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/campaigns', ('http', 400), method='POST')
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["error"], "execution_failed")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.FAILED_PRE_SEND)
+        self.assertEqual(mc.send_call_count(), 0)
+
+    def test_content_failure_retains_campaign_id_for_cleanup(self):
+        """Orphan shell: created but contentless. Never sent, ID kept."""
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/content', ('http', 500), method='PUT')
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["error"], "execution_failed")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.FAILED_PRE_SEND)
+        self.assertIsNotNone(attempts[0].provider_campaign_id)
+        self.assertEqual(mc.send_call_count(), 0)
+
+    def test_success_without_campaign_id_is_ambiguous(self):
+        db, v2_repo, adapter, mc, intv_id = _make_test_environment()
+        mc.inject('/campaigns', ('ok', 200, {}), method='POST')
+
+        result = adapter.execute(intv_id)
+
+        self.assertEqual(result["error"], "execution_outcome_ambiguous")
+        attempts = v2_repo.get_send_attempts(intv_id)
+        self.assertEqual(attempts[0].attempt_status,
+                         SendAttemptStatus.AMBIGUOUS)
+
+
+class TestRetryInvariant(unittest.TestCase):
+    """Structural proof that uncertainty cannot reach a retryable state."""
+
+    def test_no_bare_except_converts_uncertainty_to_retryable(self):
+        """After send dispatch, no handler may produce failed_pre_send."""
+        import inspect
+        import execution_adapter as ea
+
+        src = inspect.getsource(ea.ExecutionAdapter._send_via_mailchimp_checkpointed)
+        marker = "DANGER ZONE"
+        self.assertIn(marker, src)
+        danger = src[src.index(marker):]
+
+        # Catching broadly past the send boundary is fine — what matters
+        # is where it lands. Between the send call and the proven
+        # definite-failure branch, nothing may transition the attempt to
+        # a retryable state.
+        head = danger.split("is_definite_failure")[0]
+        self.assertNotIn("FAILED_PRE_SEND", head,
+                         "a pre-send (retryable) transition appears after "
+                         "the send was dispatched")
+
+        # And any broad handler there must resolve to AMBIGUOUS.
+        if "except Exception" in head:
+            tail = head[head.index("except Exception"):]
+            self.assertIn("AMBIGUOUS", tail)
+
+    def test_ambiguous_cannot_transition_to_retryable_states(self):
+        """The state machine forbids ambiguous -> retryable directly."""
+        for target in (SendAttemptStatus.FAILED_PRE_SEND,
+                       SendAttemptStatus.CANCELLED):
+            with self.subTest(target=target):
+                attempt = SendAttempt(
+                    id=1, intervention_id="i", execution_generation=1,
+                    attempt_status=SendAttemptStatus.AMBIGUOUS,
+                    idempotency_key="k", audience_hash="h",
+                )
+                with self.assertRaises(IllegalAttemptTransition):
+                    attempt.transition_to(target)
+
+    def test_ambiguous_only_resolves_via_reconciliation(self):
+        attempt = SendAttempt(
+            id=1, intervention_id="i", execution_generation=1,
+            attempt_status=SendAttemptStatus.AMBIGUOUS,
+            idempotency_key="k", audience_hash="h",
+        )
+        attempt.transition_to(SendAttemptStatus.RECONCILED_NOT_SENT)
+        self.assertEqual(attempt.attempt_status,
+                         SendAttemptStatus.RECONCILED_NOT_SENT)
+
+    def test_legacy_bool_send_is_not_used_in_execution_path(self):
+        """The execution path must use the strict, three-valued send."""
+        import inspect
+        import execution_adapter as ea
+
+        src = inspect.getsource(ea.ExecutionAdapter)
+        self.assertIn("send_campaign_strict", src)
+        # The lossy boolean form must not appear as a call.
+        self.assertNotIn("mc.send_campaign(", src)
+        self.assertNotIn("mc.create_campaign(", src)
 
 
 if __name__ == '__main__':

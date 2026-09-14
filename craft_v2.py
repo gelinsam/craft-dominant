@@ -447,6 +447,11 @@ def _build_app():
                 "attempt_in_progress": 409,
                 "already_sent": 409,
                 "reconciliation_required": 409,
+                # 409, never 5xx: a 5xx invites a retry, and a retry here
+                # could double-send. The condition is not transient —
+                # it clears only when reconciliation proves what the
+                # provider did.
+                "execution_outcome_ambiguous": 409,
             }.get(result["error"], 400)
             return jsonify(result), status_code
 

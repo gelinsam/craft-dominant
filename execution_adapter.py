@@ -45,8 +45,24 @@ from send_attempt_model import (
     TERMINAL_ATTEMPT_STATES,
 )
 from suppression_guard import SuppressionGuard, SuppressionStatus
+from provider_outcome import (
+    ProviderSendOutcome,
+    ProviderSendStatus,
+    ProviderError,
+    ReconciliationVerdict,
+    classify_reconciliation_status,
+)
 
 log = logging.getLogger("craft.execution")
+
+
+class AmbiguousSendOutcome(Exception):
+    """The provider may or may not have sent. Retry is forbidden.
+
+    Distinct from a generic execution failure so the API layer can
+    return a non-retryable, reconciliation-required response rather
+    than something a client would reasonably retry.
+    """
 
 # Default attribution window in days
 ATTRIBUTION_WINDOW_DAYS = 7
@@ -299,10 +315,35 @@ class ExecutionAdapter:
             send_result = self._send_via_mailchimp_checkpointed(
                 attempt, intervention, campaign, audience_emails, actor,
             )
+        except AmbiguousSendOutcome as e:
+            # The provider may have sent. This is NOT a retryable
+            # failure — surface it as its own terminal-until-reconciled
+            # condition so no client treats it as "try again".
+            log.error(f"Execution ambiguous for {intervention_id}: {e}")
+            return {
+                "error": "execution_outcome_ambiguous",
+                "message": str(e),
+                "reconciliation_required": True,
+                "provider_campaign_id": attempt.provider_campaign_id,
+                "send_attempt": attempt.to_dict(),
+            }
         except Exception as e:
             # If we get here, the attempt has been checkpointed at each
             # step. The attempt status tells us exactly where it failed.
+            #
+            # Guard: if the checkpointed send left the attempt in an
+            # ambiguous state, report it as ambiguous even though the
+            # error surfaced as a generic exception. The persisted state
+            # is the authority on whether a send may have happened.
             log.error(f"Execution failed for {intervention_id}: {e}")
+            if attempt.attempt_status == SendAttemptStatus.AMBIGUOUS:
+                return {
+                    "error": "execution_outcome_ambiguous",
+                    "message": str(e),
+                    "reconciliation_required": True,
+                    "provider_campaign_id": attempt.provider_campaign_id,
+                    "send_attempt": attempt.to_dict(),
+                }
             return {
                 "error": "execution_failed",
                 "message": str(e),
@@ -516,6 +557,45 @@ class ExecutionAdapter:
         State progression:
             claimed → provider_campaign_created → audience_configured
             → send_requested → confirmed_sent | ambiguous
+
+        Any step may instead go to `ambiguous` if its response is lost.
+
+        ── RETRY INVARIANT ──────────────────────────────────────────
+        Every transition into a retryable state below is justified by
+        proof that no recipient could have received mail:
+
+          1. Mailchimp not configured  — no provider contact occurred.
+          2. ensure_members failed     — audience upsert only; adding or
+                                         tagging members sends nothing.
+          3. get_tag_segment_id failed — read-only lookup.
+          4. create definite failure   — campaign rejected, or created
+                                         with no content. A contentless
+                                         campaign has no send action
+                                         behind it.
+          5. send definite failure     — provider returned one of
+                                         400/401/403/404/405/422, which
+                                         proves it rejected the request
+                                         before acting on it.
+
+        Steps 1-3 run before any campaign exists, so a broad `except`
+        there is safe.  Steps 4-5 are gated on explicit `is_definite_
+        failure` checks, never on a bare exception.  Everything else —
+        every 5xx, every timeout, every reset, every unparseable body —
+        routes to `ambiguous` and blocks retry until reconciliation.
+
+        ── PROVIDER MUTATION IDEMPOTENCY ────────────────────────────
+        Steps 1-2 mutate provider state and may be repeated after a
+        crash.  Both are safe to repeat:
+
+          ensure_members  POST /lists/{id} with update_existing=true and
+                          status_if_new=subscribed.  An upsert: existing
+                          members keep their status, so re-running adds
+                          nothing new and changes no one's subscription.
+          tag_members     Static segment membership is set-valued, so
+                          re-adding the same addresses is a no-op.
+
+        Neither dispatches email, so repetition is harmless — which is
+        why they may safely live behind a retryable failure state.
         """
         if not self.campaign_engine or not self.campaign_engine.mailchimp:
             attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
@@ -545,24 +625,67 @@ class ExecutionAdapter:
             raise RuntimeError(f"Mailchimp segment lookup failed: {e}") from e
 
         # ── Step 3: Create campaign (IRREVERSIBLE) ────────────────────
-        try:
-            mc_campaign_id = mc.create_campaign(
-                subject=campaign.get("subject_line", ""),
-                preview_text=campaign.get("preview_text", ""),
-                html=campaign.get("body_html", ""),
-                segment_id=segment_id,
-            )
-        except Exception as e:
-            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
-            attempt.error_message = f"create_campaign exception: {e}"
-            self.v2_repo.update_send_attempt(attempt)
-            raise RuntimeError(f"Mailchimp campaign creation exception: {e}") from e
+        # A campaign that exists but was never sent harms no customer.
+        # The danger here is losing its ID: an unnamed campaign cannot
+        # be reconciled later, so an uncertain creation must NOT become
+        # retryable.
+        create_outcome = mc.create_campaign_strict(
+            subject=campaign.get("subject_line", ""),
+            preview_text=campaign.get("preview_text", ""),
+            html=campaign.get("body_html", ""),
+            segment_id=segment_id,
+        )
 
-        if not mc_campaign_id:
-            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
-            attempt.error_message = "create_campaign returned None"
+        if create_outcome.is_ambiguous:
+            # We may have created a campaign we cannot address.  Nothing
+            # was sent, but blindly creating another one on retry would
+            # accumulate orphans and, worse, hide the unnamed campaign.
+            log.error(
+                f"AMBIGUOUS campaign creation for attempt {attempt.id}: "
+                f"{create_outcome.error_type}"
+            )
+            attempt.transition_to(SendAttemptStatus.AMBIGUOUS)
+            attempt.error_message = (
+                create_outcome.error_message or "Campaign creation outcome unknown"
+            )
+            attempt.error_detail = create_outcome.to_dict()
             self.v2_repo.update_send_attempt(attempt)
-            raise RuntimeError("Mailchimp campaign creation failed (returned None)")
+            self.v2_repo.append_audit(
+                intervention.id, intervention.event_id,
+                action="send_attempt_ambiguous",
+                actor=actor,
+                metadata={
+                    "send_attempt_id": attempt.id,
+                    "provider_operation": "create_campaign",
+                    "provider_campaign_id": create_outcome.provider_campaign_id,
+                    "error_type": create_outcome.error_type,
+                    "http_status": create_outcome.http_status,
+                },
+                error="Campaign creation outcome uncertain — manual review required",
+            )
+            raise RuntimeError(
+                f"Campaign creation outcome uncertain for attempt "
+                f"{attempt.id}. Manual review required before retrying."
+            )
+
+        if create_outcome.is_definite_failure:
+            # Proven not created, or created-without-content. Either way
+            # nothing was dispatched to any recipient.
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = (
+                create_outcome.error_message or "Campaign creation failed"
+            )
+            attempt.error_detail = create_outcome.to_dict()
+            if create_outcome.provider_campaign_id:
+                # Orphaned shell — record the ID so it can be cleaned up.
+                attempt.provider_campaign_id = create_outcome.provider_campaign_id
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(
+                f"Mailchimp campaign creation failed: "
+                f"{create_outcome.error_type}"
+            )
+
+        mc_campaign_id = create_outcome.provider_campaign_id
 
         # CHECKPOINT: campaign created — persist provider_campaign_id
         attempt.provider_campaign_id = mc_campaign_id
@@ -585,15 +708,38 @@ class ExecutionAdapter:
         log.info(f"Checkpoint: send_requested for attempt {attempt.id}, "
                  f"campaign {mc_campaign_id}")
 
+        # send_campaign_strict never raises for provider conditions: it
+        # returns a three-valued outcome.  A bare `except Exception` here
+        # would re-introduce the very bug this design removes, so the
+        # only exceptions we catch are genuinely unexpected local ones —
+        # and those are ALSO treated as ambiguous, because the request
+        # had already been dispatched by then.
         try:
-            sent_ok = mc.send_campaign(mc_campaign_id)
+            send_outcome = mc.send_campaign_strict(mc_campaign_id)
         except Exception as e:
-            # Network timeout, connection reset, or crash around send.
-            # We do NOT know if the send succeeded — mark AMBIGUOUS.
-            log.error(f"AMBIGUOUS: send_campaign exception for attempt "
-                      f"{attempt.id}: {e}")
+            log.error(f"AMBIGUOUS: unexpected error during send for attempt "
+                      f"{attempt.id}: {type(e).__name__}")
+            send_outcome = ProviderSendOutcome(
+                status=ProviderSendStatus.AMBIGUOUS,
+                provider_campaign_id=mc_campaign_id,
+                error_type=type(e).__name__,
+                error_message="Unexpected error after send dispatch",
+                detail="unexpected_exception_after_dispatch",
+            )
+
+        if send_outcome.is_ambiguous:
+            # The provider may have accepted and sent the campaign.
+            # This state BLOCKS retry until reconciliation proves what
+            # actually happened.
+            log.error(
+                f"AMBIGUOUS send for attempt {attempt.id}, campaign "
+                f"{mc_campaign_id}: {send_outcome.error_type}"
+            )
             attempt.transition_to(SendAttemptStatus.AMBIGUOUS)
-            attempt.error_message = f"send_campaign exception: {e}"
+            attempt.error_message = (
+                send_outcome.error_message or "Send outcome unknown"
+            )
+            attempt.error_detail = send_outcome.to_dict()
             self.v2_repo.update_send_attempt(attempt)
             self.v2_repo.append_audit(
                 intervention.id, intervention.event_id,
@@ -602,25 +748,33 @@ class ExecutionAdapter:
                 metadata={
                     "send_attempt_id": attempt.id,
                     "provider_campaign_id": mc_campaign_id,
-                    "error": str(e),
+                    "provider_operation": "send_campaign",
+                    "error_type": send_outcome.error_type,
+                    "http_status": send_outcome.http_status,
+                    "detail": send_outcome.detail,
                 },
                 error="Provider outcome uncertain — reconciliation required",
             )
-            raise RuntimeError(
+            raise AmbiguousSendOutcome(
                 f"Send outcome uncertain for campaign {mc_campaign_id}. "
                 f"Attempt {attempt.id} marked ambiguous — reconcile before "
                 f"retrying."
-            ) from e
+            )
 
-        if not sent_ok:
-            # Provider explicitly returned failure (not ambiguous — the
-            # API responded, and said it failed).  The campaign was
-            # created but not sent.
+        if send_outcome.is_definite_failure:
+            # The provider returned a status code that PROVES the send
+            # was rejected before it was processed.  Only these codes may
+            # release the claim and allow a retry.
             attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
-            attempt.error_message = f"send_campaign returned False for {mc_campaign_id}"
+            attempt.error_message = (
+                send_outcome.error_message
+                or f"Provider rejected send for {mc_campaign_id}"
+            )
+            attempt.error_detail = send_outcome.to_dict()
             self.v2_repo.update_send_attempt(attempt)
             raise RuntimeError(
-                f"Mailchimp send explicitly failed for campaign {mc_campaign_id}"
+                f"Mailchimp rejected the send for campaign {mc_campaign_id} "
+                f"(HTTP {send_outcome.http_status}) — nothing was sent."
             )
 
         # CHECKPOINT: confirmed sent
@@ -681,13 +835,17 @@ class ExecutionAdapter:
             }
 
         if not ambiguous.provider_campaign_id:
-            # Cannot reconcile without a provider campaign ID
+            # We hold no provider campaign ID, so there is nothing to
+            # query. The attempt STAYS ambiguous — absence of an ID is
+            # not evidence that nothing was created or sent.
             return {
                 "error": "no_provider_campaign_id",
                 "message": (
                     "Cannot reconcile: no provider_campaign_id recorded. "
-                    "Campaign may not have been created."
+                    "A provider campaign may exist that we cannot address. "
+                    "Manual review required; retry remains blocked."
                 ),
+                "reconciliation_required": True,
                 "send_attempt": ambiguous.to_dict(),
             }
 
@@ -699,29 +857,76 @@ class ExecutionAdapter:
             }
 
         mc = self.campaign_engine.mailchimp
-        provider_result = mc._request(
-            'GET', f'/campaigns/{ambiguous.provider_campaign_id}'
-        )
-
-        if provider_result is None:
+        try:
+            provider_response = mc.get_campaign_status(
+                ambiguous.provider_campaign_id
+            )
+        except ProviderError as e:
+            # We could not ask. That is NOT an answer — the attempt
+            # stays ambiguous and stays blocked.
             return {
                 "error": "provider_query_failed",
                 "message": (
                     f"Could not query Mailchimp for campaign "
                     f"{ambiguous.provider_campaign_id}. Try again later."
                 ),
+                "reconciliation_required": True,
                 "send_attempt": ambiguous.to_dict(),
             }
 
-        campaign_status = provider_result.get("status", "unknown")
+        provider_result = provider_response.body
+        # Note: no `.get(..., "unknown")` default here. A missing status
+        # must stay None so the classifier sees absence-of-evidence
+        # rather than a string that could accidentally match a rule.
+        campaign_status = provider_result.get("status")
+        emails_sent = provider_result.get("emails_sent")
+        send_time = provider_result.get("send_time")
+
+        verdict = classify_reconciliation_status(
+            provider_status=campaign_status,
+            emails_sent=emails_sent,
+            send_time=send_time,
+        )
+
         ambiguous.reconciliation_detail = {
             "provider_status": campaign_status,
-            "emails_sent": provider_result.get("emails_sent"),
-            "send_time": provider_result.get("send_time"),
+            "emails_sent": emails_sent,
+            "send_time": send_time,
+            "verdict": verdict.value,
             "query_time": datetime.now(timezone.utc).isoformat(),
         }
 
-        if campaign_status == "sent":
+        if verdict == ReconciliationVerdict.UNKNOWN:
+            # The provider answered, but the answer does not prove
+            # whether the send happened. Persist the evidence, keep the
+            # attempt ambiguous, and do NOT unlock a retry.
+            self.v2_repo.update_send_attempt(ambiguous)
+            self.v2_repo.append_audit(
+                intervention_id, intervention.event_id,
+                action="send_attempt_reconciliation_inconclusive",
+                actor=actor,
+                metadata={
+                    "send_attempt_id": ambiguous.id,
+                    "provider_campaign_id": ambiguous.provider_campaign_id,
+                    "provider_status": campaign_status,
+                    "verdict": verdict.value,
+                },
+                error="Provider state does not prove whether the send occurred",
+            )
+            return {
+                "status": "provider_state_still_ambiguous",
+                "message": (
+                    f"Mailchimp reports campaign status "
+                    f"{campaign_status!r}, which does not prove whether the "
+                    f"send occurred. The attempt remains ambiguous and "
+                    f"retry stays blocked. Manual review required."
+                ),
+                "provider_status": campaign_status,
+                "reconciliation_required": True,
+                "send_attempt": ambiguous.to_dict(),
+            }
+
+        if verdict == ReconciliationVerdict.SENT:
             # Provider confirms: campaign was sent
             ambiguous.transition_to(SendAttemptStatus.RECONCILED_SENT)
             ambiguous.reconciled_by = actor
@@ -766,8 +971,11 @@ class ExecutionAdapter:
                 "intervention": intervention.to_dict(),
             }
         else:
-            # Provider says campaign was NOT sent (status is 'save',
-            # 'paused', 'schedule', or something else — not 'sent')
+            # verdict is DEFINITELY_NOT_SENT — the provider proved the
+            # campaign is still a draft ('save') with no delivered mail
+            # and no send_time. This is the ONLY path that unlocks a
+            # retry, and it is reached only via the explicit allowlist
+            # in classify_reconciliation_status().
             ambiguous.transition_to(SendAttemptStatus.RECONCILED_NOT_SENT)
             ambiguous.reconciled_by = actor
             self.v2_repo.update_send_attempt(ambiguous)
@@ -786,9 +994,11 @@ class ExecutionAdapter:
             return {
                 "status": "reconciled_not_sent",
                 "message": (
-                    f"Provider says campaign status is '{campaign_status}' "
-                    f"(not 'sent'). Safe to retry."
+                    f"Provider proves the campaign was never dispatched "
+                    f"(status '{campaign_status}', no delivered mail, no "
+                    f"send time). Safe to retry."
                 ),
+                "provider_status": campaign_status,
                 "send_attempt": ambiguous.to_dict(),
             }
 
