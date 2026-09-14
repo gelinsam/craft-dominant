@@ -18,7 +18,7 @@ from functools import wraps
 from flask import jsonify, request
 
 from campaign_adapter import CampaignDraftAdapter
-from craft_unified import Database, DecisionEngine, create_app
+from craft_unified import Database, DecisionEngine, auto_sync_enabled, create_app
 from diagnosis_engine import DiagnosisEngine
 from dominant_agent import OpportunityEngine
 from execution_adapter import ExecutionAdapter
@@ -149,7 +149,9 @@ def analytics_row_counts(db) -> dict:
 
 def _build_app():
     db = ResilientDatabase(os.environ.get("DB_PATH", "craft_unified.db"))
-    app = create_app(db, auto_sync=os.environ.get("CRAFT_AUTO_SYNC", "1") == "1")
+    # Single source of truth shared with craft_unified, so the two entry
+    # points cannot disagree about whether a startup sync runs.
+    app = create_app(db, auto_sync=auto_sync_enabled())
     decision_engine = DecisionEngine(db)
     opportunity_engine = OpportunityEngine(db, decision_engine)
     diagnosis_engine = DiagnosisEngine(db, decision_engine)

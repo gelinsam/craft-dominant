@@ -24,6 +24,9 @@ os.environ.setdefault("TESTING", "1")
 # database. Point that at an in-memory DB before the first import so importing
 # this module can never touch (or be poisoned by) a real SQLite file on disk.
 os.environ.setdefault("DB_PATH", ":memory:")
+# Constructing the app is what may start a background Eventbrite sync; tests
+# must never do that.
+os.environ.setdefault("CRAFT_AUTO_SYNC", "0")
 
 from craft_v2 import (  # noqa: E402
     ANALYTICS_TABLES,

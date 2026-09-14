@@ -15,6 +15,7 @@ import os
 os.environ['TESTING'] = '1'  # Prevent module-level app creation
 
 import sqlite3
+import tempfile
 import threading
 import time
 import unittest
@@ -256,23 +257,72 @@ class TestDatabaseBusyTimeout(unittest.TestCase):
         self.assertIn(row[0], ("wal", "memory"))
 
     def test_timeout_on_connect(self):
-        """Database connection should have timeout parameter."""
-        db = Database(":memory:")
-        # Verify the connection works under contention by running concurrent reads
-        results = []
-        def reader():
-            try:
-                row = db.conn.execute("SELECT 1 as v").fetchone()
-                results.append(row[0])
-            except Exception as e:
-                results.append(str(e))
-        threads = [threading.Thread(target=reader) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-        # All reads should succeed
-        self.assertTrue(all(r == 1 for r in results), f"Some reads failed: {results}")
+        """Concurrent connections to one database file must not hit lock errors.
+
+        Each thread opens its OWN connection. That is the shape busy_timeout
+        actually governs: separate connections contending for one file, with
+        the loser waiting rather than raising "database is locked".
+
+        This test previously shared a single sqlite3.Connection across five
+        threads, which tests nothing about busy_timeout and is itself unsafe:
+        a Connection owns one prepared-statement cache, so identical SQL
+        issued concurrently can hand two threads the same statement, and one
+        thread's reset swallows the other's row — fetchone() then returns
+        None. It failed in CI on Python 3.12 for exactly that reason.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contended.db")
+            Database(path)  # create the schema once, up front
+
+            results = []
+            lock = threading.Lock()
+            start = threading.Barrier(6)
+
+            def worker(n):
+                start.wait()
+                try:
+                    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+                    conn.execute("PRAGMA busy_timeout = 30000")
+                    # Writes are what contend; reads alone would never exercise
+                    # the timeout. BEGIN IMMEDIATE takes the write lock up
+                    # front and the sleep holds it long enough that the other
+                    # five threads must genuinely wait. Without busy_timeout
+                    # five of six get "database is locked" here.
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO events "
+                        "(event_id, name, event_date, capacity, status) "
+                        "VALUES (?, 'Contention', '2026-10-01', 1, 'upcoming')",
+                        (f"evt_{n}",),
+                    )
+                    time.sleep(0.05)
+                    conn.commit()
+                    outcome = conn.execute(
+                        "SELECT COUNT(*) FROM events"
+                    ).fetchone()[0]
+                    conn.close()
+                except Exception as e:
+                    outcome = f"{type(e).__name__}: {e}"
+                with lock:
+                    results.append(outcome)
+
+            threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+            self.assertEqual(len(results), 6, "a worker did not finish")
+            failures = [r for r in results if not isinstance(r, int)]
+            self.assertEqual(failures, [], f"contended writes failed: {failures}")
+
+            conn = sqlite3.connect(path)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+                6,
+                "every contending writer's row must survive",
+            )
+            conn.close()
 
 
 class TestMetaSyncBatchWrites(unittest.TestCase):

@@ -5290,8 +5290,38 @@ class CraftDominant:
             at_risk_value = sum(c['total_spent'] for c in at_risk)
             print(f"\n   AT RISK: {len(at_risk)} customers (${at_risk_value:,.2f} historical)")
         print("\n" + "=" * 70)
-def create_app_with_db(auto_sync: bool = True):
-    """Factory function for gunicorn deployment. Auto-syncs on creation."""
+def auto_sync_enabled() -> bool:
+    """Whether application startup should kick off a background Eventbrite sync.
+
+    Single source of truth, shared by every construction path, so the two
+    entry points cannot disagree about whether a sync runs.
+
+    Semantics (unchanged from the previous craft_v2 behaviour):
+
+        unset  -> enabled   keeping data fresh is the safe default for a
+                            read-only analytics rebuild; silently stopping
+                            ingestion is its own hazard
+        "1"    -> enabled
+        "0"    -> disabled
+        other  -> disabled  anything unrecognised falls back to NOT syncing
+                            rather than guessing
+
+    Note this is the opposite default to V2_ENABLE_EXTERNAL_SEND, and
+    deliberately so: an unattended sync is recoverable, an unattended send
+    is not.
+    """
+    return os.environ.get('CRAFT_AUTO_SYNC', '1') == '1'
+
+
+def create_app_with_db(auto_sync: Optional[bool] = None):
+    """Factory for gunicorn deployment.
+
+    Pass auto_sync explicitly to override; otherwise the CRAFT_AUTO_SYNC
+    policy decides. Constructing the app is what may start a sync — importing
+    this module must never do so (see the note at the bottom of this file).
+    """
+    if auto_sync is None:
+        auto_sync = auto_sync_enabled()
     db = Database(os.environ.get('DB_PATH', 'craft_unified.db'))
     return create_app(db, auto_sync=auto_sync)
 def main():
@@ -5359,14 +5389,29 @@ Then:
     else:
         print(f"Unknown command: {cmd}")
 # =============================================================================
-# MODULE-LEVEL APP FOR GUNICORN
+# NO MODULE-LEVEL APP — IMPORTING THIS MODULE MUST HAVE NO SIDE EFFECTS
 # =============================================================================
-# gunicorn craft_unified:app will use this.
-# auto_sync=True starts Eventbrite sync in background immediately.
-# Skip when imported under test to avoid side effects.
-if os.environ.get('TESTING') != '1':
-    app = create_app_with_db(auto_sync=True)
-else:
-    app = None
+# This module previously ended with:
+#
+#     if os.environ.get('TESTING') != '1':
+#         app = create_app_with_db(auto_sync=True)
+#
+# which meant that merely importing craft_unified constructed a Flask app,
+# opened a second SQLite connection, and started a full background Eventbrite
+# sync. craft_v2 imports this module for Database/DecisionEngine/create_app,
+# so production booted TWO apps and ran TWO concurrent syncs against the same
+# database file — every event was fetched twice, doubling Eventbrite API
+# traffic and putting two writers on one SQLite file.
+#
+# The TESTING escape hatch hid this from the test suite but not from
+# production. Nothing imports `craft_unified.app`, and Railway's start command
+# overrides the Procfile with `gunicorn craft_v2:app`, so the module-level app
+# was never actually served — it was pure side effect.
+#
+# Deploying craft_unified directly still works via gunicorn's factory syntax:
+#
+#     gunicorn "craft_unified:create_app_with_db()"
+#
+# Construction — not import — is what decides whether a sync runs.
 if __name__ == "__main__":
     main()
