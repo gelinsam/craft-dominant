@@ -339,19 +339,176 @@ CREATE INDEX IF NOT EXISTS idx_cep_momentum ON customer_event_profiles(buying_mo
 CREATE INDEX IF NOT EXISTS idx_cep_group ON customer_event_profiles(group_size_segment);
 CREATE INDEX IF NOT EXISTS idx_cep_price_sens ON customer_event_profiles(price_sensitivity);
 """
+#: How long a writer waits for the write lock before giving up. A batched
+#: profile phase holds it for ~1.5s, so anything near this ceiling means a code
+#: path leaked an uncommitted write; failing loudly beats hanging the worker
+#: until gunicorn's 120s watchdog kills it.
+WRITE_LOCK_TIMEOUT = float(os.environ.get("CRAFT_WRITE_LOCK_TIMEOUT", "60"))
+
+
+class WriteLockTimeout(RuntimeError):
+    """A writer could not obtain exclusive write access in time."""
+
+
+# Statements that only read. Everything else is treated as a write, so an
+# unrecognised verb fails safe into serialization rather than out of it.
+_READ_ONLY_SQL = re.compile(
+    r"""^(?:\s|--[^\n]*\n|/\*.*?\*/)*      # leading whitespace and comments
+        (SELECT|PRAGMA\s+\w+\s*(?:\(|$|;)|EXPLAIN|VALUES|WITH\b(?!.*\b(?:INSERT|UPDATE|DELETE)\b))""",
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+class _WriteSerializingConnection:
+    """Gives an open write transaction exclusive ownership of the connection.
+
+    A SQLite connection has exactly ONE transaction. Two threads writing
+    through the same connection are therefore in the *same* transaction
+    whether they intend to be or not, and either one's commit commits both.
+    That was harmless while every writer committed its own row immediately;
+    batching a whole profile phase into one transaction made it unsafe:
+
+      * a request thread's unrelated write joined the phase transaction and
+        was discarded when the phase rolled back, and
+      * a request thread's plain ``conn.commit()`` committed the half-built
+        phase, destroying the atomicity the batching exists to provide.
+
+    Both were reproduced against the unguarded implementation.
+
+    Rather than edit the ~60 ``db.conn.execute(...)``/``db.conn.commit()``
+    pairs spread across craft_engine, campaign_adapter, intervention_model,
+    suppression_guard and the SQLite v2_state_repository, this wraps the one
+    object they all reach SQLite through. Coverage is then structural: a new
+    writer added later is serialized without knowing this class exists.
+
+    A thread takes the lock on its first write and holds it until it commits
+    or rolls back — the lifetime of SQLite's own deferred transaction — so an
+    ``execute``/``commit`` pair is indivisible even though the caller never
+    declared it as a unit. The lock is re-entrant per thread, so
+    ``transaction()`` nested inside ``deferred_commit()`` does not deadlock.
+
+    Reads never take the lock. Under WAL a reader is not blocked by a writer,
+    so the dashboard keeps serving during a phase.
+    """
+
+    __slots__ = ("_conn", "_lock", "_local", "_timeout")
+
+    def __init__(self, conn, timeout: float = None):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", threading.RLock())
+        object.__setattr__(self, "_local", threading.local())
+        object.__setattr__(self, "_timeout", WRITE_LOCK_TIMEOUT if timeout is None else timeout)
+
+    # -- write-transaction ownership ---------------------------------------
+    def _holding(self) -> bool:
+        return getattr(self._local, "holding", False)
+
+    def begin_write(self):
+        """Claim exclusive write access, blocking until the holder finishes."""
+        if self._holding():
+            return  # already ours; re-entrant
+        if not self._lock.acquire(timeout=self._timeout):
+            raise WriteLockTimeout(
+                f"waited {self._timeout}s for the analytics write lock; "
+                "another thread is holding an uncommitted write transaction"
+            )
+        self._local.holding = True
+
+    def end_write(self):
+        """Release write access. Called after commit/rollback closes the txn."""
+        if not self._holding():
+            return
+        self._local.holding = False
+        self._lock.release()
+
+    # -- intercepted operations --------------------------------------------
+    def execute(self, sql, *args, **kwargs):
+        if _READ_ONLY_SQL.match(sql or ""):
+            return self._conn.execute(sql, *args, **kwargs)
+        self.begin_write()
+        try:
+            return self._conn.execute(sql, *args, **kwargs)
+        except Exception:
+            # The statement never opened a transaction, so holding the lock
+            # would strand every other writer behind a failure.
+            if not self._conn.in_transaction:
+                self.end_write()
+            raise
+
+    def executemany(self, sql, *args, **kwargs):
+        self.begin_write()
+        try:
+            return self._conn.executemany(sql, *args, **kwargs)
+        except Exception:
+            if not self._conn.in_transaction:
+                self.end_write()
+            raise
+
+    def executescript(self, sql, *args, **kwargs):
+        self.begin_write()
+        try:
+            return self._conn.executescript(sql, *args, **kwargs)
+        finally:
+            # executescript COMMITs any pending transaction itself, so the
+            # transaction it opened is already closed when it returns.
+            if not self._conn.in_transaction:
+                self.end_write()
+
+    def commit(self):
+        self.begin_write()
+        try:
+            return self._conn.commit()
+        finally:
+            self.end_write()
+
+    def rollback(self):
+        self.begin_write()
+        try:
+            return self._conn.rollback()
+        finally:
+            self.end_write()
+
+    # -- everything else passes straight through ---------------------------
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._conn, name, value)
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+
 class Database:
     """Unified database for all Craft data."""
     def __init__(self, path: str = "craft_unified.db"):
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA journal_mode = WAL")
-        self.conn.execute("PRAGMA busy_timeout = 30000")  # 30s retry on lock
-        # When true, row-level writers skip their own commit so a whole phase
-        # can be committed once. Only deferred_commit() sets this.
-        self._defer_commits = False
+        raw = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        raw.row_factory = sqlite3.Row
+        raw.execute("PRAGMA foreign_keys = ON")
+        raw.execute("PRAGMA journal_mode = WAL")
+        raw.execute("PRAGMA busy_timeout = 30000")  # 30s retry on lock
+        # Every module reaches SQLite through this attribute, so wrapping it
+        # is what makes write serialization cover writers this class has never
+        # heard of. See _WriteSerializingConnection.
+        self.conn = _WriteSerializingConnection(raw)
+        # Whether THIS thread is inside a deferred_commit() block. Thread-local
+        # on purpose: a shared flag let one thread's phase suppress another
+        # thread's commit, which is one of the two races this fixes.
+        self._defer_state = threading.local()
         self._init_schema()
+    @property
+    def _defer_commits(self) -> bool:
+        return getattr(self._defer_state, "active", False)
+    @_defer_commits.setter
+    def _defer_commits(self, value: bool):
+        self._defer_state.active = bool(value)
     def _init_schema(self):
         self.conn.executescript(UNIFIED_SCHEMA)
         self.conn.commit()
@@ -382,21 +539,30 @@ class Database:
 
         Re-entrant: nesting yields without taking a second transaction, so the
         outermost block owns the commit.
+
+        Exclusivity: the block claims the connection's write lock up front and
+        holds it until its single commit or rollback. Other threads' writes
+        queue behind it instead of landing inside the phase transaction, which
+        is what makes "one transaction per phase" true rather than aspirational.
+        Readers are unaffected. See _WriteSerializingConnection.
         """
         if self._defer_commits:
             yield self
             return
+        # Claim write ownership before the first statement, so a writer that
+        # is mid-transaction right now is drained before the phase begins.
+        self.conn.begin_write()
         self._defer_commits = True
         try:
             yield self
         except Exception:
             # Undo the whole phase, not just the row that failed.
             self._defer_commits = False
-            self.conn.rollback()
+            self.conn.rollback()  # releases the write lock
             raise
         else:
             self._defer_commits = False
-            self.conn.commit()
+            self.conn.commit()  # releases the write lock
     @contextmanager
     def transaction(self):
         try:
