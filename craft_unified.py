@@ -1,5 +1,6 @@
 import os
 import sys
+import bisect
 import json
 import csv
 import io
@@ -426,9 +427,36 @@ class Database:
             FROM orders o
             JOIN events e ON o.event_id = e.event_id
             WHERE o.email = ?
-            ORDER BY o.order_timestamp DESC
+            ORDER BY o.order_timestamp DESC, o.rowid
         """, (email.lower().strip(),)).fetchall()
         return [dict(r) for r in rows]
+    def get_orders_grouped_by_customer(self) -> Dict[str, List[dict]]:
+        """Every customer's orders in ONE query, keyed by normalized email.
+
+        Bulk equivalent of calling get_orders_for_customer() once per address:
+        same columns, same normalized key, same per-customer ordering. Building
+        profiles one customer at a time issued a query per distinct email —
+        tens of thousands of round trips against a single SQLite connection,
+        which is what pushed the startup sync past gunicorn's worker timeout.
+
+        `rowid` is the tiebreak in both this query and get_orders_for_customer
+        so that orders sharing a timestamp come back in the same order either
+        way. SQLite left that case unspecified before; pinning it costs
+        nothing and makes the two paths provably identical.
+        """
+        rows = self.conn.execute("""
+            SELECT o.*, e.name as event_name, e.event_type, e.city, e.event_date
+            FROM orders o
+            JOIN events e ON o.event_id = e.event_id
+            ORDER BY o.email, o.order_timestamp DESC, o.rowid
+        """).fetchall()
+        grouped: Dict[str, List[dict]] = defaultdict(list)
+        for r in rows:
+            # Mirror get_orders_for_customer's lookup key exactly. Writes have
+            # normalized email since insert_order(), but rows predating that
+            # must still resolve the same way through both paths.
+            grouped[(r['email'] or '').lower().strip()].append(dict(r))
+        return grouped
     def get_all_emails(self) -> List[str]:
         rows = self.conn.execute("SELECT DISTINCT email FROM orders").fetchall()
         return [r['email'] for r in rows]
@@ -1544,13 +1572,26 @@ class EventbriteSync:
             )
             current += timedelta(days=1)
     def _build_all_customers(self) -> int:
-        """Build customer profiles from all orders."""
+        """Build customer profiles from all orders.
+
+        Reads every customer's orders in a single grouped query rather than
+        one query per address. The per-customer loop made this phase scale
+        with customer count badly enough to exceed gunicorn's 120s worker
+        timeout, so the worker was killed mid-build and the whole Eventbrite
+        sync restarted — customers were never written at all.
+
+        Profile output is unchanged: same orders per customer, same order,
+        same quintiles.
+        """
         emails = self.db.get_all_emails()
         count = 0
+        # One query for every customer's orders, keyed the same way
+        # get_orders_for_customer() keys its lookup.
+        orders_by_email = self.db.get_orders_grouped_by_customer()
         # Get global stats for RFM scoring
         all_customers_data = []
         for email in emails:
-            orders = self.db.get_orders_for_customer(email)
+            orders = orders_by_email.get((email or '').lower().strip(), [])
             if orders:
                 total_spent = sum(o.get('gross_amount', 0) for o in orders)
                 last_date = max(o['order_timestamp'] for o in orders)
@@ -1574,7 +1615,14 @@ class EventbriteSync:
                 n = len(sorted_list)
                 if n == 0:
                     return 3
-                idx = sorted_list.index(value) if value in sorted_list else 0
+                # bisect_left on a sorted list returns the index of the first
+                # occurrence — the same answer list.index() gave, without the
+                # linear scan. Called three times per customer against lists
+                # as long as the customer base, the old form made this phase
+                # quadratic; it dominated even the per-customer queries.
+                idx = bisect.bisect_left(sorted_list, value)
+                if idx == n or sorted_list[idx] != value:
+                    idx = 0  # preserves the old `else 0` for absent values
                 pct = idx / n
                 if reverse:
                     pct = 1 - pct
@@ -1668,6 +1716,33 @@ class EventbriteSync:
             elif pct >= 0.4: return 3
             elif pct >= 0.2: return 2
             return 1
+        # Cross-event affinity needs, per profile, the distinct event types a
+        # customer bought in a city and the distinct event types that city
+        # offers. Both were queried inside the loop below — two statements per
+        # profile, and the first matched on LOWER(o.email), which no index can
+        # serve, so every profile provoked a full scan of orders joined to
+        # events. Precomputing both in one pass makes the loop pure Python.
+        #
+        # Deliberately unfiltered: unlike the query that builds `rows` above,
+        # the originals did not exclude null or empty event_type, and a null
+        # counts as a distinct type in the denominator. Lowercasing stays in
+        # SQL so the key matches LOWER() exactly rather than approximately.
+        types_by_customer_city = defaultdict(set)
+        types_by_city = defaultdict(set)
+        lower_email_of = {}
+        for r in self.db.conn.execute("""
+            SELECT o.email AS raw_email, LOWER(o.email) AS lower_email,
+                   e.city AS city, e.event_type AS event_type
+            FROM orders o
+            JOIN events e ON o.event_id = e.event_id
+        """).fetchall():
+            lower_email_of[r['raw_email']] = r['lower_email']
+            types_by_customer_city[(r['lower_email'], r['city'])].add(r['event_type'])
+        for r in self.db.conn.execute(
+            "SELECT city, event_type FROM events"
+        ).fetchall():
+            types_by_city[r['city']].add(r['event_type'])
+
         # Build quintile lookup
         quintile_map = {}
         for s in scope_stats:
@@ -1753,14 +1828,10 @@ class EventbriteSync:
             # 3. Cross-event affinity: distinct event types in this city
             cross_event_affinity = 0.0
             if etype and city:
-                customer_events = self.db.conn.execute("""
-                    SELECT DISTINCT e.event_type FROM orders o
-                    JOIN events e ON o.event_id = e.event_id
-                    WHERE LOWER(o.email) = LOWER(?) AND e.city = ?
-                """, (email, city)).fetchall()
-                event_types_in_city = self.db.conn.execute("""
-                    SELECT DISTINCT event_type FROM events WHERE city = ?
-                """, (city,)).fetchall()
+                customer_events = types_by_customer_city.get(
+                    (lower_email_of.get(email, email.lower()), city), ()
+                )
+                event_types_in_city = types_by_city.get(city, ())
                 if event_types_in_city:
                     cross_event_affinity = len(customer_events) / len(event_types_in_city)
 
