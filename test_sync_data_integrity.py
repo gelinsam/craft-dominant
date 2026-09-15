@@ -1,0 +1,384 @@
+"""A sync must never overwrite a known value with one it did not observe.
+
+Production incident: the dashboard showed Philly Coffee Saturday at 251 tickets
+and Austin Coffee Saturday at 316, against Eventbrite's 379 and 462. Revenue was
+untouched, which is what made it invisible -- $16,390 over 316 tickets implies
+$51.87 a ticket for a festival whose own history runs $30.71-$40.29.
+
+The cause was one line:
+
+    ticket_count = len(attendees) if attendees else 1
+
+`attendees` only exists because of `expand=attendees`. When that expansion came
+back empty, the count silently became 1, and `INSERT OR REPLACE` wrote it over a
+correct multi-ticket order. The real value was gone, replaced by a plausible one.
+
+That is a CLASS of defect, not one line. Every field these parsers derive from an
+optional part of the payload can degrade the same way, and every one of them is
+written through a blind REPLACE:
+
+  orders  ticket_count, gross_amount, net_amount, ticket_type, promo_code,
+          order_timestamp/days_before_event (fabricated from now() on a parse error)
+  events  capacity, city, meta_campaign_id
+
+net_amount and meta_campaign_id are worse: the parsers never return them at all,
+so every sync wrote 0 and NULL over whatever was stored.
+
+The invariant these tests hold to: an unobserved field is UNKNOWN, never a
+default, and a write merges rather than replaces. A genuinely observed change
+(a refund taking 4 tickets to 2) must still be written.
+"""
+
+import datetime
+import os
+import sys
+import tempfile
+import unittest
+
+os.environ.setdefault("CRAFT_AUTO_SYNC", "0")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from craft_unified import Database, EventbriteSync  # noqa: E402
+
+
+EVENT_DATE = datetime.datetime(2026, 10, 17, 9, 0, 0)
+
+
+def _order_payload(order_id="ORD1", n_attendees=4, with_costs=True,
+                   with_attendees=True, promo="SAVE10"):
+    data = {
+        "id": order_id,
+        "created": "2026-09-01T10:00:00Z",
+        "email": "Buyer@Example.com",
+        "promo_code": promo,
+    }
+    if with_costs:
+        data["costs"] = {"gross": {"major_value": "140.00"},
+                         "net": {"major_value": "126.00"}}
+    if with_attendees:
+        data["attendees"] = [
+            {"profile": {"email": "buyer@example.com"},
+             "ticket_class_name": "General Admission"}
+            for _ in range(n_attendees)
+        ]
+    return data
+
+
+def _event_payload(event_id="E1", capacity=2000, with_venue=True):
+    data = {
+        "id": event_id,
+        "name": {"text": "Austin Coffee Festival"},
+        "start": {"local": "2026-10-17T09:00:00"},
+    }
+    if capacity is not None:
+        data["capacity"] = capacity
+    if with_venue:
+        data["venue"] = {"address": {"city": "Austin"}}
+    return data
+
+
+class _Fixture(unittest.TestCase):
+    def setUp(self):
+        self.db = Database(os.path.join(tempfile.mkdtemp(), "integrity.db"))
+        self.sync = EventbriteSync("", self.db)
+        self.db.upsert_event({
+            "event_id": "E1", "name": "Austin Coffee Festival",
+            "event_type": "coffee", "city": "Austin",
+            "event_date": EVENT_DATE.isoformat(), "capacity": 2000,
+            "status": "upcoming",
+        })
+
+    def _store(self, payload):
+        order = self.sync._parse_order(payload, "E1", EVENT_DATE)
+        if order:
+            self.db.insert_order(order)
+        return order
+
+    def _row(self, order_id="ORD1"):
+        r = self.db.conn.execute(
+            "SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        return dict(r) if r else None
+
+    def _event(self, event_id="E1"):
+        return self.db.get_event(event_id)
+
+
+# ---------------------------------------------------------------------------
+# The proven production corruption
+# ---------------------------------------------------------------------------
+class TestTicketCountSurvivesMissingExpansion(_Fixture):
+
+    def test_a_good_order_stores_its_real_count(self):
+        self._store(_order_payload(n_attendees=4))
+        self.assertEqual(self._row()["ticket_count"], 4)
+
+    def test_missing_expansion_does_not_overwrite_with_one(self):
+        """THE incident. Old code wrote 1 over 4."""
+        self._store(_order_payload(n_attendees=4))
+        self._store(_order_payload(with_attendees=False))
+        self.assertEqual(self._row()["ticket_count"], 4)
+
+    def test_a_real_refund_is_still_written(self):
+        """Observed decreases must apply -- this is not a ratchet."""
+        self._store(_order_payload(n_attendees=4))
+        self._store(_order_payload(n_attendees=2))
+        self.assertEqual(self._row()["ticket_count"], 2)
+
+    def test_unknown_count_is_not_invented_on_first_sight(self):
+        """A brand-new order with no expansion must not claim to know 1."""
+        order = self.sync._parse_order(
+            _order_payload(order_id="NEW", with_attendees=False), "E1", EVENT_DATE)
+        self.assertIsNone(order["ticket_count"])
+
+    def test_repeated_bad_syncs_cannot_erode_the_value(self):
+        self._store(_order_payload(n_attendees=6))
+        for _ in range(5):
+            self._store(_order_payload(with_attendees=False))
+        self.assertEqual(self._row()["ticket_count"], 6)
+
+
+# ---------------------------------------------------------------------------
+# Same class: money
+# ---------------------------------------------------------------------------
+class TestAmountsSurviveMissingCosts(_Fixture):
+
+    def test_gross_is_stored(self):
+        self._store(_order_payload())
+        self.assertAlmostEqual(self._row()["gross_amount"], 140.0, places=2)
+
+    def test_missing_costs_does_not_zero_revenue(self):
+        """Revenue survived the real incident by luck, not by design."""
+        self._store(_order_payload())
+        self._store(_order_payload(with_costs=False))
+        self.assertAlmostEqual(self._row()["gross_amount"], 140.0, places=2)
+
+    def test_net_amount_is_actually_parsed(self):
+        """It was never returned, so every sync wrote 0 over it."""
+        self._store(_order_payload())
+        self.assertAlmostEqual(self._row()["net_amount"], 126.0, places=2)
+
+    def test_net_amount_is_not_zeroed_by_a_later_partial_sync(self):
+        self._store(_order_payload())
+        self._store(_order_payload(with_costs=False))
+        self.assertAlmostEqual(self._row()["net_amount"], 126.0, places=2)
+
+    def test_a_real_price_change_is_written(self):
+        self._store(_order_payload())
+        p = _order_payload()
+        p["costs"]["gross"]["major_value"] = "70.00"
+        self._store(p)
+        self.assertAlmostEqual(self._row()["gross_amount"], 70.0, places=2)
+
+
+# ---------------------------------------------------------------------------
+# Same class: descriptive fields
+# ---------------------------------------------------------------------------
+class TestDescriptiveFieldsSurvive(_Fixture):
+
+    def test_ticket_type_not_erased(self):
+        self._store(_order_payload())
+        self.assertEqual(self._row()["ticket_type"], "General Admission")
+        self._store(_order_payload(with_attendees=False))
+        self.assertEqual(self._row()["ticket_type"], "General Admission")
+
+    def test_promo_code_not_erased(self):
+        self._store(_order_payload())
+        self._store(_order_payload(promo=None))
+        self.assertEqual(self._row()["promo_code"], "SAVE10")
+
+    def test_order_timestamp_is_never_fabricated_from_now(self):
+        """An unparseable date used to store datetime.now(), moving the sale."""
+        bad = _order_payload()
+        bad["created"] = "not-a-date"
+        order = self.sync._parse_order(bad, "E1", EVENT_DATE)
+        if order is not None:
+            today = datetime.date.today().isoformat()
+            self.assertFalse(str(order.get("order_timestamp", "")).startswith(today))
+
+    def test_a_bad_date_does_not_move_an_existing_sale(self):
+        self._store(_order_payload())
+        before = self._row()["order_timestamp"]
+        bad = _order_payload()
+        bad["created"] = "not-a-date"
+        self._store(bad)
+        self.assertEqual(self._row()["order_timestamp"], before)
+
+
+# ---------------------------------------------------------------------------
+# Same class: events
+# ---------------------------------------------------------------------------
+class TestEventFieldsSurvive(_Fixture):
+
+    def _store_event(self, payload):
+        ev = self.sync._parse_event(payload)
+        if ev:
+            ev["status"] = "upcoming"
+            self.db.upsert_event(ev)
+        return ev
+
+    def test_capacity_not_zeroed_by_a_partial_payload(self):
+        self._store_event(_event_payload(capacity=2000))
+        self.assertEqual(self._event()["capacity"], 2000)
+        self._store_event(_event_payload(capacity=None))
+        self.assertEqual(self._event()["capacity"], 2000)
+
+    def test_city_not_erased_when_venue_missing(self):
+        self._store_event(_event_payload())
+        self.assertEqual(self._event()["city"], "Austin")
+        self._store_event(_event_payload(with_venue=False))
+        self.assertEqual(self._event()["city"], "Austin")
+
+    def test_meta_campaign_id_not_nulled_every_sync(self):
+        """_parse_event never returned it, so upsert wrote NULL each time."""
+        self.db.conn.execute(
+            "UPDATE events SET meta_campaign_id = ? WHERE event_id = ?",
+            ("camp-123", "E1"))
+        self.db.conn.commit()
+        self._store_event(_event_payload())
+        self.assertEqual(self._event()["meta_campaign_id"], "camp-123")
+
+    def test_a_real_capacity_change_is_written(self):
+        self._store_event(_event_payload(capacity=2000))
+        self._store_event(_event_payload(capacity=2500))
+        self.assertEqual(self._event()["capacity"], 2500)
+
+
+# ---------------------------------------------------------------------------
+# Production shape: the exact Austin/Philly numbers
+# ---------------------------------------------------------------------------
+class TestProductionShapeReconstruction(_Fixture):
+    """462 Saturday tickets must not become 316 because an expansion blinked."""
+
+    ORDERS = [(f"A{i}", 3) for i in range(100)] + [(f"B{i}", 2) for i in range(81)]
+
+    def _seed(self):
+        for oid, n in self.ORDERS:
+            self._store(_order_payload(order_id=oid, n_attendees=n))
+
+    def _total(self):
+        return self.db.get_event_tickets("E1")
+
+    def test_baseline(self):
+        self._seed()
+        self.assertEqual(self._total(), 100 * 3 + 81 * 2)  # 462
+
+    def test_a_flaky_resync_does_not_collapse_the_total(self):
+        self._seed()
+        before = self._total()
+        # Two thirds of the orders come back without their expansion.
+        for oid, _ in self.ORDERS[: int(len(self.ORDERS) * 0.66)]:
+            self._store(_order_payload(order_id=oid, with_attendees=False))
+        self.assertEqual(self._total(), before)
+
+    def test_implied_price_per_ticket_stays_sane(self):
+        """The detector that caught this: revenue/tickets leaving its band."""
+        self._seed()
+        for oid, _ in self.ORDERS:
+            self._store(_order_payload(order_id=oid, with_attendees=False))
+        revenue = self.db.get_event_revenue("E1")
+        ppt = revenue / self._total()
+        self.assertLess(ppt, 60.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The detector: a sync that loses tickets must say so
+# ---------------------------------------------------------------------------
+class TestTicketLossDetector(_Fixture):
+    """Defence in depth. The merge above prevents this class of loss; this
+    catches any future write path that finds a new way to do it."""
+
+    def test_the_real_incident_would_have_been_caught(self):
+        """Austin 483 -> 316 is a 34.6% drop on 483 stored tickets."""
+        found = Database.ticket_total_regressions({"E1": 483}, {"E1": 316})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["lost"], 167)
+        self.assertAlmostEqual(found[0]["pct"], 34.6, places=1)
+
+    def test_philly_too(self):
+        found = Database.ticket_total_regressions({"E1": 381}, {"E1": 251})
+        self.assertEqual(found[0]["lost"], 130)
+
+    def test_growth_is_not_flagged(self):
+        self.assertEqual(Database.ticket_total_regressions({"E1": 300}, {"E1": 340}), [])
+
+    def test_unchanged_is_not_flagged(self):
+        self.assertEqual(Database.ticket_total_regressions({"E1": 300}, {"E1": 300}), [])
+
+    def test_a_small_refund_is_not_flagged(self):
+        """Two tickets off 500 is business, not corruption."""
+        self.assertEqual(Database.ticket_total_regressions({"E1": 500}, {"E1": 498}), [])
+
+    def test_an_event_vanishing_entirely_is_flagged(self):
+        found = Database.ticket_total_regressions({"E1": 400}, {})
+        self.assertEqual(found[0]["after"], 0)
+        self.assertEqual(found[0]["pct"], 100.0)
+
+    def test_worst_offender_is_reported_first(self):
+        found = Database.ticket_total_regressions(
+            {"A": 100, "B": 900, "C": 200}, {"A": 50, "B": 300, "C": 100})
+        # B lost 600, C lost 100, A lost 50.
+        self.assertEqual([r["event_id"] for r in found], ["B", "C", "A"])
+
+    def test_probe_reads_live_totals(self):
+        self._store(_order_payload(order_id="X1", n_attendees=5))
+        self.assertEqual(self.db.event_ticket_totals().get("E1"), 5)
+
+    def test_unknown_counts_are_countable(self):
+        self.assertEqual(self.db.unknown_ticket_count_orders(), 0)
+        self._store(_order_payload(order_id="X2", with_attendees=False))
+        self.assertEqual(self.db.unknown_ticket_count_orders(), 1)
+
+    def test_an_unknown_count_is_not_silently_a_one(self):
+        """The whole point: absence is recorded as absence."""
+        self._store(_order_payload(order_id="X3", with_attendees=False))
+        row = self._row("X3")
+        self.assertIsNone(row["ticket_count"])
+
+
+# ---------------------------------------------------------------------------
+# Durable sync state: an interrupted sync must remain visible after restart
+# ---------------------------------------------------------------------------
+class TestSyncRunVisibility(_Fixture):
+    """The in-memory flag died with the container, so after the deploy that
+    killed a 74-minute traversal, /api/sync-status reported nothing had run."""
+
+    def test_a_running_sync_is_recorded(self):
+        run_id = self.db.start_sync_run("eventbrite")
+        self.assertEqual(len(self.db.interrupted_sync_runs()), 1)
+        self.db.finish_sync_run(run_id, "completed")
+        self.assertEqual(self.db.interrupted_sync_runs(), [])
+
+    def test_a_killed_sync_survives_the_restart(self):
+        self.db.start_sync_run("eventbrite")
+        reopened = Database(self.db.path)  # a new process, same volume
+        self.assertEqual(len(reopened.interrupted_sync_runs()), 1)
+
+    def test_startup_marks_orphans_interrupted(self):
+        self.db.start_sync_run("eventbrite")
+        self.assertEqual(self.db.mark_orphaned_sync_runs(), 1)
+        self.assertEqual(self.db.interrupted_sync_runs(), [])
+        self.assertEqual(self.db.last_sync_run("eventbrite")["status"], "interrupted")
+
+    def test_a_clean_run_is_not_marked_interrupted(self):
+        run_id = self.db.start_sync_run("eventbrite")
+        self.db.finish_sync_run(run_id, "completed")
+        self.assertEqual(self.db.mark_orphaned_sync_runs(), 0)
+        self.assertEqual(self.db.last_sync_run("eventbrite")["status"], "completed")
+
+    def test_failures_are_recorded_with_detail(self):
+        run_id = self.db.start_sync_run("eventbrite")
+        self.db.finish_sync_run(run_id, "failed", "API error 500")
+        last = self.db.last_sync_run("eventbrite")
+        self.assertEqual(last["status"], "failed")
+        self.assertIn("500", last["detail"])
+
+    def test_last_run_is_the_most_recent(self):
+        first = self.db.start_sync_run("eventbrite")
+        self.db.finish_sync_run(first, "completed")
+        second = self.db.start_sync_run("eventbrite")
+        self.db.finish_sync_run(second, "failed", "boom")
+        self.assertEqual(self.db.last_sync_run("eventbrite")["status"], "failed")
