@@ -1999,7 +1999,14 @@ class EventbriteSync:
                         results['orders'] += 1
                 # Build snapshots for completed events
                 if event['status'] == 'completed':
-                    self._build_snapshots(event['event_id'], event_date.date(), event['capacity'])
+                    # Read the MERGED row back. `event` is parse output, which
+                    # deliberately carries None for anything this response did
+                    # not observe; downstream consumers expect real values.
+                    # Passing the parse dict straight through made an
+                    # unobserved capacity blow up _build_snapshots.
+                    stored = self.db.get_event(event['event_id']) or event
+                    self._build_snapshots(event['event_id'], event_date.date(),
+                                          stored.get('capacity') or 0)
             except Exception as e:
                 results['errors'].append(str(e))
                 log.error(f"  Error: {e}")
@@ -2088,6 +2095,36 @@ class EventbriteSync:
             'capacity': capacity or None,
             'platform': 'eventbrite'
         }
+    # Eventbrite marks a withdrawn attendee rather than removing it, so the
+    # attendees array still contains refunded and cancelled people. Counting
+    # the raw length treats every refund as a ticket still sold, which
+    # overstates tickets, revenue, sell-through and pacing, and understates
+    # CAC. Nothing in this codebase looked at these flags.
+    _DEAD_ATTENDEE_STATUSES = {'deleted', 'refunded', 'cancelled', 'canceled',
+                               'not attending', 'abandoned'}
+
+    @classmethod
+    def _live_attendees(cls, attendees: List[dict]) -> List[dict]:
+        """Attendees that represent a ticket actually held.
+
+        Conservative by design: an attendee is dropped only when Eventbrite
+        SAYS it is refunded, cancelled or deleted. A payload that omits these
+        fields entirely (older records, or an expansion that returns a thin
+        shape) keeps every attendee, so a missing flag can never silently
+        delete tickets the way a missing expansion once silently created them.
+        """
+        live = []
+        for a in attendees or []:
+            if not isinstance(a, dict):
+                continue
+            if a.get('cancelled') or a.get('refunded'):
+                continue
+            status = str(a.get('status') or '').strip().lower()
+            if status in cls._DEAD_ATTENDEE_STATUSES:
+                continue
+            live.append(a)
+        return live
+
     def _parse_order(self, data: dict, event_id: str, event_date: datetime) -> Optional[dict]:
         order_id = data.get('id')
         created = data.get('created', '')
@@ -2120,16 +2157,17 @@ class EventbriteSync:
         gross = (costs.get('gross') or {}).get('major_value')
         net = (costs.get('net') or {}).get('major_value')
         attendees = data.get('attendees') or []
+        live = self._live_attendees(attendees)
 
         return {
             'order_id': order_id,
             'event_id': event_id,
             'email': email,
             'order_timestamp': order_date.isoformat(),
-            'ticket_count': len(attendees) if attendees else None,
+            'ticket_count': len(live) if attendees else None,
             'gross_amount': float(gross) if gross is not None else None,
             'net_amount': float(net) if net is not None else None,
-            'ticket_type': attendees[0].get('ticket_class_name') if attendees else None,
+            'ticket_type': (live or attendees)[0].get('ticket_class_name') if attendees else None,
             'promo_code': data.get('promo_code'),
             'days_before_event': days_before,
         }
