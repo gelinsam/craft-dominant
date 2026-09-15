@@ -123,7 +123,11 @@ class DiagnosisEngine:
         historical_velocity = self._compute_historical_velocity(event_id, event, days_until)
 
         # ── Meta spend ──────────────────────────────────────────────────
-        meta_data_status = self._check_meta_data_status(event_id)
+        # Status resolved at the same edition scope as the spend below it.
+        # A raw session of a multi-day festival holds no ad_spend rows of its
+        # own unless it happens to be the canonical row, so per-event status
+        # would report no_records beside non-zero edition spend.
+        meta_data_status = self._check_meta_data_status_for_ids([event_id])
         meta_total, meta_7d_spend, meta_7d_impressions, meta_7d_clicks = self._get_meta_spend(event_id)
         blended_ad_spend_per_ticket = self._compute_blended_ad_spend_per_ticket(event_id, meta_total)
 
@@ -242,8 +246,14 @@ class DiagnosisEngine:
         meta_total, meta_7d_spend, meta_7d_impressions, meta_7d_clicks = (
             self._get_meta_spend_for_ids(constituent_ids)
         )
+        # Edition spend over EDITION tickets. `tickets_sold` here is this day
+        # group's own count, so using it would divide festival-wide spend by one
+        # day's buyers. Seeded from a constituent so the edition resolves the
+        # same way for Saturday and Sunday.
         blended_ad_spend_per_ticket = (
-            (meta_total / tickets_sold) if tickets_sold > 0 and meta_total > 0 else 0.0
+            self._compute_blended_ad_spend_per_ticket(constituent_ids[0], meta_total)
+            if constituent_ids
+            else ((meta_total / tickets_sold) if tickets_sold > 0 and meta_total > 0 else 0.0)
         )
 
         # ── CRM audience (using constituent IDs for buyer exclusion) ───
@@ -458,15 +468,30 @@ class DiagnosisEngine:
             return "unavailable"
 
     def _compute_blended_ad_spend_per_ticket(self, event_id: str, total_spend: float) -> float:
-        """Blended ad spend per ticket: total ad spend / all tickets sold.
+        """Festival-edition Meta spend / ALL tickets sold across that edition.
 
-        Note: this divides total Meta spend by ALL tickets (including organic).
-        It is NOT a true CAC — it's a blended cost metric.
+        Both sides must describe the same business scope. `total_spend` is
+        edition-level (Meta advertises the festival; buyers then choose a day
+        or session), so the denominator is edition-level too. Dividing festival
+        spend by one day's tickets overstated the metric for every constituent
+        day and fed a recommendation-driving root cause.
+
+        This is NOT true attributable CAC: the denominator includes organically
+        acquired tickets. It is a blended cost-per-ticket at festival scope.
+
+        Falls back to raw-event tickets only for a store that predates the
+        edition readers. A missing helper must never become $0 — a false zero
+        here is indistinguishable from "advertising was free".
         """
         if total_spend <= 0:
             return 0.0
         try:
-            tickets = self.db.get_event_tickets(event_id)
+            tickets = 0
+            edition_tickets = getattr(self.db, "get_edition_tickets", None)
+            if edition_tickets is not None:
+                tickets = edition_tickets(event_id)
+            if not tickets:
+                tickets = self.db.get_event_tickets(event_id)
             return total_spend / tickets if tickets > 0 else 0.0
         except Exception as e:
             log.warning(f"Blended ad spend computation failed for {event_id}: {e}")
@@ -842,11 +867,51 @@ class DiagnosisEngine:
                 found = True
         return total_velocity if found else None
 
-    def _check_meta_data_status_for_ids(self, event_ids: List[str]) -> str:
-        """Check Meta ad spend data freshness across constituent event IDs.
+    def _unique_edition_seeds(self, event_ids: List[str]) -> List[str]:
+        """One representative id per DISTINCT festival edition in `event_ids`.
 
-        Returns the best status found (most informative), preferring
-        'current_has_spend' > 'current_zero_spend' > 'stale' > 'no_records' > 'unavailable'.
+        Meta buys advertising for a festival edition, and PR #13 made the spend
+        readers resolve that edition from ANY of its rows. So a helper that
+        loops constituents and calls an edition-scoped reader for each one adds
+        the same festival's spend once per session: a 3-session Saturday
+        reported 3x. Collapsing to one seed per edition first keeps a festival
+        read exactly once, while two genuinely different editions in the same
+        list still contribute separately.
+
+        Identity comes from `edition_sibling_ids`, the same authority the spend
+        readers and the portfolio total use — never from a display name.
+        """
+        resolver = getattr(self.db, "edition_sibling_ids", None)
+        seeds: List[str] = []
+        seen = set()
+        for eid in event_ids:
+            if not eid:
+                continue
+            key = (eid,)
+            if resolver is not None:
+                try:
+                    siblings = resolver(eid)
+                    if siblings:
+                        key = tuple(sorted(set(siblings)))
+                except Exception:
+                    # A resolver failure must not silently merge editions.
+                    key = (eid,)
+            if key in seen:
+                continue
+            seen.add(key)
+            seeds.append(eid)
+        return seeds
+
+    def _check_meta_data_status_for_ids(self, event_ids: List[str]) -> str:
+        """Meta freshness for the festival edition(s) these ids belong to.
+
+        Scope matters as much as it does for spend. `_check_meta_data_status`
+        queries `ad_spend WHERE event_id = ?`, and spend is stored once on one
+        canonical raw row per edition. A day group that does not contain that
+        row therefore had every constituent answer 'no_records' — so Sunday
+        could report "no paid advertising data" while the spend reader resolved
+        real festival spend for that same day. Resolving status per edition
+        keeps the two answers consistent.
         """
         if not event_ids:
             return "unavailable"
@@ -857,10 +922,18 @@ class DiagnosisEngine:
             "no_records": 2,
             "unavailable": 1,
         }
+        edition_status = getattr(self.db, "get_edition_spend_status", None)
         best_status = "unavailable"
         best_priority = 0
-        for eid in event_ids:
-            s = self._check_meta_data_status(eid)
+        for eid in self._unique_edition_seeds(event_ids):
+            if edition_status is not None:
+                try:
+                    s = edition_status(eid)
+                except Exception:
+                    s = self._check_meta_data_status(eid)
+            else:
+                # Store predating edition reads: per-event scope is all there is.
+                s = self._check_meta_data_status(eid)
             p = status_priority.get(s, 0)
             if p > best_priority:
                 best_status = s
@@ -870,12 +943,22 @@ class DiagnosisEngine:
     def _get_meta_spend_for_ids(
         self, event_ids: List[str]
     ) -> Tuple[float, float, int, int]:
-        """Aggregate Meta spend across constituent event IDs."""
+        """Meta spend for the festival edition(s) these constituent ids belong to.
+
+        `_get_meta_spend` returns EDITION-level figures (PR #13), so this must
+        not add one response per constituent session — that multiplied a
+        festival's spend by its session count and produced Austin at $26,196.54
+        against $8,732.18 actually stored, inflating blended spend per ticket
+        into a false "spend per ticket is high" root cause.
+
+        Each distinct edition is read exactly once; two different editions in
+        one list still add up.
+        """
         total = 0.0
         spend_7d = 0.0
         impressions_7d = 0
         clicks_7d = 0
-        for eid in event_ids:
+        for eid in self._unique_edition_seeds(event_ids):
             t, s7, i7, c7 = self._get_meta_spend(eid)
             total += t
             spend_7d += s7
