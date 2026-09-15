@@ -3386,6 +3386,95 @@ class DecisionEngine:
 # =============================================================================
 # FLASK API
 # =============================================================================
+class ProfileRebuildBusy(RuntimeError):
+    """A profile rebuild could not start; `reason` says which writer holds it."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _ProfileRebuildControl:
+    """Runs the two profile-build phases over already-persisted SQLite rows.
+
+    TEMPORARY VALIDATION SURFACE. This exists to measure, against the real
+    mounted volume, the profile-write batching introduced in PR #11 — without
+    a 70-minute Eventbrite traversal and without the post-sync Meta behaviour
+    restored in PR #10. It is deliberately narrow: one operation, no options,
+    no scheduling. Decide whether it earns a permanent place before widening
+    it into anything resembling a maintenance framework.
+
+    It reuses EventbriteSync._build_all_customers() rather than reimplementing
+    the phases, so what gets measured is exactly what production runs.
+    EventbriteSync.__init__ only builds a requests.Session; it issues no call.
+    Neither _build_all_customers nor _build_event_profiles reaches _get,
+    _paginate or self.session — test_profile_rebuild_endpoint.py proves that
+    structurally by walking the call graph, and behaviourally by making every
+    outbound HTTP call raise during the run.
+
+    Both phases are pure upserts keyed by email and (email, event_type, city);
+    neither deletes. Re-running over unchanged orders is therefore idempotent.
+    """
+
+    def __init__(self, claim, release, db):
+        self._claim = claim
+        self._release = release
+        self._db = db
+
+    def run(self) -> dict:
+        """Rebuild both profile tables. Raises ProfileRebuildBusy if blocked."""
+        reason = self._claim()
+        if reason:
+            raise ProfileRebuildBusy(reason)
+        try:
+            import time as _time
+            orders_before = self._db.conn.execute(
+                "SELECT COUNT(*) FROM orders").fetchone()[0]
+            events_before = self._db.conn.execute(
+                "SELECT COUNT(*) FROM events").fetchone()[0]
+
+            # api_key is only stored on the instance; nothing in this path
+            # reads it. Passing '' keeps the credential out of the rebuild.
+            sync = EventbriteSync('', self._db)
+
+            # _build_all_customers() calls _build_event_profiles() as its last
+            # step, so time the inner phase by wrapping it on this instance
+            # only. Production code is untouched.
+            phase2 = {}
+            inner = sync._build_event_profiles
+
+            def _timed_event_profiles():
+                started = _time.perf_counter()
+                try:
+                    return inner()
+                finally:
+                    phase2['elapsed'] = _time.perf_counter() - started
+
+            sync._build_event_profiles = _timed_event_profiles
+
+            started = _time.perf_counter()
+            customers_built = sync._build_all_customers()
+            total = _time.perf_counter() - started
+
+            event_profiles = self._db.conn.execute(
+                "SELECT COUNT(*) FROM customer_event_profiles").fetchone()[0]
+            event_elapsed = phase2.get('elapsed')
+            return {
+                'status': 'ok',
+                'elapsed_seconds_total': round(total, 3),
+                'elapsed_seconds_global_profiles': (
+                    round(total - event_elapsed, 3) if event_elapsed is not None else None),
+                'elapsed_seconds_event_profiles': (
+                    round(event_elapsed, 3) if event_elapsed is not None else None),
+                'customers_built': customers_built,
+                'customer_event_profiles_built': event_profiles,
+                'orders_source_count': orders_before,
+                'events_source_count': events_before,
+            }
+        finally:
+            self._release()
+
+
 def create_app(db: Database, auto_sync: bool = False) -> Flask:
     """Create Flask app with all endpoints."""
     import threading
@@ -3396,6 +3485,12 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
     _meta_sync_lock = threading.Lock()  # Serialize Meta sync writers
     _meta_sync_running = False  # Single-flight guard for Meta sync
+    # Admission control shared by the Eventbrite full sync and the profile-only
+    # rebuild. Both run the SAME two profile phases (sync_all() calls
+    # _build_all_customers()), so they must not overlap — see
+    # _ProfileRebuildControl.
+    _profile_admission_lock = threading.Lock()
+    _profile_rebuild_running = False
     _portfolio_cache = {'analyses': None, 'ts': 0}  # Cache portfolio analysis for 60s
     def _get_portfolio():
         """Get cached portfolio analysis (avoids re-analyzing on every targeting request)."""
@@ -3475,13 +3570,74 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         finally:
             _sync_state['done'] = True
             _sync_state['running'] = False
+    # ── Admission control: full sync vs profile-only rebuild ──────────────
+    #
+    # sync_all() calls _build_all_customers(), which calls
+    # _build_event_profiles(). The profile-only rebuild endpoint runs those
+    # exact same two phases. The connection write guard added in PR #11 makes
+    # an overlap *safe* — neither can corrupt the other or commit the other's
+    # transaction — but it does not make it *correct*:
+    #
+    #   * A full sync writes `orders` incrementally during traversal and only
+    #     builds profiles at the end. A rebuild starting mid-traversal derives
+    #     profiles from a partially-populated orders table.
+    #   * The rebuild exists to measure the profile phases. A run that spends
+    #     most of its time blocked on the sync's write lock, over a moving
+    #     dataset, measures nothing.
+    #
+    # So the two refuse each other rather than queueing. Exclusion has to be
+    # mutual: a one-directional check races, because both sides would test a
+    # flag the other had not yet set.
+    def _claim_profile_rebuild():
+        """Reserve the profile phases, or return why that isn't possible."""
+        nonlocal _profile_rebuild_running
+        with _profile_admission_lock:
+            if _sync_state['running']:
+                return 'eventbrite_sync_running'
+            if _profile_rebuild_running:
+                return 'profile_rebuild_running'
+            _profile_rebuild_running = True
+            return None
+
+    def _release_profile_rebuild():
+        nonlocal _profile_rebuild_running
+        with _profile_admission_lock:
+            _profile_rebuild_running = False
+
+    def _claim_full_sync():
+        """Reserve a full Eventbrite sync, or return why that isn't possible.
+
+        Marks _sync_state['running'] here rather than waiting for the worker
+        thread to do it. _do_background_sync() still sets it on entry, so this
+        changes no semantics — it only closes the window in which a rebuild
+        could look at the flag and see False for an already-admitted sync.
+        """
+        with _profile_admission_lock:
+            if _sync_state['running']:
+                return 'already_running'
+            if _profile_rebuild_running:
+                return 'profile_rebuild_running'
+            _sync_state['done'] = False
+            _sync_state['result'] = None
+            _sync_state['error'] = None
+            _sync_state['running'] = True
+            return None
+
+    app.profile_rebuild_control = _ProfileRebuildControl(
+        claim=_claim_profile_rebuild,
+        release=_release_profile_rebuild,
+        db=db,
+    )
+
     def _schedule_recurring_sync():
         """Recurring sync every 6 hours (or custom interval from env)."""
         import time
         SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_HOURS', 6)) * 3600
         while True:
             time.sleep(SYNC_INTERVAL)
-            if not _sync_state['running']:
+            # Same admission gate as /api/sync, so a scheduled sync cannot
+            # start on top of an in-flight profile rebuild.
+            if _claim_full_sync() is None:
                 log.info(f"Scheduled sync triggered (every {SYNC_INTERVAL//3600}h)")
                 threading.Thread(target=_do_background_sync, daemon=True).start()
 
@@ -3646,16 +3802,22 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     @app.route('/api/sync')
     def sync_endpoint():
         """Trigger Eventbrite sync (runs in background)."""
-        if _sync_state['running']:
-            return jsonify({'status': 'already_running', 'message': 'Sync is already in progress'})
         api_key = os.environ.get('EVENTBRITE_API_KEY')
         if not api_key:
             return jsonify({'error': 'EVENTBRITE_API_KEY not set'}), 500
-        # Reset state and run in background
-        _sync_state['done'] = False
-        _sync_state['running'] = False
-        _sync_state['result'] = None
-        _sync_state['error'] = None
+        # Admission gate, shared with the profile-only rebuild: a full sync
+        # rebuilds the same profile tables, so the two must not overlap.
+        # Checked before the key check would have been equally valid; keeping
+        # the key check first preserves the existing 500-over-409 ordering.
+        blocked = _claim_full_sync()
+        if blocked == 'profile_rebuild_running':
+            return jsonify({
+                'status': 'profile_rebuild_running',
+                'message': 'A profile rebuild is in progress; it rebuilds the same '
+                           'customer tables this sync would. Retry when it finishes.',
+            }), 409
+        if blocked:
+            return jsonify({'status': 'already_running', 'message': 'Sync is already in progress'})
         threading.Thread(target=_do_background_sync, daemon=True).start()
         return jsonify({'status': 'started', 'message': 'Sync started in background. Poll /api/sync-status for progress.'})
     @app.route('/api/meta-sync')
