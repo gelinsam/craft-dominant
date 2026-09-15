@@ -247,8 +247,18 @@ class TestPortfolioDeduplication(_Fixture):
             portfolio_spend_total(self.db, [a, b]), 1000.0, places=2)
 
     def test_grouped_day_view_alongside_raw_sessions_counts_once(self):
-        """A day-group and its constituents are several views of one edition."""
-        views = [_Analysis("grouped", self.NAME, self.DAYS[0][0], 1000.0)]
+        """A day-group and its constituents are several views of one edition.
+
+        The grouped view carries constituent_event_ids, as the dashboard
+        actually builds it. It previously did not, and a synthesized id with no
+        constituents is not a shape production ever produces — that gap is part
+        of why this class passed while production double-counted.
+        """
+        sat_ids = [r["event_id"] for r in self.rows
+                   if r["event_date"] == self.DAYS[0][0]]
+        grouped = _Analysis("grouped", self.NAME, self.DAYS[0][0], 1000.0)
+        grouped.constituent_event_ids = sat_ids
+        views = [grouped]
         views += [_Analysis(r["event_id"], self.NAME, r["event_date"], 1000.0)
                   for r in self.rows]
         self.assertAlmostEqual(portfolio_spend_total(self.db, views), 1000.0, places=2)
@@ -328,3 +338,138 @@ class TestSiblingScoping(_Fixture):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Production-shaped portfolio deduplication
+#
+# The class above passed while production double-counted, because every
+# synthetic analysis was given the bare festival name. The real dashboard
+# builds a GROUPED DAY analysis whose display name carries a weekday suffix:
+#
+#   "Austin Coffee Festival - Saturday"  ->  austin_coffee_fest_saturday
+#   "Austin Coffee Festival - Sunday"    ->  austin_coffee_fest_sunday
+#
+# Two different normalised keys, so name-derived identity deduped nothing and
+# one festival's spend was added once per day view. Production showed
+# $88,403.98 against $49,580.99 of stored spend.
+#
+# Those same grouped analyses already carry the REAL constituent event ids, so
+# identity is resolved from the database instead of from a display string.
+# ---------------------------------------------------------------------------
+class _GroupedAnalysis:
+    """Mirrors the EventPacing shape the dashboard builds for a day group."""
+
+    def __init__(self, event_id, name, event_date, ad_spend, constituent_event_ids):
+        self.event_id, self.event_name = event_id, name
+        self.event_date, self.ad_spend = event_date, ad_spend
+        self.constituent_event_ids = list(constituent_event_ids)
+
+
+class TestPortfolioDeduplicationProductionShape(_Fixture):
+    """The exact production defect, reproduced."""
+
+    def _day_groups(self, spend):
+        sat_ids = [r["event_id"] for r in self.rows if r["event_date"] == self.DAYS[0][0]]
+        sun_ids = [r["event_id"] for r in self.rows if r["event_date"] == self.DAYS[1][0]]
+        return (
+            _GroupedAnalysis("grp-sat", f"{self.NAME} - Saturday",
+                             self.DAYS[0][0], spend, sat_ids),
+            _GroupedAnalysis("grp-sun", f"{self.NAME} - Sunday",
+                             self.DAYS[1][0], spend, sun_ids),
+        )
+
+    def test_weekday_suffixed_day_groups_count_once(self):
+        """THE regression. Old code returned 2000.0 here."""
+        sat, sun = self._day_groups(1000.0)
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, [sat, sun]), 1000.0, places=2)
+
+    def test_the_old_name_derived_identity_really_did_split(self):
+        """Proves the test has teeth: the display names DO normalise apart."""
+        sat, sun = self._day_groups(1000.0)
+        self.assertNotEqual(
+            festival_edition_key(sat.event_name, sat.event_date),
+            festival_edition_key(sun.event_name, sun.event_date),
+        )
+
+    def test_dc_coffee_production_values(self):
+        """$9,596.49 on either day view contributes $9,596.49, not $19,192.98."""
+        sat, sun = self._day_groups(9596.49)
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, [sat, sun]), 9596.49, places=2)
+
+    def test_grouped_views_plus_raw_sessions_count_once(self):
+        """Day groups and their own constituents are all views of one edition."""
+        sat, sun = self._day_groups(1000.0)
+        raw = [_GroupedAnalysis(r["event_id"], self.NAME, r["event_date"], 1000.0, [])
+               for r in self.rows]
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, [sat, sun] + raw), 1000.0, places=2)
+
+    def test_constituent_ids_win_over_a_misleading_display_name(self):
+        """Identity comes from the database, not from whatever the label says."""
+        ids = [r["event_id"] for r in self.rows]
+        a = _GroupedAnalysis("g1", "Totally Different Label", "2026-01-01", 500.0, ids[:3])
+        b = _GroupedAnalysis("g2", "Another Unrelated Label", "2030-12-31", 500.0, ids[3:])
+        self.assertAlmostEqual(portfolio_spend_total(self.db, [a, b]), 500.0, places=2)
+
+    def test_unresolvable_analyses_are_not_merged(self):
+        """Fail safe to a unique identity rather than collapsing by fuzzy name."""
+        a = _GroupedAnalysis("ghost-1", "", "", 100.0, ["nonexistent-a"])
+        b = _GroupedAnalysis("ghost-2", "", "", 250.0, ["nonexistent-b"])
+        self.assertAlmostEqual(portfolio_spend_total(self.db, [a, b]), 350.0, places=2)
+
+
+class TestPortfolioMultiEditionProductionShape(unittest.TestCase):
+    """Distinct festivals and distinct years must still add normally."""
+
+    FESTIVALS = [
+        ("Austin Coffee Festival", "Austin", [("2026-10-17", 3), ("2026-10-18", 3)], 8732.18),
+        ("DC Coffee Festival", "DC", [("2026-10-03", 3), ("2026-10-04", 3)], 9596.49),
+        ("San Diego Coffee Festival", "San Diego", [("2026-10-10", 3), ("2026-10-11", 3)], 7146.49),
+        ("Austin Coffee Festival", "Austin", [("2025-10-25", 3), ("2025-10-26", 3)], 400.0),
+    ]
+
+    def setUp(self):
+        self.db = Database(os.path.join(tempfile.mkdtemp(), "multi.db"))
+        self.groups, n = [], 0
+        for name, city, days, spend in self.FESTIVALS:
+            for d, count in days:
+                ids = []
+                for _ in range(count):
+                    eid = f"E{n}"
+                    self.db.upsert_event({
+                        "event_id": eid, "name": name, "event_type": "coffee",
+                        "city": city, "event_date": d, "capacity": 2000,
+                        "status": "upcoming",
+                    })
+                    ids.append(eid)
+                    n += 1
+                weekday = datetime.date.fromisoformat(d).strftime("%A")
+                self.groups.append(
+                    _GroupedAnalysis(f"grp-{n}", f"{name} - {weekday}", d, spend, ids))
+
+    def test_each_edition_counted_exactly_once(self):
+        expected = round(8732.18 + 9596.49 + 7146.49 + 400.0, 2)
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, self.groups), expected, places=2)
+
+    def test_eight_day_groups_collapse_to_four_editions(self):
+        """Eight day views, four editions — the naive sum counts each twice."""
+        self.assertEqual(len(self.groups), 8)
+        naive = round(sum(g.ad_spend for g in self.groups), 2)
+        deduped = portfolio_spend_total(self.db, self.groups)
+        self.assertAlmostEqual(naive, round(deduped * 2, 2), places=2)
+        self.assertLess(deduped, naive - 1.0)
+
+    def test_austin_2025_and_2026_stay_distinct(self):
+        austin = [g for g in self.groups if "Austin" in g.event_name]
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, austin), round(8732.18 + 400.0, 2), places=2)
+
+    def test_distinct_festivals_do_not_collapse(self):
+        y2026 = [g for g in self.groups if g.event_date.startswith("2026")]
+        self.assertAlmostEqual(
+            portfolio_spend_total(self.db, y2026),
+            round(8732.18 + 9596.49 + 7146.49, 2), places=2)
