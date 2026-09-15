@@ -382,3 +382,92 @@ class TestSyncRunVisibility(_Fixture):
         second = self.db.start_sync_run("eventbrite")
         self.db.finish_sync_run(second, "failed", "boom")
         self.assertEqual(self.db.last_sync_run("eventbrite")["status"], "failed")
+
+
+# ---------------------------------------------------------------------------
+# Refunds and cancellations
+# ---------------------------------------------------------------------------
+def _attendee(cancelled=False, refunded=False, status="Attending"):
+    a = {"profile": {"email": "buyer@example.com"},
+         "ticket_class_name": "General Admission", "status": status}
+    if cancelled:
+        a["cancelled"] = True
+    if refunded:
+        a["refunded"] = True
+    return a
+
+
+class TestRefundedTicketsAreNotCounted(_Fixture):
+    """Eventbrite marks a withdrawn attendee rather than removing it, so
+    len(attendees) counted every refund as a ticket still sold. Nothing in the
+    codebase looked at these flags."""
+
+    def _order(self, attendees, order_id="R1"):
+        d = _order_payload(order_id=order_id)
+        d["attendees"] = attendees
+        return d
+
+    def test_refunded_attendee_is_excluded(self):
+        self._store(self._order([_attendee(), _attendee(), _attendee(refunded=True)]))
+        self.assertEqual(self._row("R1")["ticket_count"], 2)
+
+    def test_cancelled_attendee_is_excluded(self):
+        self._store(self._order([_attendee(), _attendee(cancelled=True)]))
+        self.assertEqual(self._row("R1")["ticket_count"], 1)
+
+    def test_deleted_status_is_excluded(self):
+        self._store(self._order([_attendee(), _attendee(status="Deleted")]))
+        self.assertEqual(self._row("R1")["ticket_count"], 1)
+
+    def test_not_attending_is_excluded(self):
+        self._store(self._order([_attendee(), _attendee(status="Not Attending")]))
+        self.assertEqual(self._row("R1")["ticket_count"], 1)
+
+    def test_a_fully_refunded_order_counts_zero(self):
+        self._store(self._order([_attendee(refunded=True), _attendee(refunded=True)]))
+        self.assertEqual(self._row("R1")["ticket_count"], 0)
+
+    def test_a_later_refund_reduces_the_stored_count(self):
+        """The observed-change path: 3 tickets, then one refunded."""
+        self._store(self._order([_attendee(), _attendee(), _attendee()]))
+        self.assertEqual(self._row("R1")["ticket_count"], 3)
+        self._store(self._order([_attendee(), _attendee(), _attendee(refunded=True)]))
+        self.assertEqual(self._row("R1")["ticket_count"], 2)
+
+    def test_missing_flags_keep_every_attendee(self):
+        """Conservative: a thin payload must not silently delete tickets."""
+        bare = [{"profile": {"email": "b@example.com"}} for _ in range(4)]
+        self._store(self._order(bare))
+        self.assertEqual(self._row("R1")["ticket_count"], 4)
+
+    def test_ticket_type_comes_from_a_live_attendee(self):
+        a = _attendee(refunded=True)
+        a["ticket_class_name"] = "Refunded VIP"
+        self._store(self._order([a, _attendee()]))
+        self.assertEqual(self._row("R1")["ticket_type"], "General Admission")
+
+    def test_event_totals_exclude_refunds(self):
+        self._store(self._order([_attendee(), _attendee(refunded=True)], order_id="R1"))
+        self._store(self._order([_attendee(), _attendee()], order_id="R2"))
+        self.assertEqual(self.db.get_event_tickets("E1"), 3)
+
+
+class TestParsedUnknownsDoNotReachNonNullConsumers(_Fixture):
+    """A regression from the merge work: parse output carries None for
+    unobserved fields, and it was handed straight to code expecting numbers."""
+
+    def test_unobserved_capacity_does_not_break_snapshot_building(self):
+        ev = self.sync._parse_event(_event_payload(event_id="E2", capacity=None))
+        self.assertIsNone(ev["capacity"])
+        ev["status"] = "completed"
+        self.db.upsert_event(ev)
+        self._store(_order_payload(order_id="S1"))
+        stored = self.db.get_event("E2") or ev
+        # Must not raise: this is exactly what failed in production.
+        self.sync._build_snapshots("E2", EVENT_DATE.date(), stored.get("capacity") or 0)
+
+    def test_stored_capacity_is_preserved_for_downstream_use(self):
+        ev = self.sync._parse_event(_event_payload(capacity=None))
+        ev["status"] = "upcoming"
+        self.db.upsert_event(ev)
+        self.assertEqual(self.db.get_event("E1")["capacity"], 2000)
