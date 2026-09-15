@@ -368,6 +368,19 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
     ad_spend_cumulative REAL DEFAULT 0,
     UNIQUE(event_id, snapshot_date)
 );
+-- Sync runs. Durable because the in-memory flag died with the container: a
+-- 74-minute Eventbrite sync was killed mid-traversal by a deploy, and
+-- afterwards /api/sync-status reported "not running" with no trace that
+-- anything had been interrupted. A row with finished_at NULL is a sync that
+-- never completed, and it survives the restart that hid the last one.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    detail TEXT
+);
 -- Pacing curves (aggregated from past events)
 CREATE TABLE IF NOT EXISTS pacing_curves (
     pattern TEXT PRIMARY KEY,
@@ -719,15 +732,32 @@ class Database:
             raise e
     # === Events ===
     def upsert_event(self, event: dict):
+        """Insert or MERGE an event. A None field means "not observed".
+
+        Same rule as insert_order, and for the same reason. Two fields were
+        being destroyed on every single sync: `capacity` fell back to 0 when the
+        ticket_availability expansion was absent (which zeroes sell-through),
+        and `meta_campaign_id` was never returned by _parse_event at all, so the
+        old REPLACE wrote NULL over any stored value every time.
+        """
         with self.transaction() as conn:
             conn.execute("""
-                INSERT OR REPLACE INTO events
+                INSERT INTO events
                 (event_id, name, event_type, city, event_date, capacity, status, platform, meta_campaign_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    name             = COALESCE(excluded.name,             events.name),
+                    event_type       = COALESCE(excluded.event_type,       events.event_type),
+                    city             = COALESCE(excluded.city,             events.city),
+                    event_date       = COALESCE(excluded.event_date,       events.event_date),
+                    capacity         = COALESCE(excluded.capacity,         events.capacity),
+                    status           = COALESCE(excluded.status,           events.status),
+                    platform         = COALESCE(excluded.platform,         events.platform),
+                    meta_campaign_id = COALESCE(excluded.meta_campaign_id, events.meta_campaign_id)
             """, (
                 event['event_id'], event['name'], event.get('event_type'),
-                event.get('city'), event['event_date'], event.get('capacity', 0),
-                event.get('status', 'upcoming'), event.get('platform', 'eventbrite'),
+                event.get('city'), event['event_date'], event.get('capacity'),
+                event.get('status'), event.get('platform', 'eventbrite'),
                 event.get('meta_campaign_id')
             ))
     def get_event(self, event_id: str) -> Optional[dict]:
@@ -759,19 +789,122 @@ class Database:
         return [dict(r) for r in rows]
     # === Orders ===
     def insert_order(self, order: dict):
+        """Insert or MERGE an order. A None field means "not observed".
+
+        This used to be INSERT OR REPLACE, which let an incomplete API response
+        overwrite good data with a default. A sync whose `attendees` expansion
+        came back empty rewrote real multi-ticket orders as 1 ticket, and
+        Saturday counts collapsed (Austin 462 -> 316) while revenue stayed
+        intact, so nothing looked broken.
+
+        Now every optional column is COALESCEd against what is already stored:
+        an unobserved value keeps the stored one, while an OBSERVED change --
+        including a refund taking 4 tickets to 2 -- is still written. Absent
+        keys are treated as unobserved rather than as zero.
+        """
         with self.transaction() as conn:
             conn.execute("""
-                INSERT OR REPLACE INTO orders
+                INSERT INTO orders
                 (order_id, event_id, email, order_timestamp, ticket_count,
                  gross_amount, net_amount, ticket_type, promo_code, days_before_event)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    event_id          = excluded.event_id,
+                    email             = excluded.email,
+                    order_timestamp   = COALESCE(excluded.order_timestamp,   orders.order_timestamp),
+                    ticket_count      = COALESCE(excluded.ticket_count,      orders.ticket_count),
+                    gross_amount      = COALESCE(excluded.gross_amount,      orders.gross_amount),
+                    net_amount        = COALESCE(excluded.net_amount,        orders.net_amount),
+                    ticket_type       = COALESCE(excluded.ticket_type,       orders.ticket_type),
+                    promo_code        = COALESCE(excluded.promo_code,        orders.promo_code),
+                    days_before_event = COALESCE(excluded.days_before_event, orders.days_before_event)
             """, (
                 order['order_id'], order['event_id'], order['email'].lower().strip(),
-                order['order_timestamp'], order.get('ticket_count', 1),
-                order.get('gross_amount', 0), order.get('net_amount', 0),
+                order['order_timestamp'], order.get('ticket_count'),
+                order.get('gross_amount'), order.get('net_amount'),
                 order.get('ticket_type'), order.get('promo_code'),
                 order.get('days_before_event')
             ))
+    # === Durable sync-run state ===
+    def start_sync_run(self, kind: str = 'eventbrite') -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO sync_runs (kind, started_at, status) VALUES (?, ?, 'running')",
+                (kind, datetime.now().isoformat()))
+            return int(cur.lastrowid)
+
+    def finish_sync_run(self, run_id: int, status: str = 'completed', detail: str = None):
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE sync_runs SET finished_at = ?, status = ?, detail = ? WHERE id = ?",
+                (datetime.now().isoformat(), status, detail, run_id))
+
+    def interrupted_sync_runs(self) -> List[dict]:
+        """Runs that started and never finished — a killed or crashed sync."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM sync_runs WHERE finished_at IS NULL AND status = 'running' "
+            "ORDER BY started_at DESC")]
+
+    def mark_orphaned_sync_runs(self) -> int:
+        """At startup, any still-'running' row belongs to a process that is gone.
+
+        Called on boot so an interrupted sync is visible as `interrupted`
+        instead of masquerading as in-flight forever.
+        """
+        rows = self.interrupted_sync_runs()
+        if rows:
+            with self.transaction() as conn:
+                conn.execute(
+                    "UPDATE sync_runs SET status = 'interrupted', finished_at = ? "
+                    "WHERE finished_at IS NULL AND status = 'running'",
+                    (datetime.now().isoformat(),))
+            log.error("INTEGRITY: %d sync run(s) were interrupted and never finished: %s. "
+                      "Data may be partially updated — re-run a full sync before "
+                      "trusting these numbers.",
+                      len(rows), ', '.join(f"{r['kind']}@{r['started_at']}" for r in rows))
+        return len(rows)
+
+    def last_sync_run(self, kind: str = 'eventbrite') -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM sync_runs WHERE kind = ? ORDER BY started_at DESC LIMIT 1",
+            (kind,)).fetchone()
+        return dict(row) if row else None
+
+    def event_ticket_totals(self) -> Dict[str, int]:
+        """Tickets currently stored per event — the before/after integrity probe."""
+        return {r['event_id']: int(r['t'] or 0) for r in self.conn.execute(
+            "SELECT event_id, COALESCE(SUM(ticket_count), 0) AS t FROM orders GROUP BY event_id")}
+
+    def unknown_ticket_count_orders(self) -> int:
+        """Orders whose ticket count was never observed.
+
+        These are honest unknowns rather than fabricated 1s, but a rising count
+        means the attendees expansion is failing and the data is thinning out.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM orders WHERE ticket_count IS NULL").fetchone()
+        return int(row['c']) if row else 0
+
+    @staticmethod
+    def ticket_total_regressions(before: Dict[str, int], after: Dict[str, int],
+                                 min_drop: int = 10, min_fraction: float = 0.05):
+        """Events whose stored ticket total FELL materially during a sync.
+
+        Ticket totals essentially never fall: refunds are rare and small. A
+        double-digit percentage drop means a write destroyed data, which is
+        exactly what went unnoticed when Austin went 483 -> 316 while its
+        revenue stayed put. Cheap, assumption-free, and it catches the whole
+        class rather than the one field that failed last time.
+        """
+        out = []
+        for event_id, was in before.items():
+            now = after.get(event_id, 0)
+            drop = was - now
+            if was > 0 and drop >= min_drop and (drop / was) >= min_fraction:
+                out.append({'event_id': event_id, 'before': was, 'after': now,
+                            'lost': drop, 'pct': round(drop / was * 100, 1)})
+        return sorted(out, key=lambda r: r['lost'], reverse=True)
+
     def get_orders_for_event(self, event_id: str) -> List[dict]:
         rows = self.conn.execute(
             "SELECT * FROM orders WHERE event_id = ? ORDER BY order_timestamp",
@@ -1825,6 +1958,12 @@ class EventbriteSync:
         """Sync everything: events, orders, build snapshots and customers."""
         results = {'events': 0, 'orders': 0, 'customers': 0, 'curves': 0, 'errors': []}
         cutoff = datetime.now() - timedelta(days=years_back * 365)
+        # Integrity probe. Stored ticket totals essentially never fall, so a
+        # material drop across a sync means a write destroyed data rather than
+        # recorded it. The incident this guards against was invisible precisely
+        # because nothing ever compared before with after.
+        tickets_before = self.db.event_ticket_totals()
+        unknown_before = self.db.unknown_ticket_count_orders()
         # Get all events
         log.info("Fetching events from Eventbrite...")
         events = self._paginate(
@@ -1864,6 +2003,31 @@ class EventbriteSync:
             except Exception as e:
                 results['errors'].append(str(e))
                 log.error(f"  Error: {e}")
+        # ── Integrity check, before anything downstream trusts this data ──
+        regressions = self.db.ticket_total_regressions(
+            tickets_before, self.db.event_ticket_totals())
+        unknown_after = self.db.unknown_ticket_count_orders()
+        results['integrity'] = {
+            'ticket_total_regressions': regressions,
+            'events_with_ticket_loss': len(regressions),
+            'tickets_lost': sum(r['lost'] for r in regressions),
+            'orders_with_unknown_ticket_count': unknown_after,
+            'unknown_ticket_count_delta': unknown_after - unknown_before,
+        }
+        if regressions:
+            log.error(
+                "INTEGRITY: %d event(s) LOST tickets during this sync (%d total). "
+                "Stored counts should not fall — investigate before trusting the "
+                "dashboard. Worst: %s",
+                len(regressions), results['integrity']['tickets_lost'],
+                ', '.join(f"{r['event_id']} {r['before']}->{r['after']}"
+                          for r in regressions[:5]))
+        if unknown_after > unknown_before:
+            log.warning(
+                "INTEGRITY: orders with an unobserved ticket count rose %d -> %d. "
+                "The attendees expansion is returning empty; counts are honest but "
+                "incomplete.", unknown_before, unknown_after)
+
         # Build customer profiles
         log.info("Building customer profiles...")
         results['customers'] = self._build_all_customers()
@@ -1905,20 +2069,23 @@ class EventbriteSync:
             event_date = datetime.fromisoformat(event_date.replace('Z', '+00:00')).replace(tzinfo=None)
         except:
             return None
+        # venue and ticket_availability are expansions. When they are absent
+        # this response simply did not observe city or capacity — it is not
+        # evidence that the event moved to nowhere with room for no one. None
+        # lets upsert_event keep what is already stored.
         venue = data.get('venue') or {}
         address = venue.get('address') or {}
-        city = address.get('city', '')
-        capacity = data.get('capacity') or 0
+        city = address.get('city') or None
+        capacity = data.get('capacity')
         if not capacity:
-            ticket_avail = data.get('ticket_availability') or {}
-            capacity = ticket_avail.get('total_capacity', 0)
+            capacity = (data.get('ticket_availability') or {}).get('total_capacity')
         return {
             'event_id': event_id,
             'name': name,
             'event_type': self._infer_type(name),
             'city': city,
             'event_date': event_date.isoformat(),
-            'capacity': capacity,
+            'capacity': capacity or None,
             'platform': 'eventbrite'
         }
     def _parse_order(self, data: dict, event_id: str, event_date: datetime) -> Optional[dict]:
@@ -1936,27 +2103,35 @@ class EventbriteSync:
         try:
             order_date = datetime.fromisoformat(created.replace('Z', '+00:00')).replace(tzinfo=None)
             days_before = max(0, (event_date - order_date).days)
-        except:
-            order_date = datetime.now()
-            days_before = 0
+        except Exception:
+            # An unusable timestamp used to become datetime.now(), which moved
+            # the sale to today and bent the whole pacing curve. A row we cannot
+            # place on the timeline is not written at all; whatever is already
+            # stored for this order stays.
+            log.warning(f"Order {order_id}: unparseable created date {created!r} — skipped")
+            return None
+
+        # Anything below comes from an OPTIONAL part of the payload. None means
+        # "not observed in this response", never "zero" or "one". insert_order
+        # preserves the stored value for those. Inventing a default here is what
+        # silently rewrote real ticket counts to 1 and would have zeroed revenue
+        # the same way if `costs` had been the field that blinked.
         costs = data.get('costs') or {}
-        gross = costs.get('gross') or {}
-        gross_amount = float(gross.get('major_value') or 0)
-        attendees = data.get('attendees', [])
-        ticket_count = len(attendees) if attendees else 1
-        ticket_type = None
-        if attendees:
-            ticket_type = attendees[0].get('ticket_class_name')
+        gross = (costs.get('gross') or {}).get('major_value')
+        net = (costs.get('net') or {}).get('major_value')
+        attendees = data.get('attendees') or []
+
         return {
             'order_id': order_id,
             'event_id': event_id,
             'email': email,
             'order_timestamp': order_date.isoformat(),
-            'ticket_count': ticket_count,
-            'gross_amount': gross_amount,
-            'ticket_type': ticket_type,
+            'ticket_count': len(attendees) if attendees else None,
+            'gross_amount': float(gross) if gross is not None else None,
+            'net_amount': float(net) if net is not None else None,
+            'ticket_type': attendees[0].get('ticket_class_name') if attendees else None,
             'promo_code': data.get('promo_code'),
-            'days_before_event': days_before
+            'days_before_event': days_before,
         }
     def _infer_type(self, name: str) -> str:
         name_lower = name.lower()
@@ -3909,6 +4084,12 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     engine = DecisionEngine(db)
     # Sync status tracking
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
+    # Any sync still marked running belongs to a process that no longer exists.
+    # Surfacing that on boot is how an interrupted traversal stops being silent.
+    try:
+        db.mark_orphaned_sync_runs()
+    except Exception as exc:
+        log.warning(f"Could not reconcile previous sync runs: {exc}")
     _meta_sync_lock = threading.Lock()  # Serialize Meta sync writers
     _meta_sync_running = False  # Single-flight guard for Meta sync
     # Admission control shared by the Eventbrite full sync and the profile-only
@@ -3942,12 +4123,19 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         """
         nonlocal _meta_sync_running
         _sync_state['running'] = True
+        run_id = None
         try:
             api_key = os.environ.get('EVENTBRITE_API_KEY')
             if not api_key:
                 _sync_state['error'] = 'EVENTBRITE_API_KEY not set'
                 log.error("EVENTBRITE_API_KEY not set - cannot sync")
                 return
+            # Durable marker: survives the container, so an interrupted sync
+            # cannot silently look like "nothing was running".
+            try:
+                run_id = db.start_sync_run('eventbrite')
+            except Exception as exc:
+                log.warning(f"Could not record sync run start: {exc}")
             log.info("Starting Eventbrite sync...")
             eb = EventbriteSync(api_key, db)
             result = eb.sync_all(years_back=4)
@@ -3993,7 +4181,21 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         except Exception as e:
             _sync_state['error'] = str(e)
             log.error(f"Sync error: {e}")
+            if run_id is not None:
+                try:
+                    db.finish_sync_run(run_id, 'failed', str(e)[:500])
+                    run_id = None
+                except Exception:
+                    pass
         finally:
+            if run_id is not None:
+                try:
+                    integrity = (_sync_state.get('result') or {}).get('integrity') or {}
+                    status = 'completed_with_integrity_warnings' if \
+                        integrity.get('events_with_ticket_loss') else 'completed'
+                    db.finish_sync_run(run_id, status, json.dumps(integrity)[:500] or None)
+                except Exception as exc:
+                    log.warning(f"Could not record sync run finish: {exc}")
             _sync_state['done'] = True
             _sync_state['running'] = False
     # ── Admission control: full sync vs profile-only rebuild ──────────────
@@ -4218,11 +4420,23 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         })
     @app.route('/api/sync-status')
     def sync_status():
-        """Check sync progress."""
+        """Check sync progress.
+
+        `running`/`done` describe THIS process. `last_run` and `interrupted`
+        come from the database, so a sync killed by a restart is still visible
+        afterwards instead of vanishing with the in-memory flag.
+        """
+        try:
+            last_run = db.last_sync_run('eventbrite')
+            interrupted = db.interrupted_sync_runs()
+        except Exception:
+            last_run, interrupted = None, []
         return jsonify({
             'done': _sync_state['done'],
             'running': _sync_state['running'],
             'result': _sync_state['result'],
+            'last_run': last_run,
+            'interrupted_runs': interrupted,
             'error': _sync_state['error']
         })
     @app.route('/api/sync')
