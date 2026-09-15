@@ -23,6 +23,7 @@ from craft_unified import (
     DecisionEngine,
     MetaAdsSync,
     ProfileRebuildBusy,
+    command_auth_error,
     auto_sync_enabled,
     create_app,
 )
@@ -181,17 +182,10 @@ def _build_app():
 
         @wraps(fn)
         def wrapped(*args, **kwargs):
-            expected = os.environ.get("COMMAND_API_KEY", "")
-            if not expected:
-                return jsonify({
-                    "error": "command_api_not_configured",
-                    "message": "COMMAND_API_KEY must be configured before enabling V2 Command API.",
-                }), 503
-
-            auth = request.headers.get("Authorization", "")
-            supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-            if not supplied or not hmac.compare_digest(supplied, expected):
-                return jsonify({"error": "unauthorized"}), 401
+            denied = command_auth_error()
+            if denied is not None:
+                payload, status = denied
+                return jsonify(payload), status
             return fn(*args, **kwargs)
 
         return wrapped

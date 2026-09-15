@@ -88,6 +88,13 @@ class FakeDB:
         ).fetchone()
         return float(row["s"])
 
+    def edition_sibling_ids(self, event_id):
+        """Single-row editions: this double predates timed-entry grouping."""
+        return [event_id]
+
+    def get_edition_spend(self, event_id):
+        return self.get_event_spend(event_id)
+
     def get_snapshots(self, event_id):
         return [
             dict(row)

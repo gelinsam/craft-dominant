@@ -514,3 +514,70 @@ class TestContentWordPrefixMatching(_Base):
             with self.subTest(campaign=campaign, event=event_name):
                 self.assertIsNone(
                     self.m._campaign_matches_event(campaign, event_name, 2026))
+
+
+class TestMetaSyncEndpointAuth(unittest.TestCase):
+    """/api/meta-sync burns Meta quota and writes analytics rows.
+
+    It was reachable by anyone who knew the URL. It now rides the same
+    COMMAND_API_KEY gate as the rest of the command surface — one shared
+    implementation in craft_unified.command_auth_error(), so the base app and
+    the V2 layer cannot drift apart on who is allowed in.
+    """
+
+    KEY = "test-secret-key-12345"
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("COMMAND_API_KEY", "DB_PATH", "META_ACCESS_TOKEN",
+                        "META_AD_ACCOUNT_ID", "CRAFT_AUTO_SYNC")}
+        os.environ["COMMAND_API_KEY"] = self.KEY
+        os.environ["DB_PATH"] = ":memory:"
+        os.environ["CRAFT_AUTO_SYNC"] = "0"
+        os.environ.pop("META_ACCESS_TOKEN", None)
+        os.environ.pop("META_AD_ACCOUNT_ID", None)
+        from craft_v2 import _build_app
+        self.client = _build_app().test_client()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_unauthenticated_is_rejected(self):
+        self.assertEqual(self.client.get("/api/meta-sync").status_code, 401)
+
+    def test_bad_key_is_rejected(self):
+        r = self.client.get("/api/meta-sync", headers={"Authorization": "Bearer nope"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_valid_key_is_accepted_and_reaches_sync_logic(self):
+        """Accepted means it gets past auth; Meta is unconfigured so it 400s."""
+        r = self.client.get("/api/meta-sync",
+                            headers={"Authorization": f"Bearer {self.KEY}"})
+        self.assertNotIn(r.status_code, (401, 403))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("META_ACCESS_TOKEN", r.data.decode())
+
+    def test_unconfigured_command_key_fails_closed(self):
+        os.environ.pop("COMMAND_API_KEY", None)
+        r = self.client.get("/api/meta-sync",
+                            headers={"Authorization": f"Bearer {self.KEY}"})
+        self.assertEqual(r.status_code, 503)
+
+    def test_rejected_request_starts_no_thread(self):
+        import craft_unified
+        started = []
+        original = craft_unified.MetaAdsSync
+        craft_unified.MetaAdsSync = lambda *a, **k: started.append(1)
+        try:
+            self.client.get("/api/meta-sync")
+        finally:
+            craft_unified.MetaAdsSync = original
+        self.assertEqual(started, [])
+
+    def test_diagnostics_route_is_also_protected(self):
+        self.assertEqual(
+            self.client.get("/api/v2/diagnostics/meta-assignment").status_code, 401)

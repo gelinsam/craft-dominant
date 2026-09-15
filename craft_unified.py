@@ -6,6 +6,7 @@ import csv
 import io
 import sqlite3
 import hashlib
+import hmac
 import logging
 import statistics
 import re
@@ -88,6 +89,51 @@ def festival_edition_key(event_name: str, event_date: str):
     except Exception:
         return None
     return (pattern, year)
+
+
+def command_auth_error():
+    """Shared COMMAND_API_KEY gate.
+
+    Returns (payload, status) when the request must be refused, or None when it
+    may proceed. Defined here rather than in craft_v2 so the Flask app built by
+    craft_unified and the V2 layer enforce exactly one implementation — if the
+    two ever diverged, one surface would be protected and the other would not.
+    """
+    expected = os.environ.get("COMMAND_API_KEY", "")
+    if not expected:
+        return ({
+            "error": "command_api_not_configured",
+            "message": "COMMAND_API_KEY must be configured before using this endpoint.",
+        }, 503)
+    auth = request.headers.get("Authorization", "")
+    supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        return ({"error": "unauthorized"}, 401)
+    return None
+
+
+def portfolio_spend_total(db, analyses) -> float:
+    """Portfolio spend with festival editions counted once.
+
+    Each analysis reports its FESTIVAL EDITION's spend, and several analyses can
+    belong to one edition — Saturday and Sunday of the same festival, or a
+    grouped day view alongside its raw sessions. Summing them would multiply a
+    single stored spend stream by the number of views of it, so spend is taken
+    once per distinct edition.
+    """
+    seen = {}
+    for a in analyses:
+        key = None
+        try:
+            key = festival_edition_key(a.event_name, a.event_date)
+        except Exception:
+            key = None
+        if key is None:
+            key = ('__unkeyed__', getattr(a, 'event_id', id(a)))
+        spend = float(getattr(a, 'ad_spend', 0) or 0)
+        if spend > seen.get(key, 0.0):
+            seen[key] = spend
+    return round(sum(seen.values()), 2)
 
 
 def canonical_edition_event(events):
@@ -1504,6 +1550,84 @@ class Database:
             return "current_has_spend" if total > 0 else "current_zero_spend"
         except Exception:
             return "unavailable"
+    # === Festival-edition spend reads ===
+    #
+    # Spend is STORED once, on one canonical raw row per edition (see
+    # canonical_edition_event). That is a storage detail and must not leak into
+    # business interpretation: Meta advertises the festival, so every
+    # constituent day and session of an edition shares one paid-media context.
+    # These readers resolve an edition's spend from ANY of its rows, without
+    # copying a single stored dollar.
+    def edition_sibling_ids(self, event_id: str) -> List[str]:
+        """Every raw event_id belonging to the same festival edition."""
+        row = self.conn.execute(
+            "SELECT name, event_date FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if not row:
+            return [event_id]
+        key = festival_edition_key(row['name'], row['event_date'])
+        if key is None:
+            return [event_id]
+        siblings = []
+        for r in self.conn.execute("SELECT event_id, name, event_date FROM events"):
+            if festival_edition_key(r['name'], r['event_date']) == key:
+                siblings.append(r['event_id'])
+        return siblings or [event_id]
+
+    def _sum_spend_over(self, event_ids: List[str]) -> float:
+        if not event_ids:
+            return 0.0
+        marks = ','.join('?' * len(event_ids))
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(spend), 0) AS total FROM ad_spend "
+            f"WHERE event_id IN ({marks})", event_ids).fetchone()
+        return float(row['total']) if row else 0.0
+
+    def get_edition_spend(self, event_id: str) -> float:
+        """Festival-edition spend, resolvable from any constituent row.
+
+        Counted once: the edition's rows share a single stored spend stream, so
+        summing across siblings returns that stream, not a multiple of it.
+        """
+        return self._sum_spend_over(self.edition_sibling_ids(event_id))
+
+    def get_edition_tickets(self, event_id: str) -> int:
+        """Tickets across the whole edition — the denominator festival CAC needs.
+
+        Advertising is bought at festival level, so dividing festival spend by a
+        single day's tickets would overstate CAC for that day.
+        """
+        ids = self.edition_sibling_ids(event_id)
+        marks = ','.join('?' * len(ids))
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(ticket_count), 0) AS t FROM orders "
+            f"WHERE event_id IN ({marks})", ids).fetchone()
+        return int(row['t']) if row else 0
+
+    def get_edition_spend_status(self, event_id: str) -> str:
+        """Best spend status across the edition — see get_spend_status()."""
+        priority = {'current_has_spend': 5, 'current_zero_spend': 4,
+                    'stale': 3, 'no_records': 2, 'unavailable': 1}
+        best = 'no_records'
+        for eid in self.edition_sibling_ids(event_id):
+            status = self.get_spend_status(eid)
+            if priority.get(status, 0) > priority.get(best, 0):
+                best = status
+        return best
+
+    def get_edition_spend_at_days_out(self, event_id: str, days_before: int) -> float:
+        """Cumulative edition spend at T-N, resolvable from any constituent row.
+
+        Snapshots are per raw row and only the canonical row carries spend, so
+        this takes the maximum across siblings rather than the sum: the others
+        contribute 0 and summing would still be correct, but max is robust if a
+        historical edition was synced before canonical-row storage existed.
+        """
+        best = 0.0
+        for eid in self.edition_sibling_ids(event_id):
+            best = max(best, self.get_event_spend_at_days_out(eid, days_before))
+        return best
+
     def get_event_spend(self, event_id: str) -> float:
         row = self.conn.execute(
             "SELECT COALESCE(SUM(spend), 0) as total FROM ad_spend WHERE event_id = ?",
@@ -3138,12 +3262,20 @@ class DecisionEngine:
         days_until = (event_date - date.today()).days
         tickets = self.db.get_event_tickets(event_id)
         revenue = self.db.get_event_revenue(event_id)
-        spend = self.db.get_event_spend(event_id)
-        spend_status = self.db.get_spend_status(event_id)
+        # Paid media is bought per FESTIVAL EDITION, so spend resolves at that
+        # scope from any constituent row — the canonical storage row may sit on
+        # another day of the same festival.
+        spend = self.db.get_edition_spend(event_id)
+        spend_status = self.db.get_edition_spend_status(event_id)
         capacity = event.get('capacity', 0)
         sell_through = (tickets / capacity * 100) if capacity > 0 else 0
-        # CAC is only meaningful when spend data is current and > 0
-        cac = spend / tickets if tickets > 0 and spend > 0 and spend_status == 'current_has_spend' else 0
+        # CAC is only meaningful when spend data is current and > 0. The
+        # denominator is edition-wide tickets: festival spend over one day's
+        # tickets would overstate that day's acquisition cost.
+        edition_tickets = self.db.get_edition_tickets(event_id)
+        cac = (spend / edition_tickets
+               if edition_tickets > 0 and spend > 0
+               and spend_status == 'current_has_spend' else 0)
         # --- Find all past editions of this event pattern ---
         pattern = self._get_pattern(event['name'])
         all_events = self._get_all_events()
@@ -3162,7 +3294,7 @@ class DecisionEngine:
             pe_tickets = self.db.get_event_tickets(pe['event_id'])
             pe_revenue = self.db.get_event_revenue(pe['event_id'])
             pe_capacity = pe.get('capacity', 0)
-            pe_spend_total = self.db.get_event_spend(pe['event_id'])
+            pe_spend_total = self.db.get_edition_spend(pe['event_id'])
             comparison_events.append(pe['name'])
             comparison_years.append(pe_date.year)
             snap = self.db.get_snapshot_at_days(pe['event_id'], days_until)
@@ -3178,7 +3310,10 @@ class DecisionEngine:
                 'ad_spend_total': round(pe_spend_total, 2),
             }
             if snap_tickets is not None:
-                spend_at_point = snap.get('ad_spend_cumulative', 0) or 0
+                # Edition-scoped: a Saturday comparison must still see the
+                # festival's spend when the canonical row is the Sunday one.
+                spend_at_point = self.db.get_edition_spend_at_days_out(
+                    pe['event_id'], days_until)
                 comp['at_days_out'] = {
                     'days': snap['days_before_event'],
                     'tickets': snap_tickets,
@@ -3362,7 +3497,7 @@ class DecisionEngine:
                      'stale': 3, 'no_records': 2, 'unavailable': 1}
         best = 'unavailable'
         for eid in event_ids:
-            status = self.db.get_spend_status(eid)
+            status = self.db.get_edition_spend_status(eid)
             if priority.get(status, 0) > priority.get(best, 0):
                 best = status
         return best
@@ -3402,7 +3537,10 @@ class DecisionEngine:
         # Sum capacities across sessions (not max) - each timed slot is separate capacity
         total_capacity = sum(a.capacity for a in day_analyses) if day_analyses else 0
         max_capacity = total_capacity  # keep variable name for downstream compat
-        total_spend = sum(a.ad_spend for a in day_analyses)
+        # Every constituent belongs to the same festival edition and each
+        # already reports that edition's spend, so summing would multiply one
+        # stored stream by the number of sessions.
+        total_spend = max((a.ad_spend for a in day_analyses), default=0.0)
         sell_through = (total_tickets / max_capacity * 100) if max_capacity > 0 else 0
         # Compute grouped spend status from constituent event IDs
         constituent_ids = [a.event_id for a in day_analyses]
@@ -3467,11 +3605,11 @@ class DecisionEngine:
                 t = self.db.get_event_tickets(pe['event_id'])
                 r = self.db.get_event_revenue(pe['event_id'])
                 c = pe.get('capacity', 0)
-                sp = self.db.get_event_spend(pe['event_id'])
+                sp = self.db.get_edition_spend(pe['event_id'])
                 date_tickets += t
                 date_revenue += r
                 date_capacity += c  # Sum capacities across sessions (not max)
-                date_spend += sp
+                date_spend = max(date_spend, sp)  # one edition, not a sum
             date_sell = (date_tickets / date_capacity * 100) if date_capacity > 0 else 0
             snap_tickets = 0
             snap_revenue = 0
@@ -3482,7 +3620,8 @@ class DecisionEngine:
                 if s:
                     snap_tickets += s['tickets_cumulative']
                     snap_revenue += s['revenue_cumulative']
-                    snap_spend += s.get('ad_spend_cumulative', 0) or 0
+                    snap_spend = max(snap_spend, self.db.get_edition_spend_at_days_out(
+                        pe['event_id'], days_until))
                     snap_found = True
             snap_sell = round(snap_tickets / date_capacity * 100, 1) if snap_found and date_capacity > 0 else 0
             comp = {
@@ -4041,10 +4180,17 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     def meta_sync_endpoint():
         """Trigger Meta ad spend sync for all events.
 
+        Authenticated: this burns Meta API quota and writes analytics rows, so
+        it must not be reachable by anyone who knows the URL.
+
         Single-flight: rejects if a Meta sync is already running from any
         source (background or manual).  Uses _meta_sync_lock to serialize
         writes so overlapping threads can't corrupt the SQLite WAL.
         """
+        denied = command_auth_error()
+        if denied is not None:
+            payload, status = denied
+            return jsonify(payload), status
         nonlocal _meta_sync_running
         if _meta_sync_running:
             return jsonify({'status': 'already_running', 'message': 'Meta sync is already in progress'}), 409
@@ -4237,7 +4383,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         total_tickets = sum(a.tickets_sold for a in analyses)
         total_capacity = sum(a.capacity for a in analyses)
         total_revenue = sum(a.revenue for a in analyses)
-        total_spend = sum(a.ad_spend for a in analyses)
+        total_spend = portfolio_spend_total(db, analyses)
         # Decision counts
         decisions = {}
         for a in analyses:
@@ -5937,7 +6083,7 @@ class CraftDominant:
         # Summary
         total_tickets = sum(a.tickets_sold for a in analyses)
         total_revenue = sum(a.revenue for a in analyses)
-        total_spend = sum(a.ad_spend for a in analyses)
+        total_spend = portfolio_spend_total(self.db, analyses)
         print(f"\nPORTFOLIO")
         print(f"   Events: {len(analyses)}")
         print(f"   Tickets: {total_tickets:,}")
