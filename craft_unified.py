@@ -55,6 +55,55 @@ def _normalize_event_pattern(name: str, include_season: bool = False) -> str:
     name_lower = re.sub(r'_edition|_+', '_', name_lower).strip('_')
     return name_lower + season
 
+def festival_edition_key(event_name: str, event_date: str):
+    """Identity of the thing Meta actually advertises: one festival edition.
+
+    Meta campaigns promote "Austin Coffee Festival 2026". Eventbrite splits that
+    into several timed-entry rows (six, in Austin's case) which are ticket
+    inventory, not advertising targets. This collapses those rows to the unit a
+    campaign is bought against: normalized pattern + edition year.
+
+    Deliberately built on _normalize_event_pattern(include_season=True) and
+    PATTERN_ALIASES — the same primitive DecisionEngine._get_pattern() uses for
+    timed-entry grouping and pacing curves — so Meta attribution and historical
+    pacing can never disagree about what one edition is. Season is included, so
+    DC Wine Fest Spring and Fall stay separate editions within a year.
+
+    Edition year comes from an explicit 4-digit year in the event name when one
+    is present, and from the event date otherwise. The name is preferred because
+    it states the edition directly: "Austin Coffee Festival 2025" belongs to the
+    2025 edition even if its stored date drifted into another calendar year, and
+    relying on the date alone would merge two editions that the organiser
+    clearly named apart.
+
+    Returns (pattern, year), or None when neither source yields a year.
+    """
+    pattern = _normalize_event_pattern(event_name or '', include_season=True)
+    pattern = PATTERN_ALIASES.get(pattern, pattern)
+    named = re.search(r'\b(20[2-3]\d)\b', event_name or '')
+    if named:
+        return (pattern, int(named.group(1)))
+    try:
+        year = datetime.fromisoformat(event_date).date().year
+    except Exception:
+        return None
+    return (pattern, year)
+
+
+def canonical_edition_event(events):
+    """Pick the one event row that carries an edition's ad spend.
+
+    ad_spend.event_id is a raw Eventbrite id and the dashboard SUMS spend over
+    a day-group's constituent rows, so writing an edition's spend to every
+    session row would multiply it. One deterministic representative — earliest
+    date, then lowest id — keeps a Meta dollar stored exactly once while
+    remaining stable across re-syncs and across editions.
+    """
+    if not events:
+        return None
+    return min(events, key=lambda e: (str(e.get('event_date') or ''), str(e.get('event_id') or '')))
+
+
 # Pattern aliases: map current Eventbrite names to their historical pattern equivalents.
 # "DC Wine Fest" (2026) was previously listed as "DC Wine Fest! Fall Edition" (2022-2025).
 PATTERN_ALIASES = {
@@ -2309,12 +2358,24 @@ class MetaAdsSync:
         'dcock': ['dc cocktail', 'official dc cocktail'],
         'pcock': ['philly cocktail'],
         'dccf': ['dc coffee'],
-        'dcf': ['dc coffee'],
+        # 'dcf' means DALLAS coffee, not DC. It previously pointed at DC; no
+        # live campaign uses the token, so this is latent cleanup rather than a
+        # correction to spend already recorded.
+        'dcf': ['dallas coffee'],
         'acf': ['austin coffee'],
         'pcf': ['philly coffee'],
-        'scf': ['seattle coffee', 'sf coffee', 'san francisco coffee'],
+        # 'scf' is Seattle only. It used to also claim San Francisco, which made
+        # one token reach two different cities. San Francisco has 'sfcf'/'sf'.
+        'scf': ['seattle coffee'],
+        'sea': ['seattle coffee'],
         'sfcf': ['san francisco coffee', 'sf coffee'],
+        'sf': ['sf coffee', 'san francisco coffee'],
         'sdcf': ['san diego coffee'],
+        'sd': ['san diego coffee'],
+        # NYC runs whiskey, margarita, cocktail and beer events too, so only the
+        # coffee-qualified tokens are aliased. A bare 'nyc' would be unsafe.
+        'nyccf': ['nyc coffee', 'nyc craft coffee'],
+        'nycf': ['nyc coffee', 'nyc craft coffee'],
         'dalcf': ['dallas coffee'],
         'dal': ['dallas coffee'],
         'dallas': ['dallas coffee'],
@@ -2406,6 +2467,19 @@ class MetaAdsSync:
 
         Returns the match reason string, or None if no match.
         """
+        result = self._match_strategy(campaign_name, event_name, event_year=event_year)
+        return result[1] if result else None
+
+    def _match_strategy(self, campaign_name: str, event_name: str,
+                        event_year: Optional[int] = None):
+        """Same matching as _campaign_matches_event, but returns (strategy, reason).
+
+        `strategy` is one of the _MATCH_RANK keys. _campaign_matches_event
+        returns only the human-readable reason, and _MATCH_RANK was being looked
+        up with that prose — so every match ranked 0 and strength ordering never
+        applied. Keeping the reason for logs and returning the strategy
+        separately makes the existing rank table work as intended.
+        """
         cleaned = self._clean_event_name(event_name)
         if not cleaned:
             return None
@@ -2420,10 +2494,12 @@ class MetaAdsSync:
         cname_clean = re.sub(r'[^\w\s]', '', cname)
 
         match_reason = None
+        strategy = None
 
         # Strategy 1: Full cleaned name is substring of campaign name
         if cleaned in cname_clean:
             match_reason = f"full name '{cleaned}'"
+            strategy = 'full_name'
 
         # Strategy 2: ALL content words present in campaign name
         if not match_reason:
@@ -2431,8 +2507,17 @@ class MetaAdsSync:
             content_words = [w for w in cleaned.split() if w not in skip_words]
             if len(content_words) >= 2:
                 cname_words_set = set(cname_clean.split())
-                if all(any(cw in cword for cword in cname_words_set) for cw in content_words):
+                # Prefix, not arbitrary substring. The loose form let a content
+                # word match anywhere inside a campaign token, so "DC Coffee
+                # Festival"'s ['dc', 'coffee'] matched an "SDCF ... coffee"
+                # campaign ('dc' sits inside 's-dc-f') and San Diego spend was
+                # attributed to DC. Prefix still absorbs the plurals and
+                # possessives this was written for — austin/austins,
+                # philly/phillys — without reaching into the middle of acronyms.
+                if all(any(cword.startswith(cw) for cword in cname_words_set)
+                       for cw in content_words):
                     match_reason = f"all content words {content_words}"
+                    strategy = 'content_words'
 
         # Strategy 3: Known abbreviation appears as whole word in campaign
         if not match_reason:
@@ -2441,6 +2526,7 @@ class MetaAdsSync:
             for abbr in abbrevs:
                 if abbr in cname_words:
                     match_reason = f"abbreviation '{abbr}'"
+                    strategy = 'abbreviation'
                     break
 
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
@@ -2452,11 +2538,12 @@ class MetaAdsSync:
                     for pattern in self.EVENT_ALIASES[word]:
                         if pattern in event_lower or event_lower in pattern:
                             match_reason = f"reverse alias '{word}'->'{pattern}'"
+                            strategy = 'reverse_alias'
                             break
                 if match_reason:
                     break
 
-        return match_reason
+        return (strategy, match_reason) if match_reason else None
 
     def _find_campaigns(self, event_name: str, event_year: Optional[int] = None):
         """Find Meta campaigns matching an event name using strict matching.
@@ -2563,6 +2650,153 @@ class MetaAdsSync:
     # Match-reason strength ranking for dedup conflict resolution
     _MATCH_RANK = {'full_name': 4, 'content_words': 3, 'abbreviation': 2, 'reverse_alias': 1}
 
+    def dry_run_assignment(self, events_list, campaigns=None):
+        """Report campaign -> festival-edition assignment WITHOUT touching anything.
+
+        Read-only in both directions: campaign metadata is fetched with the same
+        GET path the sync uses, no insights are requested, and nothing is
+        written to ad_spend or daily_snapshots. This is the auditable
+        before/after view of attribution.
+
+        `campaigns` may be supplied to score an already-fetched list (used by
+        tests and by offline replays of real production campaign metadata).
+        """
+        today = date.today()
+        all_campaigns = campaigns if campaigns is not None else self._fetch_all_campaigns()
+        rows = []
+        counts = {'assigned': 0, 'ambiguous': 0, 'no_match': 0}
+        editions = set()
+        for campaign in all_campaigns:
+            entry = {
+                'account_id': self.ad_account_id,
+                'campaign_id': campaign.get('id'),
+                'campaign_name': campaign.get('name'),
+                'status': campaign.get('status'),
+                'parsed_year': self._extract_year(campaign.get('name') or ''),
+            }
+            assignment = self._assign_campaign_to_edition(campaign, events_list, today)
+            if assignment is None:
+                entry.update({'outcome': 'no_match', 'reason': 'no event matched'})
+                counts['no_match'] += 1
+            elif assignment.get('ambiguous'):
+                entry.update({
+                    'outcome': 'ambiguous',
+                    'match_reason': assignment['match_reason'],
+                    'tied_editions': assignment['tied_editions'],
+                    'reason': 'multiple distinct festival editions tied',
+                })
+                counts['ambiguous'] += 1
+            else:
+                canonical = assignment['canonical_event']
+                entry.update({
+                    'outcome': 'assigned',
+                    'match_reason': assignment['match_reason'],
+                    'edition': assignment['edition'],
+                    'raw_candidate_event_ids': assignment['edition_event_ids'],
+                    'raw_candidate_count': len(assignment['edition_event_ids']),
+                    'canonical_event_id': canonical['event_id'],
+                    'canonical_event_name': canonical['name'],
+                    'canonical_event_date': str(canonical['event_date'])[:10],
+                    'edition_last_date': str(assignment['edition_last_date'])[:10],
+                })
+                counts['assigned'] += 1
+                editions.add(assignment['edition'])
+            rows.append(entry)
+        return {
+            'total_campaigns': len(all_campaigns),
+            'counts': counts,
+            'distinct_editions_assigned': len(editions),
+            'campaigns': rows,
+            'writes_performed': 0,
+            'meta_mutations_performed': 0,
+        }
+
+    def _assign_campaign_to_edition(self, campaign, events_list, today):
+        """Resolve one campaign to at most one FESTIVAL EDITION.
+
+        Meta buys against a festival edition; Eventbrite stores that edition as
+        one or more timed-entry session rows. Matching used to tie-break between
+        those raw rows, which produced two failures against real campaigns:
+
+          * several sibling rows share a date, _pick_closest_event() returns
+            None on a same-date tie, and the campaign was skipped — no real
+            active coffee campaign was being assigned at all; and
+          * where one date happened to be uniquely nearest (DC Wine Fest's
+            single 10-16 row against four on 10-17), the whole edition's spend
+            silently landed on that one session while the rest showed $0.
+
+        Collapsing candidates to editions first removes both: sibling sessions
+        are one candidate, so they cannot tie with each other, and the edition —
+        not an arbitrary session — is what wins.
+
+        Returns None (no match), or a dict with either `ambiguous` set, or the
+        chosen edition plus the canonical event row that will carry its spend.
+        """
+        # --- Match raw rows, keeping the strategy so rank ordering applies ---
+        by_edition = {}
+        for event in events_list:
+            event_year = None
+            try:
+                event_year = datetime.fromisoformat(event['event_date']).date().year
+            except Exception:
+                pass
+
+            matched = self._match_strategy(
+                campaign['name'], event['name'], event_year=event_year)
+            if not matched:
+                continue
+            strategy, reason = matched
+
+            # Year gate already rejected explicit cross-year mismatches inside
+            # _match_strategy; the edition key keeps the year for everything else.
+            key = festival_edition_key(event['name'], event['event_date'])
+            if key is None:
+                continue
+
+            slot = by_edition.setdefault(key, {'events': [], 'rank': -1, 'reason': None})
+            slot['events'].append(event)
+            rank = self._MATCH_RANK.get(strategy, 0)
+            if rank > slot['rank']:
+                slot['rank'] = rank
+                slot['reason'] = reason
+
+        if not by_edition:
+            return None
+
+        # --- Strongest match strategy wins; then tie-break BETWEEN editions ---
+        best_rank = max(slot['rank'] for slot in by_edition.values())
+        top = {k: v for k, v in by_edition.items() if v['rank'] == best_rank}
+
+        if len(top) == 1:
+            key, slot = next(iter(top.items()))
+        else:
+            # One representative per edition, so the date tie-break compares
+            # editions rather than sibling sessions of the same edition.
+            reps = {}
+            for k, v in top.items():
+                rep = canonical_edition_event(v['events'])
+                reps[rep['event_id']] = k
+            resolved = self._pick_closest_event(list(
+                canonical_edition_event(v['events']) for v in top.values()), today)
+            if resolved is None:
+                return {
+                    'ambiguous': True,
+                    'match_reason': next(iter(top.values()))['reason'],
+                    'tied_editions': [f"{p}:{y}" for (p, y) in sorted(top.keys())],
+                }
+            key = reps[resolved['event_id']]
+            slot = top[key]
+
+        canonical = canonical_edition_event(slot['events'])
+        return {
+            'ambiguous': False,
+            'edition': f"{key[0]}:{key[1]}",
+            'edition_event_ids': [e['event_id'] for e in slot['events']],
+            'edition_last_date': max(str(e['event_date']) for e in slot['events']),
+            'canonical_event': canonical,
+            'match_reason': slot['reason'],
+        }
+
     def _fetch_daily_insights(self, campaign_id: str, date_start: str, date_stop: str):
         """Fetch daily spend insights for a campaign."""
         url = f"{self.BASE_URL}/{campaign_id}/insights"
@@ -2666,71 +2900,52 @@ class MetaAdsSync:
         ambiguous_campaigns = []    # campaigns that tied and could not be resolved
 
         for campaign in all_campaigns:
-            best_event = None
-            best_reason = None
-            best_rank = -1
-            tied_events = []
-
-            for event in events_list:
-                event_year = None
-                try:
-                    event_year = datetime.fromisoformat(event['event_date']).date().year
-                except Exception:
-                    pass
-
-                match_reason = self._campaign_matches_event(
-                    campaign['name'], event['name'], event_year=event_year)
-                if not match_reason:
-                    continue
-
-                rank = self._MATCH_RANK.get(match_reason, 0)
-
-                if rank > best_rank:
-                    best_event = event
-                    best_reason = match_reason
-                    best_rank = rank
-                    tied_events = [event]
-                elif rank == best_rank and best_event is not None:
-                    tied_events.append(event)
-
-            if best_event is None:
+            assignment = self._assign_campaign_to_edition(campaign, events_list, today)
+            if assignment is None:
                 continue  # Campaign matched no event
-
-            if len(tied_events) > 1:
-                # Multiple events tied at the same match strength — resolve by date
-                resolved = self._pick_closest_event(tied_events, today)
-                if resolved is None:
-                    # Truly ambiguous — fail-safe: skip this campaign
-                    ambiguous_campaigns.append({
-                        'campaign_id': campaign['id'],
-                        'campaign_name': campaign['name'],
-                        'tied_events': [e['name'] for e in tied_events],
-                        'match_reason': best_reason,
-                    })
-                    log.warning(
-                        f"AMBIGUOUS: Campaign '{campaign['name']}' matched {len(tied_events)} "
-                        f"events equally ({best_reason}): "
-                        f"{[e['name'] for e in tied_events]} — skipping per fail-safe"
-                    )
-                    continue
-                best_event = resolved
+            if assignment.get('ambiguous'):
+                ambiguous_campaigns.append({
+                    'campaign_id': campaign['id'],
+                    'campaign_name': campaign['name'],
+                    'tied_events': assignment['tied_editions'],
+                    'match_reason': assignment['match_reason'],
+                })
+                log.warning(
+                    f"AMBIGUOUS: Campaign '{campaign['name']}' matched "
+                    f"{len(assignment['tied_editions'])} distinct festival editions "
+                    f"equally ({assignment['match_reason']}): "
+                    f"{assignment['tied_editions']} — skipping per fail-safe"
+                )
+                continue
 
             campaign_assignments[campaign['id']] = {
                 'campaign': campaign,
-                'event': best_event,
-                'match_reason': best_reason,
+                'event': assignment['canonical_event'],
+                'match_reason': assignment['match_reason'],
+                'edition': assignment['edition'],
+                'edition_event_ids': assignment['edition_event_ids'],
+                'edition_last_date': assignment['edition_last_date'],
             }
             log.info(
-                f"  Assigned campaign '{campaign['name']}' -> event "
-                f"'{best_event['name']}' via {best_reason}"
+                f"  Assigned campaign '{campaign['name']}' -> edition "
+                f"{assignment['edition']} "
+                f"({len(assignment['edition_event_ids'])} session row(s), canonical "
+                f"{assignment['canonical_event']['event_id']}) via {assignment['match_reason']}"
             )
 
-        # --- Phase 3: Group assigned campaigns by event_id ---
-        event_campaigns = {}  # event_id -> [campaign dicts]
+        # --- Phase 3: Group assigned campaigns by CANONICAL event_id ---
+        # One canonical row per edition carries that edition's spend, so a Meta
+        # dollar is stored once even though the edition spans several rows.
+        event_campaigns = {}  # canonical event_id -> [campaign dicts]
+        edition_window_end = {}  # canonical event_id -> edition's last date
         for cid, assignment in campaign_assignments.items():
             eid = assignment['event']['event_id']
             if eid not in event_campaigns:
                 event_campaigns[eid] = []
+            # Insights must cover the whole edition, not just its first day.
+            last = assignment.get('edition_last_date')
+            if last and last > edition_window_end.get(eid, ''):
+                edition_window_end[eid] = last
             event_campaigns[eid].append({
                 'id': assignment['campaign']['id'],
                 'name': assignment['campaign']['name'],
@@ -2746,6 +2961,7 @@ class MetaAdsSync:
             'total_campaigns_fetched': len(all_campaigns),
             'campaigns_assigned': len(campaign_assignments),
             'campaigns_ambiguous': len(ambiguous_campaigns),
+            'editions_assigned': len({a['edition'] for a in campaign_assignments.values()}),
             'ambiguous_details': ambiguous_campaigns,
             'event_results': [],
         }
@@ -2754,7 +2970,8 @@ class MetaAdsSync:
             eid = event['event_id']
             assigned = event_campaigns.get(eid, [])
             result = self.sync_event_spend(
-                eid, event['name'], event['event_date'],
+                eid, event['name'],
+                edition_window_end.get(eid, event['event_date']),
                 campaigns_override=assigned
             )
             results['event_results'].append(result)
