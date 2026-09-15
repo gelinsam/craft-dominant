@@ -112,6 +112,52 @@ def command_auth_error():
     return None
 
 
+def _analysis_edition_identity(db, a):
+    """Resolve an analysis to its festival edition, from the DATABASE.
+
+    Identity must not be re-derived from the analysis's display name. A grouped
+    day analysis is labelled "Austin Coffee Festival - Saturday", which
+    normalises to `austin_coffee_fest_saturday` — a different key from the
+    Sunday view of the very same edition. Deriving identity that way deduped
+    nothing, and the portfolio counted one festival's spend once per day view
+    ($88,403.98 displayed against $49,580.99 stored).
+
+    Those grouped analyses already carry the real constituent event ids, so the
+    edition is resolved through `edition_sibling_ids`, the same authority the
+    spend readers use. The sibling set is identical for Saturday's constituents,
+    Sunday's constituents and any raw session of that edition, and differs
+    across festivals and across years.
+
+    Falls back to the name-derived key only when there is nothing in the
+    database to resolve, and to a per-analysis unique identity after that —
+    unrelated analyses are never merged on a fuzzy name.
+    """
+    seeds = list(getattr(a, 'constituent_event_ids', None) or [])
+    seeds.append(getattr(a, 'event_id', None))
+    resolver = getattr(db, 'edition_sibling_ids', None)
+    if resolver is not None:
+        for seed in seeds:
+            if not seed:
+                continue
+            try:
+                siblings = resolver(seed)
+            except Exception:
+                continue
+            if siblings:
+                # Every constituent of an edition resolves to the same set, so
+                # Saturday's ids and Sunday's ids agree. An id the database has
+                # never seen resolves to just itself, which keeps two unknown
+                # analyses apart instead of merging them.
+                return ('edition', tuple(sorted(set(siblings))))
+    try:
+        key = festival_edition_key(a.event_name, a.event_date)
+    except Exception:
+        key = None
+    if key is not None:
+        return key
+    return ('__unkeyed__', getattr(a, 'event_id', None) or id(a))
+
+
 def portfolio_spend_total(db, analyses) -> float:
     """Portfolio spend with festival editions counted once.
 
@@ -123,13 +169,7 @@ def portfolio_spend_total(db, analyses) -> float:
     """
     seen = {}
     for a in analyses:
-        key = None
-        try:
-            key = festival_edition_key(a.event_name, a.event_date)
-        except Exception:
-            key = None
-        if key is None:
-            key = ('__unkeyed__', getattr(a, 'event_id', id(a)))
+        key = _analysis_edition_identity(db, a)
         spend = float(getattr(a, 'ad_spend', 0) or 0)
         if spend > seen.get(key, 0.0):
             seen[key] = spend
