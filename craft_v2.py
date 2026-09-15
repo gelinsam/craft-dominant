@@ -21,7 +21,9 @@ from campaign_adapter import CampaignDraftAdapter
 from craft_unified import (
     Database,
     DecisionEngine,
+    MetaAdsSync,
     ProfileRebuildBusy,
+    command_auth_error,
     auto_sync_enabled,
     create_app,
 )
@@ -180,17 +182,10 @@ def _build_app():
 
         @wraps(fn)
         def wrapped(*args, **kwargs):
-            expected = os.environ.get("COMMAND_API_KEY", "")
-            if not expected:
-                return jsonify({
-                    "error": "command_api_not_configured",
-                    "message": "COMMAND_API_KEY must be configured before enabling V2 Command API.",
-                }), 503
-
-            auth = request.headers.get("Authorization", "")
-            supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-            if not supplied or not hmac.compare_digest(supplied, expected):
-                return jsonify({"error": "unauthorized"}), 401
+            denied = command_auth_error()
+            if denied is not None:
+                payload, status = denied
+                return jsonify(payload), status
             return fn(*args, **kwargs)
 
         return wrapped
@@ -743,6 +738,46 @@ def _build_app():
             "storage": analytics_storage_info(db),
             "row_counts": analytics_row_counts(db),
         }), 200
+
+    @app.get("/api/v2/diagnostics/meta-assignment")
+    @require_command_auth
+    def v2_meta_assignment_dry_run():
+        """Read-only campaign -> festival-edition assignment report.
+
+        Fetches campaign metadata with GET only, scores it against the current
+        events, and returns what the sync WOULD attribute. Requests no insights,
+        writes no ad_spend, touches no snapshot, mutates nothing on Meta. This is
+        how attribution is reviewed before any spend ingestion runs.
+        """
+        token = os.environ.get("META_ACCESS_TOKEN")
+        accounts = [a.strip() for a in os.environ.get("META_AD_ACCOUNT_ID", "").split(",") if a.strip()]
+        if not token or not accounts:
+            return jsonify({"error": "meta_not_configured"}), 400
+
+        events = db.get_events(upcoming_only=False)
+        combined = {"accounts": [], "totals": {"total_campaigns": 0, "assigned": 0,
+                                               "ambiguous": 0, "no_match": 0}}
+        include = request.args.get("include", "summary") == "campaigns"
+        for acct in accounts:
+            try:
+                report = MetaAdsSync(token, acct, db).dry_run_assignment(events)
+            except Exception as exc:  # diagnostics must never take the app down
+                combined["accounts"].append({"account": acct[-4:], "error": str(exc)[:200]})
+                continue
+            combined["totals"]["total_campaigns"] += report["total_campaigns"]
+            for k in ("assigned", "ambiguous", "no_match"):
+                combined["totals"][k] += report["counts"][k]
+            entry = {
+                "account_suffix": acct[-4:],
+                "total_campaigns": report["total_campaigns"],
+                "counts": report["counts"],
+                "distinct_editions_assigned": report["distinct_editions_assigned"],
+            }
+            if include:
+                entry["campaigns"] = report["campaigns"]
+            combined["accounts"].append(entry)
+        combined["read_only"] = True
+        return jsonify(combined), 200
 
     @app.post("/api/v2/maintenance/rebuild-profiles")
     @require_command_auth

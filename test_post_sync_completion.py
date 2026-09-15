@@ -47,6 +47,10 @@ def _nested_code(func, name):
     raise AssertionError(f"no nested function named {name!r}")
 
 
+
+#: /api/meta-sync is authenticated; these tests drive it as an operator would.
+_AUTH = {"Authorization": "Bearer test-secret-key-12345"}
+
 class _FakeEventbriteSync:
     """Stands in for the real traversal — returns immediately."""
 
@@ -303,7 +307,7 @@ class TestExistingMetaSemanticsPreserved(_PostSyncHarness):
     def test_guard_is_released_after_the_sync(self):
         """A later manual Meta sync must not be blocked by a stale flag."""
         self._run_sync_to_completion()
-        resp = self.client.get("/api/meta-sync")
+        resp = self.client.get("/api/meta-sync", headers=_AUTH)
         self.assertNotEqual(
             resp.status_code, 409,
             "guard left set — /api/meta-sync wrongly reports already_running",
@@ -351,6 +355,9 @@ class TestSingleFlightIsGenuinelyShared(_PostSyncHarness):
         super().setUp()
         os.environ["META_ACCESS_TOKEN"] = "fake-meta-token"
         os.environ["META_AD_ACCOUNT_ID"] = "act_fake_1"
+        # /api/meta-sync is authenticated now, so the gate must be configured
+        # for this test to reach the single-flight guard behind it.
+        os.environ["COMMAND_API_KEY"] = _AUTH["Authorization"].split()[-1]
 
     def test_endpoint_sees_the_flag_set_by_the_background_sync(self):
         _FakeMetaAdsSync.entered = threading.Event()
@@ -362,7 +369,7 @@ class TestSingleFlightIsGenuinelyShared(_PostSyncHarness):
             "background sync never reached the Meta phase",
         )
 
-        resp = self.client.get("/api/meta-sync")
+        resp = self.client.get("/api/meta-sync", headers=_AUTH)
         self.assertEqual(
             resp.status_code, 409,
             "endpoint did not see the guard set by the background sync — "

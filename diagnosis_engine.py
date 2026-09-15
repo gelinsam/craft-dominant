@@ -380,12 +380,26 @@ class DiagnosisEngine:
         impressions_7d = 0
         clicks_7d = 0
         try:
-            total = self.db.get_event_spend(event_id)
+            # Paid media is bought per festival edition, so a Saturday view
+            # must see the festival's spend even when the canonical storage row
+            # is the Sunday one. Without this, V2 reports META SPEND = $0 and
+            # "No paid advertising data" for every non-canonical day.
+            # Fall back to per-event scope on a store that predates edition
+            # reads. Resolving through getattr rather than letting an
+            # AttributeError hit the except below matters: that path returns
+            # $0, and a false zero here is indistinguishable from "no ads ran".
+            if hasattr(self.db, "get_edition_spend"):
+                total = self.db.get_edition_spend(event_id)
+                edition_ids = self.db.edition_sibling_ids(event_id)
+            else:
+                total = self.db.get_event_spend(event_id)
+                edition_ids = [event_id]
             seven_days_ago = (date.today() - timedelta(days=7)).isoformat()
+            marks = ",".join("?" * len(edition_ids))
             rows = self.db.conn.execute(
-                """SELECT SUM(spend) as s, SUM(impressions) as i, SUM(clicks) as c
-                   FROM ad_spend WHERE event_id = ? AND spend_date >= ?""",
-                (event_id, seven_days_ago),
+                f"""SELECT SUM(spend) as s, SUM(impressions) as i, SUM(clicks) as c
+                    FROM ad_spend WHERE event_id IN ({marks}) AND spend_date >= ?""",
+                (*edition_ids, seven_days_ago),
             ).fetchone()
             if rows:
                 spend_7d = self._num(rows["s"])
