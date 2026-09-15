@@ -18,7 +18,13 @@ from functools import wraps
 from flask import jsonify, request
 
 from campaign_adapter import CampaignDraftAdapter
-from craft_unified import Database, DecisionEngine, auto_sync_enabled, create_app
+from craft_unified import (
+    Database,
+    DecisionEngine,
+    ProfileRebuildBusy,
+    auto_sync_enabled,
+    create_app,
+)
 from diagnosis_engine import DiagnosisEngine
 from dominant_agent import OpportunityEngine
 from execution_adapter import ExecutionAdapter
@@ -737,6 +743,51 @@ def _build_app():
             "storage": analytics_storage_info(db),
             "row_counts": analytics_row_counts(db),
         }), 200
+
+    @app.post("/api/v2/maintenance/rebuild-profiles")
+    @require_command_auth
+    def v2_rebuild_profiles():
+        """Rebuild both customer profile tables from already-persisted orders.
+
+        TEMPORARY VALIDATION SURFACE — see _ProfileRebuildControl. It exists to
+        measure PR #11's profile-write batching against the real mounted
+        volume without a 70-minute Eventbrite traversal, and without the
+        post-sync Meta behaviour PR #10 restored.
+
+        Reaches no external API: it calls the same profile phases the full sync
+        calls, over rows already in SQLite. Refuses to start while an Eventbrite
+        full sync holds those phases, rather than queueing behind the write
+        lock — a rebuild racing a traversal would derive profiles from a
+        partially-populated orders table and would time a moving dataset.
+        """
+        control = getattr(app, "profile_rebuild_control", None)
+        if control is None:
+            # Fail closed: without the admission gate there is nothing stopping
+            # this from overlapping a full sync.
+            return jsonify({
+                "status": "unavailable",
+                "error": "rebuild_control_unavailable",
+                "message": "Profile rebuild admission control is not wired up.",
+            }), 503
+        try:
+            result = control.run()
+        except ProfileRebuildBusy as busy:
+            return jsonify({
+                "status": "rejected",
+                "reason": busy.reason,
+                "message": {
+                    "eventbrite_sync_running":
+                        "An Eventbrite full sync is running and rebuilds the same "
+                        "customer tables. Retry when /api/sync-status reports idle.",
+                    "profile_rebuild_running":
+                        "A profile rebuild is already in progress.",
+                }.get(busy.reason, "Profile rebuild is not available right now."),
+            }), 409
+        except Exception as exc:
+            log.exception("Profile rebuild failed")
+            return jsonify({"status": "error", "error": type(exc).__name__,
+                            "message": str(exc)[:500]}), 500
+        return jsonify(result), 200
 
     return app
 
