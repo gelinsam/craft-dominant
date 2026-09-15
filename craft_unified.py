@@ -453,6 +453,13 @@ _READ_ONLY_SQL = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
+# Any run of non-word, non-space characters. Campaign and event names are
+# normalised by REPLACING these with a space rather than deleting them, so a
+# delimiter separates tokens instead of fusing them. See
+# MetaAdsSync._tokenize_name for why that distinction decides whether real
+# spend is attributed or silently dropped.
+_PUNCT_RUN = re.compile(r'[^\w\s]+')
+
 
 class _WriteSerializingConnection:
     """Gives an open write transaction exclusive ownership of the connection.
@@ -2492,6 +2499,10 @@ class MetaAdsSync:
         # one token reach two different cities. San Francisco has 'sfcf'/'sf'.
         'scf': ['seattle coffee'],
         'sea': ['seattle coffee'],
+        # 'seacf' is a live variant in the production ad account alongside
+        # 'sea' and 'scf'. Without it those campaigns matched nothing and their
+        # spend was dropped rather than misattributed.
+        'seacf': ['seattle coffee'],
         'sfcf': ['san francisco coffee', 'sf coffee'],
         'sf': ['sf coffee', 'san francisco coffee'],
         'sdcf': ['san diego coffee'],
@@ -2555,14 +2566,33 @@ class MetaAdsSync:
         m = re.search(r'\b(20[2-3]\d)\b', text)
         return int(m.group(1)) if m else None
 
+    @staticmethod
+    def _tokenize_name(text: str) -> str:
+        """Lowercase `text` with punctuation reduced to a token boundary.
+
+        Punctuation used to be DELETED rather than separated, which fused a
+        delimiter's neighbours into a single token: "Instagram post:DCCF Less
+        Labor..." normalised to "postdccf", so the 'dccf' alias was no longer a
+        whole word and neither the abbreviation nor the reverse-alias strategy
+        could see it. The identical campaign written "post: DCCF" matched
+        normally, so attribution depended on whether a human typed a space --
+        and the spend on the unspaced copies was silently dropped.
+
+        Substituting a space keeps every alias reachable as a whole word.
+        Collapsing the run matters too: deleting the ',' in "Bacon, Beer" left
+        "bacon  beer" with a double space, which defeated the full-name
+        substring test against the single-spaced cleaned event name. Both sides
+        now normalise through here, so that class of mismatch cannot reappear.
+        """
+        return ' '.join(_PUNCT_RUN.sub(' ', text or '').split()).lower()
+
     def _clean_event_name(self, event_name: str) -> str:
         """Strip year, season, edition from event name and return lowercase cleaned version."""
         cleaned = re.sub(r'\b20\d{2}\b', '', event_name)
         for word in ['spring edition', 'fall edition', 'summer edition', 'winter edition',
                       'edition', 'spring', 'fall', 'summer', 'winter']:
             cleaned = re.sub(r'\b' + word + r'\b', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'[^\w\s]', '', cleaned)
-        return ' '.join(cleaned.split()).strip().lower()
+        return self._tokenize_name(cleaned)
 
     def _get_abbreviations(self, event_name: str) -> List[str]:
         """Get known abbreviations for this event from the alias map."""
@@ -2615,7 +2645,7 @@ class MetaAdsSync:
                 return None  # Hard reject: explicit year mismatch
 
         cname = campaign_name.lower()
-        cname_clean = re.sub(r'[^\w\s]', '', cname)
+        cname_clean = self._tokenize_name(cname)
 
         match_reason = None
         strategy = None
@@ -2656,7 +2686,7 @@ class MetaAdsSync:
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
         if not match_reason:
             event_lower = event_name.lower()
-            cname_words = set(re.sub(r'[^\w\s]', '', cname).split())
+            cname_words = set(self._tokenize_name(cname).split())
             for word in cname_words:
                 if word in self.EVENT_ALIASES:
                     for pattern in self.EVENT_ALIASES[word]:
