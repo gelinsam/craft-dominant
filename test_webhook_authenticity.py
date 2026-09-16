@@ -498,3 +498,48 @@ class TestMailchimpInventoryIntegrity(unittest.TestCase):
         from unittest.mock import Mock
         self.client._request = Mock(return_value={'members':[]})
         self.assertIsNone(self.client.get_suppressed_members())
+
+
+class TestMailchimpConsentBoundary(unittest.TestCase):
+    def setUp(self):
+        from craft_engine import MailchimpClient
+        from unittest.mock import Mock
+        self.client = MailchimpClient.__new__(MailchimpClient)
+        self.client.audience_id = 'austin'
+        self.client._request_strict = Mock()
+        self.client._get_members_by_status = Mock(return_value=['yes@example.com'])
+
+    def test_buyer_without_audience_consent_is_never_subscribed(self):
+        with self.assertRaises(RuntimeError):
+            self.client.ensure_members(['buyer@example.com'], tag='test')
+        self.client._request_strict.assert_not_called()
+
+    def test_unknown_consent_blocks_before_provider_mutation(self):
+        self.client._get_members_by_status.return_value = None
+        with self.assertRaises(RuntimeError):
+            self.client.ensure_members(['yes@example.com'], tag='test')
+        self.client._request_strict.assert_not_called()
+
+    def test_verified_segment_contains_exact_existing_subscribers(self):
+        from unittest.mock import Mock
+        from provider_outcome import ProviderResponse
+        self.client._request_strict.return_value = ProviderResponse(200, {'id':123})
+        self.client._request = Mock(return_value={'total_items':1, 'members':[
+            {'email_address':'yes@example.com', 'status':'subscribed'}]})
+        result = self.client.ensure_members(['yes@example.com'], tag='attempt-one')
+        self.assertEqual(result['added'], 0)
+        self.assertEqual(self.client.get_tag_segment_id('attempt-one'), 123)
+        self.assertIsNone(self.client.get_tag_segment_id('old-attempt'))
+        args = self.client._request_strict.call_args.args
+        self.assertEqual(args[1], '/lists/austin/segments')
+        self.assertNotIn('status_if_new', str(args))
+
+    def test_equal_size_wrong_membership_still_blocks(self):
+        from unittest.mock import Mock
+        from provider_outcome import ProviderResponse
+        self.client._request_strict.return_value = ProviderResponse(200, {'id':123})
+        self.client._request = Mock(return_value={'total_items':1, 'members':[
+            {'email_address':'different@example.com', 'status':'subscribed'}]})
+        with self.assertRaises(RuntimeError):
+            self.client.ensure_members(['yes@example.com'], tag='attempt-one')
+        self.assertIsNone(self.client.get_tag_segment_id('attempt-one'))

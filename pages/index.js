@@ -684,12 +684,14 @@ export default function CraftDashboard() {
             <div className="flex bg-gray-100 rounded-lg p-1">
               {['events', 'crm', 'overlap'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : t === 'crm' ? 'CRM' : 'Overlap'}</button>))}
             </div>
+            <a href="/audiences" className="text-sm font-medium text-blue-700">Audiences</a>
             <button onClick={() => { if (!syncing) triggerSync(); }} className={`px-3 py-2 rounded-lg text-sm font-medium ${syncing ? 'bg-gray-200 text-gray-400' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} disabled={syncing}>{syncing ? 'Syncing...' : 'Refresh Data'}</button>
           </div>
         </div>
       </header>
 
       {syncing && <div className="bg-blue-600 text-white py-2 px-6 text-center text-sm">Syncing data from Eventbrite... Dashboard will update automatically.</div>}
+      {(dashboard?.data_quality?.unknown_amounts > 0 || dashboard?.data_quality?.unknown_ticket_counts > 0) && <div role="status" className="bg-amber-50 text-amber-900 py-2 px-6 text-sm">Some order details are missing: {dashboard.data_quality.unknown_amounts} amounts and {dashboard.data_quality.unknown_ticket_counts} ticket counts. Totals include observed values only.</div>}
       {syncError && <div className="bg-red-100 text-red-700 py-2 px-6 text-center text-sm">Sync error: {syncError}</div>}
 
       <main className="max-w-7xl mx-auto px-6 py-6">

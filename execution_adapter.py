@@ -735,8 +735,8 @@ class ExecutionAdapter:
         proof that no recipient could have received mail:
 
           1. Mailchimp not configured  — no provider contact occurred.
-          2. ensure_members failed     — audience upsert only; adding or
-                                         tagging members sends nothing.
+          2. ensure_members failed     — consent validation / segment
+                                         preparation; no campaign created.
           3. get_tag_segment_id failed — read-only lookup.
           4. create definite failure   — campaign rejected, or created
                                          with no content. A contentless
@@ -753,19 +753,13 @@ class ExecutionAdapter:
         every 5xx, every timeout, every reset, every unparseable body —
         routes to `ambiguous` and blocks retry until reconciliation.
 
-        ── PROVIDER MUTATION IDEMPOTENCY ────────────────────────────
-        Steps 1-2 mutate provider state and may be repeated after a
-        crash.  Both are safe to repeat:
-
-          ensure_members  POST /lists/{id} with update_existing=true and
-                          status_if_new=subscribed.  An upsert: existing
-                          members keep their status, so re-running adds
-                          nothing new and changes no one's subscription.
-          tag_members     Static segment membership is set-valued, so
-                          re-adding the same addresses is a no-op.
-
-        Neither dispatches email, so repetition is harmless — which is
-        why they may safely live behind a retryable failure state.
+        Preparation never creates or subscribes contacts. It requires consent
+        in the destination audience, creates a fresh attempt-specific segment,
+        and verifies its exact membership. A failed preparation can leave an
+        unused segment but cannot fall back to the entire audience. Review any
+        provider automations triggered by segment/tag changes before enabling
+        external sending; this method itself does not dispatch a campaign until
+        the checkpointed send action below.
         """
         if not self.campaign_engine or not self.campaign_engine.mailchimp:
             attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
@@ -774,11 +768,13 @@ class ExecutionAdapter:
             raise RuntimeError("Mailchimp not configured — cannot send")
 
         mc = self.campaign_engine.mailchimp
-        tag_name = f"v2-{intervention.id}"
+        tag_name = f"v2-{intervention.id}-{attempt.id}"
 
         # ── Step 1: Push audience to Mailchimp ────────────────────────
         try:
             member_stats = mc.ensure_members(audience_emails, tag=tag_name)
+            if not isinstance(member_stats, dict) or member_stats.get('errors', 1):
+                raise RuntimeError('Mailchimp did not confirm the complete audience')
         except Exception as e:
             attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
             attempt.error_message = f"ensure_members failed: {e}"
@@ -788,6 +784,8 @@ class ExecutionAdapter:
         # ── Step 2: Get segment ID ────────────────────────────────────
         try:
             segment_id = mc.get_tag_segment_id(tag_name)
+            if not isinstance(segment_id, int) or isinstance(segment_id, bool) or segment_id <= 0:
+                raise RuntimeError('A verified segment is required; whole-audience fallback is forbidden')
         except Exception as e:
             attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
             attempt.error_message = f"get_tag_segment_id failed: {e}"

@@ -1796,12 +1796,14 @@ class Database:
         return int(row['t']) if row else 0
 
     def get_edition_spend_status(self, event_id: str) -> str:
-        """Best spend status across the edition — see get_spend_status()."""
+        """Edition spend is untrusted if any stored constituent is incomplete."""
         priority = {'current_has_spend': 5, 'current_zero_spend': 4,
                     'stale': 3, 'no_records': 2, 'unavailable': 1}
         best = 'no_records'
         for eid in self.edition_sibling_ids(event_id):
             status = self.get_spend_status(eid)
+            if status == 'unavailable':
+                return 'unavailable'
             if priority.get(status, 0) > priority.get(best, 0):
                 best = status
         return best
@@ -2728,7 +2730,7 @@ class EventbriteSync:
                 values_sorted = sorted(values)
                 n = len(values_sorted)
                 curve_data[days] = {
-                    'median': values_sorted[n // 2],
+                    'median': statistics.median(values_sorted),
                     'p25': values_sorted[max(0, n // 4 - 1)] if n >= 4 else values_sorted[0],
                     'p75': values_sorted[min(n - 1, 3 * n // 4)] if n >= 4 else values_sorted[-1],
                     'samples': n
@@ -3318,13 +3320,21 @@ class MetaAdsSync:
                         total_spend += spend
                 total_days += len(insights)
             # Phase 2: Write all rows in a single transaction
+            spend_before = self.db.get_event_spend(event_id)
             self.db.save_ad_spend_batch(batch_rows)
             # Report persisted facts after unknown-preserving merges.
             total_spend = self.db.get_event_spend(event_id)
+            regression = None
+            if spend_before > 0 and total_spend < spend_before * 0.95:
+                regression = {'before': round(spend_before, 2),
+                              'after': round(total_spend, 2),
+                              'decrease': round(spend_before - total_spend, 2)}
+                log.warning('INTEGRITY: Meta spend decreased for %s: %s; review provider restatement',
+                            event_id, regression)
             log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns, {len(batch_rows)} rows")
             return {'event_id': event_id, 'total_spend': round(total_spend, 2),
                     'campaigns_found': len(campaigns), 'days_of_data': total_days,
-                    'rows_written': len(batch_rows)}
+                    'rows_written': len(batch_rows), 'spend_regression': regression}
         except Exception as e:
             log.error(f"Meta sync error for {event_id}: {e}")
             return {'event_id': event_id, 'total_spend': 0, 'campaigns_found': 0,
@@ -3419,6 +3429,7 @@ class MetaAdsSync:
             'editions_assigned': len({a['edition'] for a in campaign_assignments.values()}),
             'ambiguous_details': ambiguous_campaigns,
             'event_results': [],
+            'spend_regressions': [],
         }
 
         for event in events_list:
@@ -3430,6 +3441,8 @@ class MetaAdsSync:
                 campaigns_override=assigned
             )
             results['event_results'].append(result)
+            if result.get('spend_regression'):
+                results['spend_regressions'].append({'event_id': eid, **result['spend_regression']})
             results['total_spend'] += result.get('total_spend', 0)
             results['total_rows'] += result.get('rows_written', 0)
             if result.get('error'):
@@ -4811,7 +4824,12 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         # Customer stats
         segments = db.get_segment_counts()
         total_customers = db.get_customer_count()
+        unknown_orders = db.conn.execute(
+            "SELECT COUNT(*) - COUNT(gross_amount) AS unknown_amounts, "
+            "COUNT(*) - COUNT(ticket_count) AS unknown_ticket_counts FROM orders"
+        ).fetchone()
         return jsonify({
+            'data_quality': dict(unknown_orders),
             'portfolio': {
                 'total_tickets': total_tickets,
                 'total_capacity': total_capacity,

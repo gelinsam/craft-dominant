@@ -625,3 +625,33 @@ class TestSQLiteClaimRace(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 check.execute("INSERT INTO v2_send_attempts (intervention_id,execution_generation,idempotency_key,audience_hash,claimed_at) VALUES ('one',1,'key','hash','2026-09-16')")
             check.close()
+
+
+class TestAuditMedianAndRestatement(unittest.TestCase):
+    def test_two_prior_editions_use_arithmetic_median(self):
+        from craft_unified import DecisionEngine
+        db = Database(':memory:')
+        today = datetime.date.today()
+        target = today + datetime.timedelta(days=20)
+        for eid, event_date, tickets in [('new', target, 30), ('old1', today - datetime.timedelta(days=365), 40), ('old2', today - datetime.timedelta(days=730), 60)]:
+            db.upsert_event({'event_id':eid, 'name':f'Austin Coffee Festival {event_date.year}', 'event_date':event_date.isoformat(), 'capacity':1000, 'city':'Austin', 'event_type':'coffee'})
+            db.insert_order({'order_id':eid, 'event_id':eid, 'email':'test@example.com', 'ticket_count':tickets, 'gross_amount':tickets * 20, 'order_timestamp':today.isoformat()})
+            if eid != 'new':
+                db.save_snapshot(eid, (event_date-datetime.timedelta(days=20)).isoformat(),20,tickets, tickets*20)
+        analysis = DecisionEngine(db).analyze_event('new')
+        self.assertEqual(analysis.historical_median_at_point, 50)
+        self.assertEqual(analysis.pace_vs_historical, -40)
+        db.conn.close()
+
+    def test_observed_downward_restatement_is_applied_and_reported(self):
+        from craft_unified import MetaAdsSync
+        from unittest.mock import Mock
+        db = Database(':memory:')
+        db.save_ad_spend('E', 'C', 'Campaign', '2026-09-01', 250)
+        sync = MetaAdsSync.__new__(MetaAdsSync)
+        sync.db = db
+        sync._fetch_daily_insights = Mock(return_value=[{'date_start':'2026-09-01','spend':'200'}])
+        result = sync.sync_event_spend('E','Austin Coffee','2026-10-17', campaigns_override=[{'id':'C','name':'Campaign'}])
+        self.assertEqual(result['total_spend'], 200)
+        self.assertEqual(result['spend_regression']['decrease'], 50)
+        db.conn.close()

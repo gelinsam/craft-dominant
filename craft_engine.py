@@ -512,84 +512,66 @@ class MailchimpClient:
     # ── Member management ──────────────────────────────────
 
     def ensure_members(self, emails: List[str], tag: str = None) -> Dict:
-        """Batch add/update members in the audience. Optionally apply a tag.
+        """Require existing consent in this audience; never subscribe buyers.
 
-        Uses Mailchimp batch subscribe endpoint (up to 500 per call).
-        Status 'subscribed' for new, existing members keep their status.
-        Returns {'added': N, 'updated': N, 'errors': N}.
+        Ticket purchase history is targeting evidence, not permission to add a
+        person to a different festival's mailing list. Any unknown membership
+        blocks preparation before campaign creation.
         """
-        stats = {'added': 0, 'updated': 0, 'errors': 0}
-
-        # Process in chunks of 500 (Mailchimp limit)
-        for i in range(0, len(emails), 500):
-            chunk = emails[i:i+500]
-            members = []
-            for email in chunk:
-                members.append({
-                    'email_address': email.lower().strip(),
-                    'status_if_new': 'subscribed',
-                })
-
-            data = {
-                'members': members,
-                'update_existing': True,
-            }
-
-            result = self._request('POST', f'/lists/{self.audience_id}', data, timeout=60)
-            if result:
-                stats['added'] += result.get('total_created', 0)
-                stats['updated'] += result.get('total_updated', 0)
-                stats['errors'] += result.get('error_count', 0)
-                if result.get('errors'):
-                    for err in result['errors'][:5]:
-                        log.warning(f"Mailchimp member error: {err.get('email_address')}: {err.get('error')}")
-            else:
-                stats['errors'] += len(chunk)
-
-            # Brief pause between chunks
-            if i + 500 < len(emails):
-                time.sleep(1)
-
-        # Apply tag if specified
-        if tag and stats['added'] + stats['updated'] > 0:
-            self.tag_members(emails, tag)
-
-        return stats
+        expected = {e.lower().strip() for e in emails if e and e.strip()}
+        subscribed = self._get_members_by_status('subscribed')
+        if subscribed is None or not expected or not expected.issubset(set(subscribed)):
+            raise RuntimeError('Audience consent is missing or could not be verified')
+        if tag:
+            self.tag_members(sorted(expected), tag)
+        return {'added': 0, 'updated': len(expected), 'errors': 0}
 
     def tag_members(self, emails: List[str], tag: str) -> bool:
-        """Apply a tag to a list of members. Creates the tag if it doesn't exist."""
-        # Process in chunks of 500
-        for i in range(0, len(emails), 500):
-            chunk = emails[i:i+500]
-            data = {
-                'members': [
-                    {'email_address': e.lower().strip(), 'status': 'active'}
-                    for e in chunk
-                ],
-            }
-            result = self._request('POST', f'/lists/{self.audience_id}/segments', {
-                'name': tag,
-                'static_segment': [e.lower().strip() for e in chunk],
+        """Create a fresh exact segment and verify membership before sending.
+
+        Never merge an earlier attempt's segment: it may contain new buyers
+        that the current audience deliberately excluded. Transport uncertainty
+        may leave an unused segment, but cannot authorize a campaign.
+        """
+        expected = sorted({e.lower().strip() for e in emails})
+        if not expected:
+            raise RuntimeError('Empty segment is not sendable')
+        result = self._request_strict('POST', f'/lists/{self.audience_id}/segments', {
+            'name': tag, 'static_segment': expected[:500],
+        }).body
+        segment_id = result.get('id')
+        if not isinstance(segment_id, int) or isinstance(segment_id, bool) or segment_id <= 0:
+            raise RuntimeError('Mailchimp did not confirm a segment ID')
+        for offset in range(500, len(expected), 500):
+            self._request_strict('POST', f'/lists/{self.audience_id}/segments/{segment_id}', {
+                'members_to_add': expected[offset:offset + 500],
             })
-
-            # If tag already exists, add members to it
-            if result is None:
-                # Find existing tag
-                tags_resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
-                if tags_resp:
-                    existing_tag_id = None
-                    for seg in tags_resp.get('segments', []):
-                        if seg.get('name') == tag:
-                            existing_tag_id = seg['id']
-                            break
-                    if existing_tag_id:
-                        self._request('POST', f'/lists/{self.audience_id}/segments/{existing_tag_id}', {
-                            'members_to_add': [e.lower().strip() for e in chunk],
-                        })
-
-            if i + 500 < len(emails):
-                time.sleep(0.5)
-
+        actual = set()
+        offset = 0
+        while True:
+            page = self._request('GET',
+                f'/lists/{self.audience_id}/segments/{segment_id}/members?count=1000&offset={offset}',
+                timeout=60)
+            if not isinstance(page, dict) or not isinstance(page.get('members'), list):
+                raise RuntimeError('Segment membership could not be verified')
+            if page.get('total_items') != len(expected):
+                raise RuntimeError('Segment membership count does not match approved audience')
+            members = page['members']
+            for member in members:
+                email = member.get('email_address', '').lower().strip()
+                if member.get('status') != 'subscribed' or not email or email in actual:
+                    raise RuntimeError('Segment contains unverified subscribers')
+                actual.add(email)
+            offset += len(members)
+            if offset == len(expected):
+                break
+            if not members or offset > len(expected):
+                raise RuntimeError('Segment membership pagination incomplete')
+        if actual != set(expected):
+            raise RuntimeError('Segment membership does not match approved audience')
+        if not hasattr(self, '_verified_segments'):
+            self._verified_segments = {}
+        self._verified_segments[tag] = segment_id
         return True
 
     # ── Campaign creation & sending ────────────────────────
@@ -804,13 +786,8 @@ class MailchimpClient:
         return self._request('GET', f'/reports/{mc_campaign_id}')
 
     def get_tag_segment_id(self, tag: str) -> Optional[int]:
-        """Find the segment ID for a given tag name."""
-        resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
-        if resp:
-            for seg in resp.get('segments', []):
-                if seg.get('name') == tag:
-                    return seg['id']
-        return None
+        """Only return the exact segment verified during this preparation."""
+        return getattr(self, '_verified_segments', {}).get(tag)
 
     # ── Suppression queries ───────────────────────────────
 
