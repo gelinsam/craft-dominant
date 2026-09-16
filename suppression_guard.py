@@ -348,7 +348,7 @@ class SuppressionGuard:
 
         # Suppression state is valid — now read the actual emails
         try:
-            rows = self.db.conn.execute("SELECT email FROM suppressions").fetchall()
+            rows = self._read_suppression_emails()
             emails = {r["email"] for r in rows}
         except Exception as e:
             return SuppressionStatus.UNAVAILABLE, {
@@ -513,6 +513,17 @@ class SuppressionGuard:
 
         self._write_sentinel(sentinel_data)
 
+    def _read_suppression_emails(self):
+        return self.db.conn.execute("SELECT email FROM suppressions").fetchall()
+
+    def _replace_suppression_emails(self, emails):
+        self.db.conn.execute("DELETE FROM suppressions")
+        for email in emails:
+            self.db.conn.execute(
+                "INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'mailchimp_suppressed')",
+                (email,))
+        self.db.conn.commit()
+
     def refresh_from_mailchimp(self, mailchimp_client) -> Dict[str, Any]:
         """Perform an authoritative full-refresh of suppressions from Mailchimp.
 
@@ -556,14 +567,7 @@ class SuppressionGuard:
         # Step 3: Replace email set in SQLite (analytics data plane)
         now = datetime.now(timezone.utc).isoformat()
         try:
-            self.db.conn.execute("DELETE FROM suppressions")
-            for email in normalized:
-                self.db.conn.execute(
-                    "INSERT OR IGNORE INTO suppressions (email, reason) "
-                    "VALUES (?, 'mailchimp_suppressed')",
-                    (email,),
-                )
-            self.db.conn.commit()
+            self._replace_suppression_emails(normalized)
         except Exception as e:
             try:
                 self.db.conn.rollback()

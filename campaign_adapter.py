@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from intervention_model import Intervention, InterventionStatus
 from suppression_guard import SuppressionGuard, SuppressionStatus
+from audience_suppression import guard_for_events
 
 log = logging.getLogger("craft.campaign_adapter")
 
@@ -263,9 +264,8 @@ class CampaignDraftAdapter:
             buyer_set.update(self.db.get_event_buyers(eid))
 
         # Suppression check — fail-closed invariant
-        supp_status, supp_details, suppressed = (
-            self.suppression_guard.get_suppressions_if_valid()
-        )
+        guard = guard_for_events(self.db, constituent_event_ids, self.suppression_guard)
+        supp_status, supp_details, suppressed = guard.get_suppressions_if_valid()
         if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             raise ValueError(
                 f"Suppression check failed ({supp_status.value}): "
@@ -313,11 +313,14 @@ class CampaignDraftAdapter:
         ids_str = ", ".join(f"'{eid}'" for eid in constituent_event_ids)
         cty = city.replace("'", "''")
         etype = event_type.replace("'", "''")
+        suppression_source = 'suppressions'
+        if getattr(guard, 'audience_id', None):
+            suppression_source = f"audience_suppressions WHERE audience_id = '{guard.audience_id}'"
         sql = f"""
             SELECT DISTINCT c.email FROM customers c
             WHERE (c.favorite_city = '{cty}' OR c.event_types LIKE '%{etype}%')
             AND c.email NOT IN (SELECT email FROM orders WHERE event_id IN ({ids_str}))
-            AND c.email NOT IN (SELECT email FROM suppressions)
+            AND c.email NOT IN (SELECT email FROM {suppression_source})
         """
 
         return {
@@ -338,9 +341,8 @@ class CampaignDraftAdapter:
         # Get suppressions — fail-closed invariant.
         # Suppression data must be positively validated via the sync sentinel.
         # If suppression state is unknown, stale, or unverified-empty, block.
-        supp_status, supp_details, suppressed = (
-            self.suppression_guard.get_suppressions_if_valid()
-        )
+        guard = guard_for_events(self.db, [event_id], self.suppression_guard)
+        supp_status, supp_details, suppressed = guard.get_suppressions_if_valid()
         if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             raise ValueError(
                 f"Suppression check failed ({supp_status.value}): "
@@ -382,11 +384,14 @@ class CampaignDraftAdapter:
         eid = event_id.replace("'", "''")
         cty = city.replace("'", "''")
         etype = event_type.replace("'", "''")
+        suppression_source = 'suppressions'
+        if getattr(guard, 'audience_id', None):
+            suppression_source = f"audience_suppressions WHERE audience_id = '{guard.audience_id}'"
         sql = f"""
             SELECT DISTINCT c.email FROM customers c
             WHERE (c.favorite_city = '{cty}' OR c.event_types LIKE '%{etype}%')
             AND c.email NOT IN (SELECT email FROM orders WHERE event_id = '{eid}')
-            AND c.email NOT IN (SELECT email FROM suppressions)
+            AND c.email NOT IN (SELECT email FROM {suppression_source})
         """
 
         return {

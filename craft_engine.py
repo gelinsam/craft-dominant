@@ -51,6 +51,121 @@ from provider_outcome import (
 log = logging.getLogger('craft.engine')
 
 # =============================================================================
+# MAILCHIMP WEBHOOK AUTHENTICITY
+# =============================================================================
+# Mailchimp's Marketing API guide "Synchronize Audience Data with Webhooks"
+# documents optional HMAC signing for audience webhooks:
+#
+#   X-Mailchimp-Signature: t=<unix_seconds>,v1=<64 hex chars>
+#   v1 = HMAC-SHA256(key=signing_secret, message="{t}.{raw_body}")
+#
+# with three rules that are easy to get wrong and are therefore spelled out
+# here: verify against the RAW body (parsing or URL-decoding first changes the
+# bytes), compare in constant time, and reject anything outside a five-minute
+# window.
+#
+# Scope of that window, stated precisely because it is easy to overclaim: it is
+# a FRESHNESS check, not deduplication. It bounds how long a captured delivery
+# stays replayable to five minutes; it does not detect the same valid delivery
+# arriving twice inside that window. Suppression inserts are idempotent: they
+# use INSERT OR IGNORE keyed on email, and the sentinel recomputes the count.
+# However, the processor also appends email_events rows; duplicate deliveries
+# can duplicate telemetry. This window does not deduplicate those writes or
+# guarantee exactly-once processing.
+
+# "reject ... where the timestamp is more than 5 minutes old" — Mailchimp.
+MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS = 300
+
+_MC_SIG_TIMESTAMP = re.compile(r'(?:\A|,)\s*t=(\d{1,20})\s*(?=,|\Z)')
+_MC_SIG_V1 = re.compile(r'(?:\A|,)\s*v1=([0-9a-fA-F]{64})\s*(?=,|\Z)')
+
+
+def verify_mailchimp_signature(signing_secret: str, signature_header: str,
+                               raw_body: bytes,
+                               tolerance_seconds: int = MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS,
+                               now: Optional[float] = None) -> Tuple[bool, str]:
+    """Verify an X-Mailchimp-Signature header against the raw request body.
+
+    Returns (ok, reason). The reason is safe to log and to return to the
+    caller: it names the failure class, never any part of the secret or the
+    expected signature.
+    """
+    if not signing_secret:
+        return False, 'signing_secret_not_configured'
+    if not signature_header:
+        return False, 'missing_signature_header'
+
+    ts_match = _MC_SIG_TIMESTAMP.search(signature_header)
+    sig_match = _MC_SIG_V1.search(signature_header)
+    if not ts_match or not sig_match:
+        # Also catches an unsupported scheme version: a header carrying only
+        # v2=... has no v1 to verify, and must not be treated as signed.
+        return False, 'malformed_signature_header'
+
+    try:
+        timestamp = int(ts_match.group(1))
+    except ValueError:
+        return False, 'malformed_signature_header'
+
+    current = time.time() if now is None else now
+    age = current - timestamp
+    if age > tolerance_seconds:
+        return False, 'stale_timestamp'
+    if age < -tolerance_seconds:
+        # A timestamp far in the future is equally not a live delivery.
+        return False, 'timestamp_in_future'
+
+    if not isinstance(raw_body, (bytes, bytearray)):
+        raw_body = str(raw_body).encode()
+
+    signed_payload = f'{timestamp}.'.encode() + bytes(raw_body)
+    expected = hmac.new(signing_secret.encode(), signed_payload,
+                        hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected, sig_match.group(1).lower()):
+        return False, 'signature_mismatch'
+    return True, 'ok'
+
+
+def normalize_mailchimp_form(form) -> Dict[str, Any]:
+    """Turn Mailchimp's form-encoded delivery into the nested dict we consume.
+
+    Mailchimp posts application/x-www-form-urlencoded, not JSON, and expresses
+    nesting with bracket notation:
+
+        type=unsubscribe&data[email]=a@b.com&data[merges][FNAME]=Ada
+
+    A flat ``form.to_dict()`` leaves the key as the literal string
+    ``data[email]``, so a consumer reading ``payload['data']['email']`` finds
+    nothing -- and the handler happily reports success while recording no
+    suppression. That is how a genuine unsubscribe gets lost silently, which is
+    worse than rejecting it, so the shape is reconstructed here.
+    """
+    out: Dict[str, Any] = {}
+    if not form:
+        return out
+    for key, value in form.items():
+        head, _, rest = key.partition('[')
+        if not rest:
+            out[key] = value
+            continue
+        # data[merges][FNAME] -> ['merges', 'FNAME']
+        parts = [p for p in re.findall(r'\[([^\[\]]*)\]', '[' + rest) if p != '']
+        node = out.setdefault(head, {})
+        for part in parts[:-1]:
+            nxt = node.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        if parts:
+            node[parts[-1]] = value
+        else:
+            out[head] = value
+    return out
+
+
+# =============================================================================
 # SCHEMA — campaigns, sends, tracking, learnings
 # =============================================================================
 ENGINE_SCHEMA = """
@@ -397,131 +512,69 @@ class MailchimpClient:
     # ── Member management ──────────────────────────────────
 
     def ensure_members(self, emails: List[str], tag: str = None) -> Dict:
-        """Batch add/update members in the audience. Optionally apply a tag.
+        """Require existing consent in this audience; never subscribe buyers.
 
-        Uses Mailchimp batch subscribe endpoint (up to 500 per call).
-        Status 'subscribed' for new, existing members keep their status.
-        Returns {'added': N, 'updated': N, 'errors': N}.
+        Ticket purchase history is targeting evidence, not permission to add a
+        person to a different festival's mailing list. Any unknown membership
+        blocks preparation before campaign creation.
         """
-        stats = {'added': 0, 'updated': 0, 'errors': 0}
-
-        # Process in chunks of 500 (Mailchimp limit)
-        for i in range(0, len(emails), 500):
-            chunk = emails[i:i+500]
-            members = []
-            for email in chunk:
-                members.append({
-                    'email_address': email.lower().strip(),
-                    'status_if_new': 'subscribed',
-                })
-
-            data = {
-                'members': members,
-                'update_existing': True,
-            }
-
-            result = self._request('POST', f'/lists/{self.audience_id}', data, timeout=60)
-            if result:
-                stats['added'] += result.get('total_created', 0)
-                stats['updated'] += result.get('total_updated', 0)
-                stats['errors'] += result.get('error_count', 0)
-                if result.get('errors'):
-                    for err in result['errors'][:5]:
-                        log.warning(f"Mailchimp member error: {err.get('email_address')}: {err.get('error')}")
-            else:
-                stats['errors'] += len(chunk)
-
-            # Brief pause between chunks
-            if i + 500 < len(emails):
-                time.sleep(1)
-
-        # Apply tag if specified
-        if tag and stats['added'] + stats['updated'] > 0:
-            self.tag_members(emails, tag)
-
-        return stats
+        expected = {e.lower().strip() for e in emails if e and e.strip()}
+        subscribed = self._get_members_by_status('subscribed')
+        if subscribed is None or not expected or not expected.issubset(set(subscribed)):
+            raise RuntimeError('Audience consent is missing or could not be verified')
+        if tag:
+            self.tag_members(sorted(expected), tag)
+        return {'added': 0, 'updated': len(expected), 'errors': 0}
 
     def tag_members(self, emails: List[str], tag: str) -> bool:
-        """Apply a tag to a list of members. Creates the tag if it doesn't exist."""
-        # Process in chunks of 500
-        for i in range(0, len(emails), 500):
-            chunk = emails[i:i+500]
-            data = {
-                'members': [
-                    {'email_address': e.lower().strip(), 'status': 'active'}
-                    for e in chunk
-                ],
-            }
-            result = self._request('POST', f'/lists/{self.audience_id}/segments', {
-                'name': tag,
-                'static_segment': [e.lower().strip() for e in chunk],
+        """Create a fresh exact segment and verify membership before sending.
+
+        Never merge an earlier attempt's segment: it may contain new buyers
+        that the current audience deliberately excluded. Transport uncertainty
+        may leave an unused segment, but cannot authorize a campaign.
+        """
+        expected = sorted({e.lower().strip() for e in emails})
+        if not expected:
+            raise RuntimeError('Empty segment is not sendable')
+        result = self._request_strict('POST', f'/lists/{self.audience_id}/segments', {
+            'name': tag, 'static_segment': expected[:500],
+        }).body
+        segment_id = result.get('id')
+        if not isinstance(segment_id, int) or isinstance(segment_id, bool) or segment_id <= 0:
+            raise RuntimeError('Mailchimp did not confirm a segment ID')
+        for offset in range(500, len(expected), 500):
+            self._request_strict('POST', f'/lists/{self.audience_id}/segments/{segment_id}', {
+                'members_to_add': expected[offset:offset + 500],
             })
-
-            # If tag already exists, add members to it
-            if result is None:
-                # Find existing tag
-                tags_resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
-                if tags_resp:
-                    existing_tag_id = None
-                    for seg in tags_resp.get('segments', []):
-                        if seg.get('name') == tag:
-                            existing_tag_id = seg['id']
-                            break
-                    if existing_tag_id:
-                        self._request('POST', f'/lists/{self.audience_id}/segments/{existing_tag_id}', {
-                            'members_to_add': [e.lower().strip() for e in chunk],
-                        })
-
-            if i + 500 < len(emails):
-                time.sleep(0.5)
-
+        actual = set()
+        offset = 0
+        while True:
+            page = self._request('GET',
+                f'/lists/{self.audience_id}/segments/{segment_id}/members?count=1000&offset={offset}',
+                timeout=60)
+            if not isinstance(page, dict) or not isinstance(page.get('members'), list):
+                raise RuntimeError('Segment membership could not be verified')
+            if page.get('total_items') != len(expected):
+                raise RuntimeError('Segment membership count does not match approved audience')
+            members = page['members']
+            for member in members:
+                email = member.get('email_address', '').lower().strip()
+                if member.get('status') != 'subscribed' or not email or email in actual:
+                    raise RuntimeError('Segment contains unverified subscribers')
+                actual.add(email)
+            offset += len(members)
+            if offset == len(expected):
+                break
+            if not members or offset > len(expected):
+                raise RuntimeError('Segment membership pagination incomplete')
+        if actual != set(expected):
+            raise RuntimeError('Segment membership does not match approved audience')
+        if not hasattr(self, '_verified_segments'):
+            self._verified_segments = {}
+        self._verified_segments[tag] = segment_id
         return True
 
     # ── Campaign creation & sending ────────────────────────
-
-    def create_campaign(self, subject: str, preview_text: str, html: str,
-                        tag: str = None, segment_id: int = None,
-                        campaign_title: str = '') -> Optional[str]:
-        """Create a Mailchimp campaign. Returns campaign ID or None.
-
-        If tag is provided, creates a segment condition for that tag.
-        If segment_id is provided, uses that directly.
-        """
-        recipients = {'list_id': self.audience_id}
-
-        if segment_id:
-            recipients['segment_opts'] = {'saved_segment_id': segment_id}
-        elif tag:
-            recipients['segment_opts'] = {
-                'match': 'all',
-                'conditions': [{
-                    'condition_type': 'StaticSegment',
-                    'field': 'static_segment',
-                    'op': 'static_is',
-                    'value': tag,
-                }],
-            }
-
-        data = {
-            'type': 'regular',
-            'recipients': recipients,
-            'settings': {
-                'subject_line': subject,
-                'preview_text': preview_text or '',
-                'title': campaign_title or subject[:50],
-                'from_name': self.from_name,
-                'reply_to': self.from_email,
-                'auto_footer': True,
-            },
-            'tracking': {
-                'opens': True,
-                'html_clicks': True,
-                'text_clicks': True,
-            },
-        }
-
-        outcome = self._create_campaign_strict(data, html)
-        return outcome.provider_campaign_id if outcome.is_created else None
 
     def create_campaign_strict(self, subject: str, preview_text: str, html: str,
                                tag: str = None, segment_id: int = None,
@@ -719,16 +772,6 @@ class MailchimpClient:
             provider_campaign_id=mc_campaign_id,
         )
 
-    def send_campaign(self, mc_campaign_id: str) -> bool:
-        """DEPRECATED lossy send. Do NOT use in the execution path.
-
-        Collapses AMBIGUOUS into False, which reads as "definitely not
-        sent" and would let a caller retry a send that may already have
-        reached customers.  Kept only for non-V2 callers.
-        Use ``send_campaign_strict``.
-        """
-        return self.send_campaign_strict(mc_campaign_id).is_confirmed_sent
-
     def get_campaign_status(self, mc_campaign_id: str) -> ProviderResponse:
         """Fetch campaign info for reconciliation. Raises on failure.
 
@@ -743,15 +786,46 @@ class MailchimpClient:
         return self._request('GET', f'/reports/{mc_campaign_id}')
 
     def get_tag_segment_id(self, tag: str) -> Optional[int]:
-        """Find the segment ID for a given tag name."""
-        resp = self._request('GET', f'/lists/{self.audience_id}/segments?count=100&type=static')
-        if resp:
-            for seg in resp.get('segments', []):
-                if seg.get('name') == tag:
-                    return seg['id']
-        return None
+        """Only return the exact segment verified during this preparation."""
+        return getattr(self, '_verified_segments', {}).get(tag)
 
     # ── Suppression queries ───────────────────────────────
+
+    def audience_inventory(self) -> List[Dict]:
+        """Read every audience's identity and counts, without contact details.
+
+        An incomplete inventory must not appear to prove account-wide coverage.
+        This method only issues GETs and never changes subscription status.
+        """
+        audiences = {}
+        offset = 0
+        expected = None
+        while True:
+            response = self._request('GET', f'/lists?count=100&offset={offset}', timeout=60)
+            if not isinstance(response, dict) or not isinstance(response.get('lists'), list):
+                raise RuntimeError('Mailchimp audience inventory incomplete')
+            total = response.get('total_items')
+            if not isinstance(total, int) or total < 0 or (expected is not None and total != expected):
+                raise RuntimeError('Mailchimp audience inventory changed during pagination')
+            expected = total
+            rows = response['lists']
+            for row in rows:
+                audience_id = row.get('id')
+                if not audience_id or audience_id in audiences:
+                    raise RuntimeError('Mailchimp audience inventory contains missing or duplicate IDs')
+                stats = row.get('stats') or {}
+                audiences[audience_id] = {
+                    'audience_id': audience_id, 'name': row.get('name'),
+                    'subscribed': stats.get('member_count'),
+                    'unsubscribed': stats.get('unsubscribe_count'),
+                    'cleaned': stats.get('cleaned_count'),
+                    'legacy_configured_audience': audience_id == self.audience_id,
+                }
+            offset += len(rows)
+            if offset == expected:
+                return list(audiences.values())
+            if not rows or offset > expected:
+                raise RuntimeError('Mailchimp audience inventory pagination truncated')
 
     def get_suppressed_members(self) -> Optional[List[str]]:
         """Fetch all suppressed members (unsubscribed + cleaned) from Mailchimp.
@@ -781,6 +855,7 @@ class MailchimpClient:
         """
         emails: List[str] = []
         offset = 0
+        expected_total = None
 
         while True:
             resp = self._request(
@@ -793,18 +868,25 @@ class MailchimpClient:
                 log.error(f"Mailchimp members request failed: status={status}, offset={offset}")
                 return None
 
-            members = resp.get('members', [])
+            members = resp.get('members')
+            total_items = resp.get('total_items')
+            if (not isinstance(members, list) or not isinstance(total_items, int)
+                    or total_items < 0
+                    or (expected_total is not None and total_items != expected_total)):
+                return None
+            expected_total = total_items
             for m in members:
                 addr = m.get('email_address', '').lower().strip()
                 if addr:
                     emails.append(addr)
 
-            total_items = resp.get('total_items', 0)
             offset += len(members)
 
-            # Done when we've fetched all or got an empty page
-            if not members or offset >= total_items:
+            if offset == total_items:
                 break
+            if not members or offset > total_items:
+                log.error("Mailchimp suppression pagination truncated: status=%s", status)
+                return None
 
             # Brief pause between pages to respect rate limits
             time.sleep(0.2)
@@ -933,6 +1015,21 @@ class CraftCampaignEngine:
             if key and audience_id:
                 self._mailchimp = MailchimpClient(key, audience_id)
         return self._mailchimp
+
+    def mailchimp_for_event(self, event_id: str) -> MailchimpClient:
+        """Resolve an explicit event destination; never use the legacy default.
+
+        Audience names, city matches, and cross-list membership do not establish
+        permission. Every event must have an independently verified mapping.
+        """
+        from audience_routing import event_audience_id
+        audience_id = event_audience_id(event_id)
+        if not self.db.get_event(event_id):
+            raise RuntimeError('Mapped festival event does not exist')
+        key = os.environ.get('MAILCHIMP_API_KEY')
+        if not key:
+            raise RuntimeError('Mailchimp is not configured')
+        return MailchimpClient(key, audience_id)
 
     # ─────────────────────────────────────────────────────────
     # PHASE DETECTION — what phase is each event in?
@@ -1375,31 +1472,24 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         self.db.conn.commit()
         return {'campaign_id': campaign_id, 'status': 'rejected'}
 
-    def send_campaign(self, campaign_id: str, dry_run: bool = False) -> Dict:
-        """Execute a campaign: pull audience from SQL, push to Mailchimp, create & send campaign.
+    def validate_campaign(self, campaign_id: str) -> Dict:
+        """Validate a campaign and report the audience it would reach.
 
-        Flow:
-        1. Pull audience emails from segment SQL (local SQLite)
-        2. Batch add/update those contacts in Mailchimp with a campaign-specific tag
-        3. Create a Mailchimp campaign targeting that tag
-        4. Send the campaign via Mailchimp API
+        This performs no external writes of any kind. It replaces the former
+        send_campaign(), whose non-dry-run branch pushed contacts to Mailchimp,
+        created a campaign and sent it -- bypassing every V2 safety gate
+        (suppression trust, execution-time buyer exclusion, durable send claim,
+        provider outcome classification, reconciliation) and reachable over an
+        unauthenticated HTTP route.
 
-        Args:
-            campaign_id: ID of an approved campaign
-            dry_run: If True, validates everything but doesn't actually send
+        Customer email now has exactly one execution path: the V2 intervention
+        lifecycle in execution_adapter.ExecutionAdapter.
         """
-        if not dry_run and not self.mailchimp:
-            return {'error': 'MAILCHIMP_API_KEY or MAILCHIMP_AUDIENCE_ID not set'}
-
         row = self.db.conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
         if not row:
             return {'error': 'Campaign not found'}
         campaign = dict(row)
 
-        if not dry_run and campaign['status'] not in ('approved',):
-            return {'error': f"Campaign status is '{campaign['status']}', must be 'approved'"}
-
-        # Pull audience from local DB
         try:
             recipients = self.db.conn.execute(campaign['segment_sql']).fetchall()
         except Exception as e:
@@ -1407,97 +1497,20 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
 
         emails = [r['email'] if hasattr(r, 'keys') else r[0] for r in recipients]
 
-        if dry_run:
-            return {
-                'campaign_id': campaign_id,
-                'status': 'dry_run',
-                'audience_count': len(emails),
-                'sample_recipients': emails[:10],
-                'subject_line': campaign['subject_line'],
-                'phase': campaign['phase'],
-            }
-
-        # Mark sending
-        self.db.conn.execute("UPDATE campaigns SET status = 'sending', updated_at = ? WHERE id = ?",
-                             (datetime.now().isoformat(), campaign_id))
-        self.db.conn.commit()
-
-        try:
-            # Step 1: Push audience to Mailchimp with campaign-specific tag
-            tag_name = f"craft-{campaign_id}"
-            log.info(f"Pushing {len(emails)} contacts to Mailchimp with tag '{tag_name}'...")
-            member_stats = self.mailchimp.ensure_members(emails, tag=tag_name)
-            log.info(f"Mailchimp members: {member_stats}")
-
-            # Step 2: Find the segment ID for this tag
-            segment_id = self.mailchimp.get_tag_segment_id(tag_name)
-
-            # Step 3: Create the Mailchimp campaign
-            subject = campaign['subject_line'].replace('{{first_name}}', '*|FNAME|*')
-            html = campaign['body_html'].replace('{{first_name}}', '*|FNAME|*')
-
-            mc_campaign_id = self.mailchimp.create_campaign(
-                subject=subject,
-                preview_text=campaign.get('preview_text', ''),
-                html=html,
-                tag=tag_name,
-                segment_id=segment_id,
-                campaign_title=f"Craft AI: {campaign_id} — {campaign.get('phase', '')}",
-            )
-
-            if not mc_campaign_id:
-                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                    (datetime.now().isoformat(), campaign_id))
-                self.db.conn.commit()
-                return {'error': 'Failed to create Mailchimp campaign'}
-
-            # Step 4: Send it
-            sent_ok = self.mailchimp.send_campaign(mc_campaign_id)
-            if not sent_ok:
-                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                    (datetime.now().isoformat(), campaign_id))
-                self.db.conn.commit()
-                return {'error': f'Mailchimp campaign {mc_campaign_id} created but failed to send'}
-
-            # Record sends in local DB for tracking
-            sent_count = member_stats.get('added', 0) + member_stats.get('updated', 0)
-            for email in emails:
-                try:
-                    self.db.conn.execute("""
-                        INSERT OR IGNORE INTO campaign_sends (campaign_id, email, first_name, mailchimp_campaign_id, status)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (campaign_id, email.lower().strip(), '', mc_campaign_id, 'sent'))
-                except Exception:
-                    pass
-
-            # Update campaign record
-            self.db.conn.execute("""
-                UPDATE campaigns SET status = 'sent', sends = ?, sent_at = ?, updated_at = ?
-                WHERE id = ?
-            """, (len(emails), datetime.now().isoformat(), datetime.now().isoformat(), campaign_id))
-            self.db.conn.commit()
-
-            log.info(f"Campaign {campaign_id} sent via Mailchimp ({mc_campaign_id}): {len(emails)} recipients")
-            return {
-                'campaign_id': campaign_id,
-                'mailchimp_campaign_id': mc_campaign_id,
-                'sent': len(emails),
-                'member_stats': member_stats,
-                'status': 'sent',
-            }
-
-        except Exception as e:
-            log.error(f"Campaign send failed: {e}", exc_info=True)
-            self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                (datetime.now().isoformat(), campaign_id))
-            self.db.conn.commit()
-            return {'error': f'Send failed: {str(e)}'}
+        return {
+            'campaign_id': campaign_id,
+            'status': 'dry_run',
+            'audience_count': len(emails),
+            'sample_recipients': emails[:10],
+            'subject_line': campaign['subject_line'],
+            'phase': campaign['phase'],
+        }
 
     # ─────────────────────────────────────────────────────────
     # WEBHOOK PROCESSING — track opens, clicks, bounces
     # ─────────────────────────────────────────────────────────
 
-    def process_mailchimp_webhook(self, data: Dict) -> Dict:
+    def process_mailchimp_webhook(self, data: Dict, audience_id: str = None) -> Dict:
         """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity).
 
         After writing a suppression row, updates the suppression sentinel
@@ -1512,12 +1525,20 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         if event_type == 'unsubscribe':
             email = data.get('data', {}).get('email', '').lower()
             if email:
-                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
+                if audience_id:
+                    from audience_suppression import AudienceSuppressionGuard
+                    AudienceSuppressionGuard(self.db, audience_id).record_email(email, 'unsubscribe', source='webhook_unsubscribe')
+                else:
+                    self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
                 suppression_written = True
         elif event_type == 'cleaned':
             email = data.get('data', {}).get('email', '').lower()
             if email:
-                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
+                if audience_id:
+                    from audience_suppression import AudienceSuppressionGuard
+                    AudienceSuppressionGuard(self.db, audience_id).record_email(email, 'bounce', source='webhook_cleaned')
+                else:
+                    self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
                 suppression_written = True
         elif event_type == 'campaign':
             # Campaign sent notification — we can pull reports
@@ -1537,7 +1558,7 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         self.db.conn.commit()
 
         # Update suppression sentinel AFTER successful commit
-        if suppression_written:
+        if suppression_written and not audience_id:
             try:
                 guard = SuppressionGuard(self.db, v2_repo=self._v2_repo)
                 guard.record_mutation(source=f"webhook_{event_type}")
@@ -1772,14 +1793,10 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
     def reject_campaign(cid):
         return jsonify(engine.reject(cid))
 
-    @app.route('/api/campaigns/<cid>/send', methods=['POST'])
-    def send_campaign(cid):
-        return jsonify(engine.send_campaign(cid))
-
     @app.route('/api/campaigns/<cid>/dry-run', methods=['POST'])
     def dry_run_campaign(cid):
         """Validate a campaign without sending — shows audience count and sample recipients."""
-        return jsonify(engine.send_campaign(cid, dry_run=True))
+        return jsonify(engine.validate_campaign(cid))
 
     @app.route('/api/campaigns/<cid>/analyze', methods=['POST'])
     def analyze_campaign(cid):
@@ -1815,11 +1832,79 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
 
     @app.route('/api/webhook/mailchimp', methods=['GET', 'POST'])
     def mailchimp_webhook():
-        """Mailchimp webhook handler. GET validates the webhook URL, POST receives events."""
+        """Mailchimp audience webhook. GET validates the URL, POST receives events.
+
+        This endpoint stays outside the bearer gate because Mailchimp cannot
+        send an Authorization header. Unverified, that made it a public write
+        into a safety-critical dataset: a POST of
+        {"type": "unsubscribe", "data": {"email": ...}} suppressed any address
+        and moved the suppression sentinel with it.
+
+        Authenticity is Mailchimp's documented HMAC signature. Per the Marketing
+        API guide "Synchronize Audience Data with Webhooks", every delivery on a
+        signed webhook carries
+
+            X-Mailchimp-Signature: t=<unix_ts>,v1=<hex>
+
+        where v1 is HMAC-SHA256(signing_secret, "{t}.{raw_body}") over the exact
+        request bytes, and deliveries outside a five-minute window are rejected.
+        That window bounds replayability; it is not deduplication -- see the
+        note on MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS.
+
+        Fails closed. With no signing secret configured the POST is refused,
+        never processed unsigned -- signature verification is optional in
+        Mailchimp's UI, and an unsigned webhook must not be silently trusted
+        here. GET never touches the database, so the URL-validation handshake
+        cannot be broken by a misconfigured secret.
+        """
         if request.method == 'GET':
-            return '', 200  # Mailchimp sends GET to validate webhook URL
-        data = request.get_json() or request.form.to_dict() or {}
-        result = engine.process_mailchimp_webhook(data)
+            return '', 200  # URL validation handshake; no mutation, no data.
+
+        raw_body = request.get_data(cache=True)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = normalize_mailchimp_form(request.form)
+        audience_id = None
+        if os.environ.get('MAILCHIMP_EVENT_AUDIENCES') or os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRETS'):
+            # Untrusted list_id selects a key only. The selected key must then
+            # authenticate the exact raw body, including that same list_id.
+            try:
+                keys = json.loads(os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRETS', '{}'))
+                audience_id = payload.get('data', {}).get('list_id')
+                if not isinstance(audience_id, str) or not re.fullmatch(r'[a-fA-F0-9]{10}', audience_id):
+                    raise ValueError('Missing audience identity')
+                signing_secret = keys.get(audience_id) if isinstance(keys, dict) else None
+            except (ValueError, TypeError, AttributeError):
+                return jsonify({'error':'invalid_webhook_audience'}), 401
+        else:
+            signing_secret = os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRET', '')
+        if not isinstance(signing_secret, str) or not signing_secret:
+            log.error("Mailchimp webhook POST refused: "
+                      "MAILCHIMP_WEBHOOK_SIGNING_SECRET is not set")
+            return jsonify({
+                'error': 'webhook_signing_secret_not_configured',
+                'message': 'MAILCHIMP_WEBHOOK_SIGNING_SECRET must be configured '
+                           'before webhook events are accepted.',
+            }), 503
+
+        ok, reason = verify_mailchimp_signature(
+            signing_secret, request.headers.get('X-Mailchimp-Signature', ''), raw_body)
+        if not ok:
+            log.warning(f"Mailchimp webhook POST rejected: {reason}")
+            return jsonify({'error': 'invalid_signature', 'reason': reason}), 401
+
+        # Optional second factor: a hard-to-guess component in the callback URL,
+        # which Mailchimp also recommends. Deliberately a DIFFERENT secret from
+        # the signing key -- one is a shared bearer, the other proves payload
+        # integrity, and they must not be interchangeable.
+        path_secret = os.environ.get('MAILCHIMP_WEBHOOK_PATH_SECRET', '')
+        if path_secret:
+            supplied = request.args.get('secret', '')
+            if not supplied or not hmac.compare_digest(supplied, path_secret):
+                log.warning("Mailchimp webhook POST rejected: bad or missing path secret")
+                return jsonify({'error': 'unauthorized'}), 401
+
+        result = engine.process_mailchimp_webhook(payload, audience_id=audience_id)
         return jsonify(result)
 
     @app.route('/api/campaigns/<cid>/sync-stats', methods=['POST'])

@@ -1,0 +1,4 @@
+# Artifact of the Postgres CI step (`| tee pg_test_output.txt`).
+pg_test_output.txt
+__pycache__/
+.pytest_cache/

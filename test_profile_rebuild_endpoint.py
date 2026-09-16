@@ -458,7 +458,7 @@ class TestMutualExclusionWithFullSync(_RouteBase):
         original = craft_unified.EventbriteSync
         craft_unified.EventbriteSync = _BlockingSync
         try:
-            started = self.client.get("/api/sync")
+            started = self.client.get("/api/sync", headers=AUTH)
             self.assertEqual(json.loads(started.data)["status"], "started")
             self.assertTrue(in_sync.wait(10), "stub sync never started")
             r = self.client.post(ROUTE, headers=AUTH)
@@ -483,10 +483,10 @@ class TestMutualExclusionWithFullSync(_RouteBase):
         original = craft_unified.EventbriteSync
         craft_unified.EventbriteSync = _QuickSync
         try:
-            self.client.get("/api/sync")
+            self.client.get("/api/sync", headers=AUTH)
             self.assertTrue(done.wait(10))
             for _ in range(100):
-                if not json.loads(self.client.get("/api/sync-status").data)["running"]:
+                if not json.loads(self.client.get("/api/sync-status", headers=AUTH).data)["running"]:
                     break
                 threading.Event().wait(0.05)
         finally:
@@ -513,7 +513,7 @@ class TestMutualExclusionWithFullSync(_RouteBase):
                 target=lambda: self.client.post(ROUTE, headers=AUTH), daemon=True)
             t.start()
             self.assertTrue(in_rebuild.wait(10), "rebuild never started")
-            resp = self.client.get("/api/sync")
+            resp = self.client.get("/api/sync", headers=AUTH)
             sync_status['code'] = resp.status_code
             sync_status['body'] = json.loads(resp.data)
             release.set()

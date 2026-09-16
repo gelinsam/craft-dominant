@@ -654,7 +654,8 @@ def _build_app():
         from suppression_guard import SuppressionGuard
 
         mc_key = os.environ.get("MAILCHIMP_API_KEY")
-        mc_audience = os.environ.get("MAILCHIMP_AUDIENCE_ID")
+        requested_audience = (request.get_json(silent=True) or {}).get('audience_id')
+        mc_audience = requested_audience or os.environ.get("MAILCHIMP_AUDIENCE_ID")
         if not mc_key or not mc_audience:
             return jsonify({
                 "error": "mailchimp_not_configured",
@@ -670,7 +671,16 @@ def _build_app():
                 "message": str(e),
             }), 500
 
-        guard = SuppressionGuard(db, v2_repo=v2_repo)
+        if requested_audience:
+            from audience_suppression import AudienceSuppressionGuard
+            try:
+                guard = AudienceSuppressionGuard(db, requested_audience)
+            except ValueError:
+                return jsonify({'error':'invalid_audience_id'}), 400
+        elif os.environ.get('MAILCHIMP_EVENT_AUDIENCES'):
+            return jsonify({'error':'audience_id_required'}), 400
+        else:
+            guard = SuppressionGuard(db, v2_repo=v2_repo)
         result = guard.refresh_from_mailchimp(mc_client)
 
         if "error" in result:
@@ -724,6 +734,21 @@ def _build_app():
             "v2_state_backend": v2_health_info,
         }
         return jsonify(result), 200 if overall == "ok" else 503
+
+    @app.get("/api/v2/diagnostics/mailchimp-audiences")
+    @require_command_auth
+    def mailchimp_audience_inventory():
+        if not _campaign_engine or not _campaign_engine.mailchimp:
+            return jsonify({"error": "mailchimp_not_configured"}), 503
+        try:
+            audiences = _campaign_engine.mailchimp.audience_inventory()
+        except Exception:
+            log.exception("Mailchimp audience inventory failed")
+            return jsonify({"error": "mailchimp_inventory_incomplete"}), 502
+        return jsonify({"read_only": True, "audiences": audiences,
+                        "audience_count": len(audiences),
+                        "external_send_enabled": external_send_enabled(),
+                        "routing_status": "single_audience_configuration_requires_mapping"})
 
     @app.get("/api/v2/diagnostics/analytics")
     @require_command_auth
@@ -827,4 +852,6 @@ def _build_app():
     return app
 
 
-app = _build_app()
+# Production uses the explicit factory. Importing diagnostics or tests must
+# never open databases, run migrations, or start ingestion threads.
+create_app_v2 = _build_app

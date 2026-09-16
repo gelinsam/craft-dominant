@@ -348,14 +348,24 @@ class DiagnosisEngine:
         """Recent ticket velocity from snapshots."""
         try:
             snaps = self.db.get_snapshots(event_id)
-            if len(snaps) < 2:
+            # Production returns oldest first. Sort by the actual calendar date
+            # so sparse snapshots and differently ordered adapters agree.
+            observed = sorted(
+                (datetime.fromisoformat(s["snapshot_date"]).date(),
+                 s["tickets_cumulative"])
+                for s in snaps
+                if s.get("snapshot_date") and s.get("tickets_cumulative") is not None
+            )
+            if len(observed) < 2 or days <= 0:
                 return None
-            recent = snaps[:days]
+            latest = observed[-1][0]
+            recent = [s for s in observed if (latest - s[0]).days <= days]
             if len(recent) < 2:
                 return None
-            ticket_diff = recent[0]["tickets_cumulative"] - recent[-1]["tickets_cumulative"]
-            day_span = max(1, len(recent) - 1)
-            return ticket_diff / day_span
+            day_span = (recent[-1][0] - recent[0][0]).days
+            if day_span <= 0:
+                return None
+            return (recent[-1][1] - recent[0][1]) / day_span
         except Exception as e:
             log.warning(f"Velocity computation failed for {event_id}: {e}")
             return None

@@ -119,8 +119,14 @@ class _PostSyncHarness(unittest.TestCase):
         _FakeEventbriteSync.instances = 0
         _FakeMetaAdsSync.reset()
 
-        self._env_before = {k: os.environ.get(k) for k in _META_ENV + ("EVENTBRITE_API_KEY",)}
+        self._env_before = {
+            k: os.environ.get(k)
+            for k in _META_ENV + ("EVENTBRITE_API_KEY", "COMMAND_API_KEY")
+        }
         os.environ["EVENTBRITE_API_KEY"] = "fake-eventbrite-key"
+        # /api/sync and /api/sync-status now sit behind the app-wide bearer gate,
+        # so the harness must authenticate the way the dashboard's proxy does.
+        os.environ["COMMAND_API_KEY"] = _AUTH["Authorization"].split()[-1]
         for key in _META_ENV:
             os.environ.pop(key, None)
 
@@ -162,11 +168,11 @@ class _PostSyncHarness(unittest.TestCase):
                 os.environ[key] = value
 
     def _run_sync_to_completion(self, timeout=10):
-        resp = self.client.get("/api/sync")
+        resp = self.client.get("/api/sync", headers=_AUTH)
         self.assertEqual(json.loads(resp.data)["status"], "started")
         deadline = time.time() + timeout
         while time.time() < deadline:
-            state = json.loads(self.client.get("/api/sync-status").data)
+            state = json.loads(self.client.get("/api/sync-status", headers=_AUTH).data)
             if state["done"]:
                 return state
             time.sleep(0.02)
@@ -280,7 +286,7 @@ class TestPostSyncBlockCompletes(_PostSyncHarness):
 
     def test_meta_status_untouched(self):
         self._run_sync_to_completion()
-        data = json.loads(self.client.get("/api/meta-status").data)
+        data = json.loads(self.client.get("/api/meta-status", headers=_AUTH).data)
         self.assertEqual(data["data"]["total_spend"], 0)
         self.assertEqual(data["data"]["campaigns"], 0)
 
@@ -363,7 +369,7 @@ class TestSingleFlightIsGenuinelyShared(_PostSyncHarness):
         _FakeMetaAdsSync.entered = threading.Event()
         _FakeMetaAdsSync.release = threading.Event()
 
-        self.assertEqual(json.loads(self.client.get("/api/sync").data)["status"], "started")
+        self.assertEqual(json.loads(self.client.get("/api/sync", headers=_AUTH).data)["status"], "started")
         self.assertTrue(
             _FakeMetaAdsSync.entered.wait(timeout=10),
             "background sync never reached the Meta phase",
@@ -380,13 +386,13 @@ class TestSingleFlightIsGenuinelyShared(_PostSyncHarness):
         _FakeMetaAdsSync.release.set()
         deadline = time.time() + 10
         while time.time() < deadline:
-            if json.loads(self.client.get("/api/sync-status").data)["done"]:
+            if json.loads(self.client.get("/api/sync-status", headers=_AUTH).data)["done"]:
                 break
             time.sleep(0.02)
         else:
             self.fail("sync did not finish after release")
 
-        self.assertIsNone(json.loads(self.client.get("/api/sync-status").data)["error"])
+        self.assertIsNone(json.loads(self.client.get("/api/sync-status", headers=_AUTH).data)["error"])
 
 
 if __name__ == "__main__":

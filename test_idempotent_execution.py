@@ -259,6 +259,9 @@ class FakeCampaignEngine:
     def __init__(self, mailchimp=None):
         self.mailchimp = mailchimp or FakeDeterministicMailchimp()
 
+    def mailchimp_for_event(self, event_id):
+        return self.mailchimp
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Fake execution DB (replicating pattern from test_intervention.py)
@@ -2128,3 +2131,23 @@ class TestHealthReadiness(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestIncompleteAudienceCannotSend(unittest.TestCase):
+    def test_missing_segment_never_creates_whole_audience_campaign(self):
+        with patch.dict(os.environ, {'V2_ENABLE_EXTERNAL_SEND':'1'}):
+            db, repo, adapter, mc, intervention_id = _make_test_environment()
+            with patch.object(mc, 'get_tag_segment_id', return_value=None):
+                result = adapter.execute(intervention_id)
+            self.assertNotEqual(result.get('status'), 'executed')
+            self.assertEqual(mc.send_call_count(), 0)
+            self.assertFalse(any(c[0] == '_request_strict' and c[1]['path'] == '/campaigns' for c in mc.calls))
+
+    def test_partial_audience_error_never_creates_campaign(self):
+        with patch.dict(os.environ, {'V2_ENABLE_EXTERNAL_SEND':'1'}):
+            db, repo, adapter, mc, intervention_id = _make_test_environment()
+            with patch.object(mc, 'ensure_members', return_value={'added':1, 'errors':1}):
+                result = adapter.execute(intervention_id)
+            self.assertNotEqual(result.get('status'), 'executed')
+            self.assertEqual(mc.send_call_count(), 0)
+            self.assertFalse(any(c[0] == '_request_strict' and c[1]['path'] == '/campaigns' for c in mc.calls))

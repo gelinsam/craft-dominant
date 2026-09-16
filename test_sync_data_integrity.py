@@ -471,3 +471,233 @@ class TestParsedUnknownsDoNotReachNonNullConsumers(_Fixture):
         ev["status"] = "upcoming"
         self.db.upsert_event(ev)
         self.assertEqual(self.db.get_event("E1")["capacity"], 2000)
+
+
+class TestAuditTruthRegressions(unittest.TestCase):
+    """Production ordering, sparse payloads, and partial fetches from the audit."""
+
+    def setUp(self):
+        from craft_unified import MetaAdsSync
+        self.db = Database(':memory:')
+        self.meta = MetaAdsSync.__new__(MetaAdsSync)
+        self.meta.db = self.db
+        self.meta.ad_account_id = '123'
+
+    def tearDown(self):
+        self.db.conn.close()
+
+    def test_missing_meta_metrics_preserve_observed_values(self):
+        today = datetime.date.today().isoformat()
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, 250, 1000, 20)
+        self.db.save_ad_spend('E', 'C', None, today, None, None, 0)
+        row = dict(self.db.conn.execute('SELECT * FROM ad_spend').fetchone())
+        self.assertEqual((row['spend'], row['impressions'], row['clicks']), (250, 1000, 0))
+        self.db.save_ad_spend('E', 'C', None, today, 200)
+        self.assertEqual(self.db.get_event_spend('E'), 200)
+
+    def test_unobserved_spend_is_not_trustworthy_zero(self):
+        today = datetime.date.today().isoformat()
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, None)
+        self.assertEqual(self.db.get_spend_status('E'), 'unavailable')
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, 0)
+        self.assertEqual(self.db.get_spend_status('E'), 'current_zero_spend')
+
+    def test_partial_meta_fetch_does_not_commit_any_rows(self):
+        from unittest.mock import Mock
+        self.meta._fetch_daily_insights = Mock(side_effect=[
+            [{'date_start': '2026-09-01', 'spend': '250'}],
+            RuntimeError('Meta API retry budget exhausted')])
+        result = self.meta.sync_event_spend('E', 'Austin Coffee', '2026-10-17',
+            campaigns_override=[{'id':'C1','name':'One'}, {'id':'C2','name':'Two'}])
+        self.assertIn('error', result)
+        self.assertEqual(self.db.conn.execute('SELECT COUNT(*) FROM ad_spend').fetchone()[0], 0)
+
+    def test_meta_pagination_failure_is_not_empty_success(self):
+        from unittest.mock import Mock
+        self.meta._api_get = Mock(return_value=None)
+        with self.assertRaises(RuntimeError):
+            self.meta._fetch_all_campaigns()
+
+    def test_meta_repeated_page_fails(self):
+        from unittest.mock import Mock
+        self.meta._api_get = Mock(return_value={'data': [], 'paging': {'next':'https://graph.facebook.com/next'}})
+        with self.assertRaises(RuntimeError):
+            self.meta._fetch_daily_insights('C', '2026-09-01', '2026-09-15')
+        self.assertEqual(self.meta._api_get.call_count, 2)
+
+    def test_meta_token_removed_and_failure_redacted(self):
+        from unittest.mock import Mock, patch
+        self.meta.session = Mock()
+        self.meta.session.get.side_effect = RuntimeError('secret-value-in-URL')
+        with patch('time.sleep'), self.assertLogs('craft', level='ERROR') as logs:
+            with self.assertRaisesRegex(RuntimeError, 'retry budget exhausted'):
+                self.meta._api_get('https://graph.facebook.com/next?access_token=secret-value-in-URL&after=abc')
+        self.assertNotIn('secret-value', str(logs.output))
+        args, kwargs = self.meta.session.get.call_args
+        self.assertNotIn('access_token', args[0])
+        self.assertFalse(kwargs['allow_redirects'])
+        self.assertEqual(kwargs['params'], {})
+
+    def test_meta_foreign_paging_origin_rejected_before_request(self):
+        from unittest.mock import Mock
+        self.meta.session = Mock()
+        with self.assertRaises(ValueError):
+            self.meta._api_get('https://example.com/collect')
+        self.meta.session.get.assert_not_called()
+
+    def test_eventbrite_incomplete_pagination_fails(self):
+        from unittest.mock import Mock
+        sync = EventbriteSync.__new__(EventbriteSync)
+        sync._get = Mock(return_value={'orders': [], 'pagination': {'has_more_items': True}})
+        with self.assertRaises(RuntimeError):
+            sync._paginate('/orders')
+
+    def test_null_amount_does_not_abort_profile_and_unknown_ticket_not_invented(self):
+        sync = EventbriteSync.__new__(EventbriteSync)
+        profile = sync._build_customer_profile('buyer@example.com', [
+            {'order_timestamp': '2026-09-01T10:00:00', 'gross_amount': None, 'ticket_count': None},
+            {'order_timestamp': '2026-09-02T10:00:00', 'gross_amount': 100, 'ticket_count': 2}], 3, 3, 3)
+        self.assertEqual(profile.total_spent, 100)
+        self.assertEqual(profile.total_tickets, 2)
+
+    def test_velocity_uses_latest_calendar_window_with_production_order(self):
+        from diagnosis_engine import DiagnosisEngine
+        self.db.conn.executemany('INSERT INTO daily_snapshots (event_id,snapshot_date,days_before_event,tickets_cumulative) VALUES (?,?,?,?)', [
+            ('E', '2026-09-01', 30, 10), ('E', '2026-09-08', 23, 80),
+            ('E', '2026-09-13', 18, 105), ('E', '2026-09-15', 16, 115)])
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, None)
+        self.assertEqual(engine._compute_velocity('E'), 5)
+        self.assertEqual(engine._compute_velocity('E', days=2), 5)
+        self.assertIsNone(engine._compute_velocity('E', days=1))
+
+
+class TestSQLiteClaimRace(unittest.TestCase):
+    def test_two_connections_both_pass_precheck_only_one_inserts(self):
+        import sqlite3
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from v2_state_repository import SQLiteV2StateRepository
+        from send_attempt_model import SendAttempt, SendAttemptStatus, DuplicateClaimError
+        barrier = threading.Barrier(2)
+
+        class RaceConnection:
+            def __init__(self, conn):
+                self.conn = conn
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+            def execute(self, sql, *args):
+                cursor = self.conn.execute(sql, *args)
+                if sql.lstrip().startswith('SELECT id, attempt_status'):
+                    rows = cursor.fetchall()
+                    barrier.wait(timeout=5)
+                    return SimpleNamespace(fetchall=lambda: rows)
+                return cursor
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'claims.db')
+            setup = sqlite3.connect(path)
+            setup.row_factory = sqlite3.Row
+            SQLiteV2StateRepository(SimpleNamespace(conn=setup))
+            setup.close()
+            def claim(_):
+                conn = sqlite3.connect(path, timeout=10)
+                conn.row_factory = sqlite3.Row
+                repo = SQLiteV2StateRepository.__new__(SQLiteV2StateRepository)
+                repo.db = SimpleNamespace(conn=RaceConnection(conn))
+                attempt = SendAttempt(None, 'one', 1, SendAttemptStatus.CLAIMED, 'key', 'hash')
+                try:
+                    repo.create_send_attempt(attempt)
+                    return 'claimed'
+                except DuplicateClaimError:
+                    return 'blocked'
+                finally:
+                    conn.close()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(claim, range(2)))
+            self.assertCountEqual(results, ['claimed', 'blocked'])
+            check = sqlite3.connect(path)
+            self.assertEqual(check.execute('SELECT COUNT(*) FROM v2_send_attempts').fetchone()[0], 1)
+            # A confirmed send continues to block a new active claim.
+            check.execute("UPDATE v2_send_attempts SET attempt_status='confirmed_sent'")
+            check.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                check.execute("INSERT INTO v2_send_attempts (intervention_id,execution_generation,idempotency_key,audience_hash,claimed_at) VALUES ('one',1,'key','hash','2026-09-16')")
+            check.close()
+
+
+class TestAuditMedianAndRestatement(unittest.TestCase):
+    def test_two_prior_editions_use_arithmetic_median(self):
+        from craft_unified import DecisionEngine
+        db = Database(':memory:')
+        today = datetime.date.today()
+        target = today + datetime.timedelta(days=20)
+        for eid, event_date, tickets in [('new', target, 30), ('old1', today - datetime.timedelta(days=365), 40), ('old2', today - datetime.timedelta(days=730), 60)]:
+            db.upsert_event({'event_id':eid, 'name':f'Austin Coffee Festival {event_date.year}', 'event_date':event_date.isoformat(), 'capacity':1000, 'city':'Austin', 'event_type':'coffee'})
+            db.insert_order({'order_id':eid, 'event_id':eid, 'email':'test@example.com', 'ticket_count':tickets, 'gross_amount':tickets * 20, 'order_timestamp':today.isoformat()})
+            if eid != 'new':
+                db.save_snapshot(eid, (event_date-datetime.timedelta(days=20)).isoformat(),20,tickets, tickets*20)
+        analysis = DecisionEngine(db).analyze_event('new')
+        self.assertEqual(analysis.historical_median_at_point, 50)
+        self.assertEqual(analysis.pace_vs_historical, -40)
+        db.conn.close()
+
+    def test_observed_downward_restatement_is_applied_and_reported(self):
+        from craft_unified import MetaAdsSync
+        from unittest.mock import Mock
+        db = Database(':memory:')
+        db.save_ad_spend('E', 'C', 'Campaign', '2026-09-01', 250)
+        sync = MetaAdsSync.__new__(MetaAdsSync)
+        sync.db = db
+        sync._fetch_daily_insights = Mock(return_value=[{'date_start':'2026-09-01','spend':'200'}])
+        result = sync.sync_event_spend('E','Austin Coffee','2026-10-17', campaigns_override=[{'id':'C','name':'Campaign'}])
+        self.assertEqual(result['total_spend'], 200)
+        self.assertEqual(result['spend_regression']['decrease'], 50)
+        db.conn.close()
+
+
+class TestAudienceSuppressionIsolation(unittest.TestCase):
+    def setUp(self):
+        from audience_suppression import AudienceSuppressionGuard
+        self.db = Database(':memory:')
+        self.a = AudienceSuppressionGuard(self.db, 'aaaaaaaaaa')
+        self.b = AudienceSuppressionGuard(self.db, 'bbbbbbbbbb')
+
+    def tearDown(self):
+        self.db.conn.close()
+
+    def client(self, audience_id, emails):
+        from types import SimpleNamespace
+        return SimpleNamespace(audience_id=audience_id, get_suppressed_members=lambda: emails)
+
+    def test_one_list_refresh_cannot_establish_other_list_freshness(self):
+        from suppression_guard import SuppressionStatus
+        self.assertTrue(self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['a@example.com']))['refreshed'])
+        self.assertEqual(self.a.validate()[0], SuppressionStatus.HEALTHY)
+        self.assertEqual(self.b.validate()[0], SuppressionStatus.NEVER_SYNCED)
+        self.b.refresh_from_mailchimp(self.client('bbbbbbbbbb', ['b@example.com']))
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'a@example.com'})
+        self.assertEqual(self.b.get_suppressions_if_valid()[2], {'b@example.com'})
+
+    def test_wrong_provider_scope_cannot_replace_rows(self):
+        self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['a@example.com']))
+        result = self.a.refresh_from_mailchimp(self.client('bbbbbbbbbb', ['b@example.com']))
+        self.assertIn('error', result)
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'a@example.com'})
+
+    def test_webhook_during_refresh_is_preserved_and_refresh_fails(self):
+        from types import SimpleNamespace
+        self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['existing@example.com']))
+        def fetch():
+            self.a.record_email('new@example.com', 'unsubscribe')
+            return ['existing@example.com']
+        result = self.a.refresh_from_mailchimp(SimpleNamespace(audience_id='aaaaaaaaaa', get_suppressed_members=fetch))
+        self.assertIn('error', result)
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'existing@example.com', 'new@example.com'})
+
+    def test_webhook_alone_never_proves_full_scope(self):
+        from suppression_guard import SuppressionStatus
+        self.a.record_email('a@example.com', 'unsubscribe')
+        self.assertEqual(self.a.validate()[0], SuppressionStatus.NEVER_SYNCED)
+        self.assertEqual(self.b._actual_suppression_count(), 0)

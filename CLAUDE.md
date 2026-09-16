@@ -83,7 +83,8 @@ python -m pytest test_dominant_agent.py test_diagnosis.py \
   test_profile_write_concurrency.py test_profile_rebuild_endpoint.py \
   test_meta_festival_edition.py test_meta_spend_pipeline_e2e.py \
   test_meta_edition_shared_reads.py test_meta_alias_tokenization.py \
-  test_sync_data_integrity.py test_idempotent_execution.py
+  test_sync_data_integrity.py test_idempotent_execution.py \
+  test_security_exposure.py test_webhook_authenticity.py
 ```
 
 CI runs these in both the SQLite and Postgres jobs

@@ -350,7 +350,7 @@ class TestMetaSyncBatchWrites(unittest.TestCase):
         ]
         meta = MetaAdsSync("fake_token", "act_123", self.db)
 
-        with patch.object(self.db, 'save_ad_spend_batch') as mock_batch:
+        with patch.object(self.db, 'save_ad_spend_batch', wraps=self.db.save_ad_spend_batch) as mock_batch:
             with patch.object(self.db, 'save_ad_spend') as mock_single:
                 result = meta.sync_event_spend('evt_1', 'Test Coffee', '2026-10-01')
 
