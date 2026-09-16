@@ -570,3 +570,58 @@ class TestAuditTruthRegressions(unittest.TestCase):
         self.assertEqual(engine._compute_velocity('E'), 5)
         self.assertEqual(engine._compute_velocity('E', days=2), 5)
         self.assertIsNone(engine._compute_velocity('E', days=1))
+
+
+class TestSQLiteClaimRace(unittest.TestCase):
+    def test_two_connections_both_pass_precheck_only_one_inserts(self):
+        import sqlite3
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from v2_state_repository import SQLiteV2StateRepository
+        from send_attempt_model import SendAttempt, SendAttemptStatus, DuplicateClaimError
+        barrier = threading.Barrier(2)
+
+        class RaceConnection:
+            def __init__(self, conn):
+                self.conn = conn
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+            def execute(self, sql, *args):
+                cursor = self.conn.execute(sql, *args)
+                if sql.lstrip().startswith('SELECT id, attempt_status'):
+                    rows = cursor.fetchall()
+                    barrier.wait(timeout=5)
+                    return SimpleNamespace(fetchall=lambda: rows)
+                return cursor
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'claims.db')
+            setup = sqlite3.connect(path)
+            setup.row_factory = sqlite3.Row
+            SQLiteV2StateRepository(SimpleNamespace(conn=setup))
+            setup.close()
+            def claim(_):
+                conn = sqlite3.connect(path, timeout=10)
+                conn.row_factory = sqlite3.Row
+                repo = SQLiteV2StateRepository.__new__(SQLiteV2StateRepository)
+                repo.db = SimpleNamespace(conn=RaceConnection(conn))
+                attempt = SendAttempt(None, 'one', 1, SendAttemptStatus.CLAIMED, 'key', 'hash')
+                try:
+                    repo.create_send_attempt(attempt)
+                    return 'claimed'
+                except DuplicateClaimError:
+                    return 'blocked'
+                finally:
+                    conn.close()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(claim, range(2)))
+            self.assertCountEqual(results, ['claimed', 'blocked'])
+            check = sqlite3.connect(path)
+            self.assertEqual(check.execute('SELECT COUNT(*) FROM v2_send_attempts').fetchone()[0], 1)
+            # A confirmed send continues to block a new active claim.
+            check.execute("UPDATE v2_send_attempts SET attempt_status='confirmed_sent'")
+            check.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                check.execute("INSERT INTO v2_send_attempts (intervention_id,execution_generation,idempotency_key,audience_hash,claimed_at) VALUES ('one',1,'key','hash','2026-09-16')")
+            check.close()

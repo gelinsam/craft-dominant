@@ -21,6 +21,7 @@ from __future__ import annotations
 import abc
 import json
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -414,6 +415,15 @@ class SQLiteV2StateRepository(V2StateRepository):
         # pre-existing dev databases forward explicitly. Mirrors Postgres
         # migration 003.
         self._ensure_column("v2_send_attempts", "provider_sent_at", "TEXT")
+        # One blocking attempt, including confirmed sends, per generation.
+        # Enforced across connections/processes, not only by a Python precheck.
+        # Existing conflicting claims deliberately fail migration closed.
+        self.db.conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_send_attempt_blocking
+            ON v2_send_attempts (intervention_id, execution_generation)
+            WHERE is_dry_run = 0 AND attempt_status NOT IN
+                ('failed_pre_send', 'reconciled_not_sent', 'cancelled')
+        """)
         self.db.conn.commit()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -880,21 +890,27 @@ class SQLiteV2StateRepository(V2StateRepository):
                     )
 
         now = attempt.claimed_at or datetime.now(timezone.utc)
-        cursor = self.db.conn.execute(
-            """INSERT INTO v2_send_attempts
-               (intervention_id, execution_generation, attempt_status,
-                idempotency_key, audience_hash, provider_campaign_id,
-                provider_tag, provider_segment_id, audience_count,
-                claimed_at, is_dry_run)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (attempt.intervention_id, attempt.execution_generation,
-             attempt.attempt_status.value, attempt.idempotency_key,
-             attempt.audience_hash, attempt.provider_campaign_id,
-             attempt.provider_tag, attempt.provider_segment_id,
-             attempt.audience_count, now.isoformat(),
-             1 if attempt.is_dry_run else 0),
-        )
-        self.db.conn.commit()
+        try:
+            cursor = self.db.conn.execute(
+                """INSERT INTO v2_send_attempts
+                   (intervention_id, execution_generation, attempt_status,
+                    idempotency_key, audience_hash, provider_campaign_id,
+                    provider_tag, provider_segment_id, audience_count,
+                    claimed_at, is_dry_run)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (attempt.intervention_id, attempt.execution_generation,
+                 attempt.attempt_status.value, attempt.idempotency_key,
+                 attempt.audience_hash, attempt.provider_campaign_id,
+                 attempt.provider_tag, attempt.provider_segment_id,
+                 attempt.audience_count, now.isoformat(),
+                 1 if attempt.is_dry_run else 0),
+            )
+            self.db.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            self.db.conn.rollback()
+            if 'UNIQUE constraint failed' in str(exc):
+                raise DuplicateClaimError('A blocking send claim already exists') from exc
+            raise
         attempt.id = cursor.lastrowid
         attempt.claimed_at = now
         return attempt
