@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import bisect
@@ -17,6 +19,7 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 try:
     import requests
 except ImportError:
@@ -1675,27 +1678,33 @@ class Database:
         return [self.get_curve(r['pattern']) for r in rows]
     # === Ad Spend ===
     def save_ad_spend(self, event_id: str, campaign_id: str, campaign_name: str,
-                      spend_date: str, spend: float, impressions: int = 0, clicks: int = 0):
-        with self.transaction() as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO ad_spend
-                (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks))
-    def save_ad_spend_batch(self, rows: list):
-        """Write many ad_spend rows in a single transaction.
+                      spend_date: str, spend: Optional[float],
+                      impressions: Optional[int] = None, clicks: Optional[int] = None):
+        self.save_ad_spend_batch([
+            (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
+        ])
 
-        Each row is a tuple: (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks).
-        Avoids holding the write lock across remote API calls.
+    def save_ad_spend_batch(self, rows: list):
+        """Merge observed metrics atomically; missing fields never erase facts.
+
+        Keep the existing edition assignment key. Reattribution/deduplication is
+        handled by the edition pipeline, not by a destructive schema migration.
+        Zero and downward provider restatements are observed values and apply.
         """
         if not rows:
             return
         with self.transaction() as conn:
             conn.executemany("""
-                INSERT OR REPLACE INTO ad_spend
+                INSERT INTO ad_spend
                 (event_id, campaign_id, campaign_name, spend_date, spend, impressions, clicks)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id, spend_date, campaign_id) DO UPDATE SET
+                    campaign_name = COALESCE(excluded.campaign_name, ad_spend.campaign_name),
+                    spend = COALESCE(excluded.spend, ad_spend.spend),
+                    impressions = COALESCE(excluded.impressions, ad_spend.impressions),
+                    clicks = COALESCE(excluded.clicks, ad_spend.clicks)
             """, rows)
+
     def get_spend_status(self, event_id: str) -> str:
         """Determine the spend data status for an event.
 
@@ -1710,12 +1719,14 @@ class Database:
             row = self.conn.execute(
                 "SELECT MAX(spend_date) as latest_date, "
                 "       SUM(spend) as total_spend, "
-                "       COUNT(*) as cnt "
+                "       COUNT(*) as cnt, COUNT(spend) as observed "
                 "FROM ad_spend WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
             if not row or int(row["cnt"]) == 0:
                 return "no_records"
+            if int(row["observed"]) != int(row["cnt"]):
+                return "unavailable"
             latest_date_str = row["latest_date"]
             if not latest_date_str:
                 return "no_records"
@@ -1930,9 +1941,11 @@ class EventbriteSync:
                     time.sleep(5 * (attempt + 1))
                 else:
                     raise
+        raise RuntimeError("Eventbrite API retry budget exhausted")
     def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
-        params = params or {}
+        params = dict(params or {})
         results = []
+        seen = set()
         while True:
             response = self._get(endpoint, params)
             for key in ['events', 'orders', 'attendees', 'organizations']:
@@ -1940,8 +1953,12 @@ class EventbriteSync:
                     results.extend(response[key])
                     break
             pagination = response.get('pagination', {})
-            if pagination.get('has_more_items') and pagination.get('continuation'):
-                params['continuation'] = pagination['continuation']
+            if pagination.get('has_more_items'):
+                continuation = pagination.get('continuation')
+                if not continuation or continuation in seen:
+                    raise RuntimeError("Eventbrite pagination did not advance")
+                seen.add(continuation)
+                params['continuation'] = continuation
             else:
                 break
         return results
@@ -2206,7 +2223,7 @@ class EventbriteSync:
         while current <= event_date:
             days_before = (event_date - current).days
             day_orders = daily.get(current, [])
-            tickets_today = sum((o.get('ticket_count') or 1) for o in day_orders)
+            tickets_today = sum(o['ticket_count'] for o in day_orders if o.get('ticket_count') is not None)
             revenue_today = sum((o.get('gross_amount') or 0) for o in day_orders)
             cumulative_tickets += tickets_today
             cumulative_revenue += revenue_today
@@ -2241,7 +2258,7 @@ class EventbriteSync:
         for email in emails:
             orders = orders_by_email.get((email or '').lower().strip(), [])
             if orders:
-                total_spent = sum(o.get('gross_amount', 0) for o in orders)
+                total_spent = sum(o['gross_amount'] for o in orders if o.get('gross_amount') is not None)
                 last_date = max(o['order_timestamp'] for o in orders)
                 try:
                     days_since = (datetime.now() - datetime.fromisoformat(last_date)).days
@@ -2413,7 +2430,7 @@ class EventbriteSync:
         with self.db.deferred_commit():
             for (email, etype, city), orders in groups.items():
                 n_orders = len(orders)
-                total_tickets = sum(o['ticket_count'] or 1 for o in orders)
+                total_tickets = sum(o['ticket_count'] for o in orders if o.get('ticket_count') is not None)
                 total_spent = sum(o['gross_amount'] or 0 for o in orders)
                 event_ids = set(o['event_id'] for o in orders)
                 timestamps = [o['order_timestamp'] for o in orders]
@@ -2568,12 +2585,12 @@ class EventbriteSync:
         if not orders:
             return None
         total_orders = len(orders)
-        total_tickets = sum(o.get('ticket_count', 1) for o in orders)
-        total_spent = sum(o.get('gross_amount', 0) for o in orders)
+        total_tickets = sum(o['ticket_count'] for o in orders if o.get('ticket_count') is not None)
+        total_spent = sum(o['gross_amount'] for o in orders if o.get('gross_amount') is not None)
         # Dates
-        timestamps = [o['order_timestamp'] for o in orders]
-        first_date = min(timestamps)
-        last_date = max(timestamps)
+        timestamps = [o['order_timestamp'] for o in orders if o.get('order_timestamp')]
+        first_date = min(timestamps) if timestamps else ''
+        last_date = max(timestamps) if timestamps else ''
         try:
             first_dt = datetime.fromisoformat(first_date)
             last_dt = datetime.fromisoformat(last_date)
@@ -2793,25 +2810,41 @@ class MetaAdsSync:
         self.session = requests.Session()
         self.session.headers['Authorization'] = f'Bearer {access_token}'
     def _api_get(self, url: str, params: dict = None):
-        """Make GET request with retry/backoff for rate limits."""
+        """Bound retries and fail the sync rather than publish partial data.
+
+        Graph pagination may include an access token in the URL. Remove it;
+        authentication belongs only in the session header, never in logs.
+        """
         import time
-        params = params or {}
-        params['access_token'] = self.access_token
+        parsed = urlsplit(url)
+        if (parsed.scheme != 'https' or parsed.hostname != 'graph.facebook.com'
+                or parsed.username or parsed.password or parsed.port not in (None, 443)):
+            raise ValueError("Unexpected Meta pagination origin")
+        query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                 if k.lower() != 'access_token']
+        url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ''))
+        params = {k: v for k, v in (params or {}).items() if k.lower() != 'access_token'}
         for attempt in range(3):
             try:
-                resp = self.session.get(url, params=params, timeout=30)
+                resp = self.session.get(url, params=params, timeout=30, allow_redirects=False)
                 if resp.status_code == 429:
                     wait = int(resp.headers.get('Retry-After', 60 * (attempt + 1)))
                     log.warning(f"Meta API rate limited, waiting {wait}s")
-                    time.sleep(wait)
+                    if attempt < 2:
+                        time.sleep(min(max(wait, 0), 120))
                     continue
+                if 300 <= resp.status_code < 400:
+                    raise RuntimeError("Meta API redirect rejected")
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                if not isinstance(data, dict) or 'error' in data:
+                    raise RuntimeError("Invalid Meta API response")
+                return data
             except Exception as e:
-                log.error(f"Meta API error (attempt {attempt+1}): {e}")
+                log.error("Meta API attempt %s failed (%s)", attempt + 1, type(e).__name__)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
-        return None
+        raise RuntimeError("Meta API retry budget exhausted") from None
 
     @staticmethod
     def _extract_year(text: str) -> Optional[int]:
@@ -2967,10 +3000,14 @@ class MetaAdsSync:
         params = {'fields': 'id,name,status,objective', 'limit': 200}
         matched = []
         seen_ids = set()
+        visited_pages = set()
         while url:
+            if url in visited_pages:
+                raise RuntimeError('Meta pagination did not advance')
+            visited_pages.add(url)
             data = self._api_get(url, params)
-            if not data:
-                break
+            if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+                raise RuntimeError('Incomplete Meta page response')
             for campaign in data.get('data', []):
                 if campaign['id'] in seen_ids:
                     continue
@@ -3002,10 +3039,14 @@ class MetaAdsSync:
         params = {'fields': 'id,name,status,objective', 'limit': 200}
         all_campaigns = []
         seen_ids = set()
+        visited_pages = set()
         while url:
+            if url in visited_pages:
+                raise RuntimeError('Meta pagination did not advance')
+            visited_pages.add(url)
             data = self._api_get(url, params)
-            if not data:
-                break
+            if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+                raise RuntimeError('Incomplete Meta page response')
             for campaign in data.get('data', []):
                 if campaign['id'] not in seen_ids:
                     all_campaigns.append(campaign)
@@ -3210,15 +3251,18 @@ class MetaAdsSync:
         params = {
             'fields': 'spend,impressions,clicks,date_start,date_stop',
             'time_increment': '1',
-            'date_start': date_start,
-            'date_stop': date_stop,
+            'time_range': json.dumps({'since': date_start, 'until': date_stop}),
             'limit': 500
         }
         insights = []
+        visited_pages = set()
         while url:
+            if url in visited_pages:
+                raise RuntimeError('Meta pagination did not advance')
+            visited_pages.add(url)
             data = self._api_get(url, params)
-            if not data:
-                break
+            if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+                raise RuntimeError('Incomplete Meta page response')
             insights.extend(data.get('data', []))
             paging = data.get('paging', {})
             next_url = paging.get('next')
@@ -3261,18 +3305,22 @@ class MetaAdsSync:
             for campaign in campaigns:
                 insights = self._fetch_daily_insights(campaign['id'], date_start, date_stop)
                 for day_data in insights:
-                    spend = float(day_data.get('spend', 0))
-                    impressions = int(day_data.get('impressions', 0))
-                    clicks = int(day_data.get('clicks', 0))
-                    spend_date = day_data.get('date_start', '')
+                    spend = float(day_data['spend']) if day_data.get('spend') is not None else None
+                    impressions = int(day_data['impressions']) if day_data.get('impressions') is not None else None
+                    clicks = int(day_data['clicks']) if day_data.get('clicks') is not None else None
+                    spend_date = day_data['date_start']
+                    date.fromisoformat(spend_date)  # reject incomplete/invalid observations
                     batch_rows.append((
                         event_id, campaign['id'], campaign['name'],
                         spend_date, spend, impressions, clicks
                     ))
-                    total_spend += spend
+                    if spend is not None:
+                        total_spend += spend
                 total_days += len(insights)
             # Phase 2: Write all rows in a single transaction
             self.db.save_ad_spend_batch(batch_rows)
+            # Report persisted facts after unknown-preserving merges.
+            total_spend = self.db.get_event_spend(event_id)
             log.info(f"Meta sync for {event_name}: ${total_spend:.2f} across {len(campaigns)} campaigns, {len(batch_rows)} rows")
             return {'event_id': event_id, 'total_spend': round(total_spend, 2),
                     'campaigns_found': len(campaigns), 'days_of_data': total_days,
@@ -3617,7 +3665,7 @@ class DecisionEngine:
         if hist_tickets_at_point:
             sorted_tix = sorted(hist_tickets_at_point)
             n = len(sorted_tix)
-            hist_median = sorted_tix[n // 2]
+            hist_median = statistics.median(sorted_tix)
             hist_lo = sorted_tix[0]
             hist_hi = sorted_tix[-1]
             if hist_median > 0:
@@ -3952,7 +4000,7 @@ class DecisionEngine:
         if comps_with_snap:
             snap_tix = sorted([c['at_days_out']['tickets'] for c in comps_with_snap])
             n = len(snap_tix)
-            grouped_hist_median = snap_tix[n // 2]
+            grouped_hist_median = statistics.median(snap_tix)
             grouped_hist_lo = snap_tix[0]
             grouped_hist_hi = snap_tix[-1]
         # Calculate actual pace for grouped event based on ticket counts

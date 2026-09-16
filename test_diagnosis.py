@@ -99,7 +99,7 @@ class FakeDB:
         return [
             dict(row)
             for row in self.conn.execute(
-                "SELECT * FROM daily_snapshot WHERE event_id = ? ORDER BY snapshot_date DESC",
+                "SELECT * FROM daily_snapshot WHERE event_id = ? ORDER BY snapshot_date ASC",
                 (event_id,),
             ).fetchall()
         ]

@@ -471,3 +471,102 @@ class TestParsedUnknownsDoNotReachNonNullConsumers(_Fixture):
         ev["status"] = "upcoming"
         self.db.upsert_event(ev)
         self.assertEqual(self.db.get_event("E1")["capacity"], 2000)
+
+
+class TestAuditTruthRegressions(unittest.TestCase):
+    """Production ordering, sparse payloads, and partial fetches from the audit."""
+
+    def setUp(self):
+        from craft_unified import MetaAdsSync
+        self.db = Database(':memory:')
+        self.meta = MetaAdsSync.__new__(MetaAdsSync)
+        self.meta.db = self.db
+        self.meta.ad_account_id = '123'
+
+    def tearDown(self):
+        self.db.conn.close()
+
+    def test_missing_meta_metrics_preserve_observed_values(self):
+        today = datetime.date.today().isoformat()
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, 250, 1000, 20)
+        self.db.save_ad_spend('E', 'C', None, today, None, None, 0)
+        row = dict(self.db.conn.execute('SELECT * FROM ad_spend').fetchone())
+        self.assertEqual((row['spend'], row['impressions'], row['clicks']), (250, 1000, 0))
+        self.db.save_ad_spend('E', 'C', None, today, 200)
+        self.assertEqual(self.db.get_event_spend('E'), 200)
+
+    def test_unobserved_spend_is_not_trustworthy_zero(self):
+        today = datetime.date.today().isoformat()
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, None)
+        self.assertEqual(self.db.get_spend_status('E'), 'unavailable')
+        self.db.save_ad_spend('E', 'C', 'Campaign', today, 0)
+        self.assertEqual(self.db.get_spend_status('E'), 'current_zero_spend')
+
+    def test_partial_meta_fetch_does_not_commit_any_rows(self):
+        from unittest.mock import Mock
+        self.meta._fetch_daily_insights = Mock(side_effect=[
+            [{'date_start': '2026-09-01', 'spend': '250'}],
+            RuntimeError('Meta API retry budget exhausted')])
+        result = self.meta.sync_event_spend('E', 'Austin Coffee', '2026-10-17',
+            campaigns_override=[{'id':'C1','name':'One'}, {'id':'C2','name':'Two'}])
+        self.assertIn('error', result)
+        self.assertEqual(self.db.conn.execute('SELECT COUNT(*) FROM ad_spend').fetchone()[0], 0)
+
+    def test_meta_pagination_failure_is_not_empty_success(self):
+        from unittest.mock import Mock
+        self.meta._api_get = Mock(return_value=None)
+        with self.assertRaises(RuntimeError):
+            self.meta._fetch_all_campaigns()
+
+    def test_meta_repeated_page_fails(self):
+        from unittest.mock import Mock
+        self.meta._api_get = Mock(return_value={'data': [], 'paging': {'next':'https://graph.facebook.com/next'}})
+        with self.assertRaises(RuntimeError):
+            self.meta._fetch_daily_insights('C', '2026-09-01', '2026-09-15')
+        self.assertEqual(self.meta._api_get.call_count, 2)
+
+    def test_meta_token_removed_and_failure_redacted(self):
+        from unittest.mock import Mock, patch
+        self.meta.session = Mock()
+        self.meta.session.get.side_effect = RuntimeError('secret-value-in-URL')
+        with patch('time.sleep'), self.assertLogs('craft', level='ERROR') as logs:
+            with self.assertRaisesRegex(RuntimeError, 'retry budget exhausted'):
+                self.meta._api_get('https://graph.facebook.com/next?access_token=secret-value-in-URL&after=abc')
+        self.assertNotIn('secret-value', str(logs.output))
+        args, kwargs = self.meta.session.get.call_args
+        self.assertNotIn('access_token', args[0])
+        self.assertFalse(kwargs['allow_redirects'])
+        self.assertEqual(kwargs['params'], {})
+
+    def test_meta_foreign_paging_origin_rejected_before_request(self):
+        from unittest.mock import Mock
+        self.meta.session = Mock()
+        with self.assertRaises(ValueError):
+            self.meta._api_get('https://example.com/collect')
+        self.meta.session.get.assert_not_called()
+
+    def test_eventbrite_incomplete_pagination_fails(self):
+        from unittest.mock import Mock
+        sync = EventbriteSync.__new__(EventbriteSync)
+        sync._get = Mock(return_value={'orders': [], 'pagination': {'has_more_items': True}})
+        with self.assertRaises(RuntimeError):
+            sync._paginate('/orders')
+
+    def test_null_amount_does_not_abort_profile_and_unknown_ticket_not_invented(self):
+        sync = EventbriteSync.__new__(EventbriteSync)
+        profile = sync._build_customer_profile('buyer@example.com', [
+            {'order_timestamp': '2026-09-01T10:00:00', 'gross_amount': None, 'ticket_count': None},
+            {'order_timestamp': '2026-09-02T10:00:00', 'gross_amount': 100, 'ticket_count': 2}], 3, 3, 3)
+        self.assertEqual(profile.total_spent, 100)
+        self.assertEqual(profile.total_tickets, 2)
+
+    def test_velocity_uses_latest_calendar_window_with_production_order(self):
+        from diagnosis_engine import DiagnosisEngine
+        self.db.conn.executemany('INSERT INTO daily_snapshots (event_id,snapshot_date,days_before_event,tickets_cumulative) VALUES (?,?,?,?)', [
+            ('E', '2026-09-01', 30, 10), ('E', '2026-09-08', 23, 80),
+            ('E', '2026-09-13', 18, 105), ('E', '2026-09-15', 16, 115)])
+        self.db.conn.commit()
+        engine = DiagnosisEngine(self.db, None)
+        self.assertEqual(engine._compute_velocity('E'), 5)
+        self.assertEqual(engine._compute_velocity('E', days=2), 5)
+        self.assertIsNone(engine._compute_velocity('E', days=1))
