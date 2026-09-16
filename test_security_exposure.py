@@ -278,3 +278,6 @@ def _here(name):
 
 if __name__ == "__main__":
     unittest.main()
+
+# Include the new protected report boundary in the existing CI security suite.
+from test_campaign_history_report import CampaignHistoryReportTests  # noqa: E402,F401
