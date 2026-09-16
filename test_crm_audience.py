@@ -74,6 +74,7 @@ class CRMAudienceTests(unittest.TestCase):
             ('philly','Coffee','Philly','coffee','2025-10-01'),
             ('future','Coffee','DC','coffee','2026-09-25'),
             ('unknown','Coffee','DC','coffee','not-a-date'),
+            ('exhibitor','Coffee - Exhibitor Payment','DC','coffee','2025-10-01'),
         ]
         conn.executemany('INSERT INTO events VALUES (?,?,?,?,?)', events)
         conn.executemany('INSERT INTO orders VALUES (?,?,?)', [
@@ -82,6 +83,7 @@ class CRMAudienceTests(unittest.TestCase):
             ('wine','wine@example.com',2), ('philly','philly@example.com',2),
             ('future','future@example.com',2), ('unknown','unknown@example.com',2),
             ('past','refunded@example.com',0), ('past','unobserved@example.com',None),
+            ('exhibitor','vendor@example.com',3),
         ])
         self.db.conn = conn
         self.db.get_event.side_effect = lambda eid: dict(conn.execute('SELECT * FROM events WHERE event_id=?',(eid,)).fetchone())

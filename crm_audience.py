@@ -48,6 +48,9 @@ def _past_buyers(db, event, siblings, now):
         FROM orders o JOIN events e ON e.event_id = o.event_id
         WHERE e.event_type = ? AND e.city = ?
           AND date(e.event_date) < ? AND o.ticket_count > 0
+          AND lower(e.name) NOT LIKE '%exhibitor%'
+          AND lower(e.name) NOT LIKE '%vendor%'
+          AND lower(e.name) NOT LIKE '%sponsor%'
           AND e.event_id NOT IN ({placeholders})
         GROUP BY lower(trim(o.email))
         ORDER BY email LIMIT 50001
@@ -65,6 +68,8 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
     event = db.get_event(event_id)
     if not event or not event.get('event_type') or not event.get('city'):
         raise ValueError('A known event with festival type and city is required')
+    if any(word in (event.get('name') or '').lower() for word in ('exhibitor', 'vendor', 'sponsor')):
+        raise ValueError('Business payment events are not customer campaign destinations')
     siblings = db.edition_sibling_ids(event_id)
     if not siblings or event_id not in siblings:
         raise ValueError('Current edition could not be resolved')
