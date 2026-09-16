@@ -5759,41 +5759,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                     break
         if not event:
             return jsonify({'error': 'Event not found'}), 404
-        current_buyers = set()
-        for eid in all_sibling_ids:
-            current_buyers.update(db.get_event_buyers(eid))
-
-        customers_list = []
-        _et = event.get('event_type', '')
-        _ec = event.get('city', '')
-        if audience == 'cross_sell':
-            customers_list = db.get_cross_sell_candidates(
-                event.get('event_type', ''), event.get('city', ''),
-                exclude_emails=current_buyers, limit=5000)
-        elif audience == 'super_spreaders':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(_et, _ec, superspreaders_only=True)
-        elif audience == 'vips':
-            if _et and _ec:
-                vips = db.get_event_profiles(_et, _ec, vips_only=True)
-                customers_list = [v for v in vips if v['email'] not in current_buyers]
-        elif audience == 'churn_critical':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(
-                    _et, _ec, churn_levels=['critical', 'urgent']
-                )
-        elif audience == 'accelerating':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(_et, _ec, momentum='accelerating')
-        elif audience == 'dormant':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(_et, _ec, momentum='dormant')
-        elif audience == 'high_influence':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(_et, _ec, min_social_influence=50)
-        elif audience == 'group_buyers':
-            if _et and _ec:
-                customers_list = db.get_event_profiles(_et, _ec, group_size='large_group')
+        from crm_audience import build_crm_audience
+        try:
+            plan = build_crm_audience(
+                db, event['event_id'], audience,
+                purpose=request.args.get('purpose', 'ticket_sales'))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        # Fresh CRM candidates, not proof of provider subscription eligibility.
+        customers_list = plan['records']
         # Build CSV
         output = io.StringIO()
         fields = ['email', 'favorite_city', 'favorite_event_type', 'rfm_segment',
