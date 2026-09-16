@@ -45,6 +45,7 @@ from send_attempt_model import (
     TERMINAL_ATTEMPT_STATES,
 )
 from suppression_guard import SuppressionGuard, SuppressionStatus
+from audience_suppression import guard_for_events
 from provider_outcome import (
     ProviderSendOutcome,
     ProviderSendStatus,
@@ -207,7 +208,7 @@ class ExecutionAdapter:
 
         # ── Gate 3: suppression must be positively valid (fail-closed) ──
         supp_status, supp_details, suppressed = (
-            self.suppression_guard.get_suppressions_if_valid()
+            guard_for_events(self.db, [intervention.event_id], self.suppression_guard).get_suppressions_if_valid()
         )
         if supp_status not in (SuppressionStatus.HEALTHY, SuppressionStatus.ACKNOWLEDGED_EMPTY):
             self.v2_repo.append_audit(
@@ -767,7 +768,13 @@ class ExecutionAdapter:
             self.v2_repo.update_send_attempt(attempt)
             raise RuntimeError("Mailchimp not configured — cannot send")
 
-        mc = self.campaign_engine.mailchimp
+        try:
+            mc = self.campaign_engine.mailchimp_for_event(intervention.event_id)
+        except Exception as exc:
+            attempt.transition_to(SendAttemptStatus.FAILED_PRE_SEND)
+            attempt.error_message = 'Verified festival audience mapping required'
+            self.v2_repo.update_send_attempt(attempt)
+            raise RuntimeError(attempt.error_message) from exc
         tag_name = f"v2-{intervention.id}-{attempt.id}"
 
         # ── Step 1: Push audience to Mailchimp ────────────────────────

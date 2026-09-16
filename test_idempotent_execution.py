@@ -259,6 +259,9 @@ class FakeCampaignEngine:
     def __init__(self, mailchimp=None):
         self.mailchimp = mailchimp or FakeDeterministicMailchimp()
 
+    def mailchimp_for_event(self, event_id):
+        return self.mailchimp
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Fake execution DB (replicating pattern from test_intervention.py)

@@ -654,7 +654,8 @@ def _build_app():
         from suppression_guard import SuppressionGuard
 
         mc_key = os.environ.get("MAILCHIMP_API_KEY")
-        mc_audience = os.environ.get("MAILCHIMP_AUDIENCE_ID")
+        requested_audience = (request.get_json(silent=True) or {}).get('audience_id')
+        mc_audience = requested_audience or os.environ.get("MAILCHIMP_AUDIENCE_ID")
         if not mc_key or not mc_audience:
             return jsonify({
                 "error": "mailchimp_not_configured",
@@ -670,7 +671,16 @@ def _build_app():
                 "message": str(e),
             }), 500
 
-        guard = SuppressionGuard(db, v2_repo=v2_repo)
+        if requested_audience:
+            from audience_suppression import AudienceSuppressionGuard
+            try:
+                guard = AudienceSuppressionGuard(db, requested_audience)
+            except ValueError:
+                return jsonify({'error':'invalid_audience_id'}), 400
+        elif os.environ.get('MAILCHIMP_EVENT_AUDIENCES'):
+            return jsonify({'error':'audience_id_required'}), 400
+        else:
+            guard = SuppressionGuard(db, v2_repo=v2_repo)
         result = guard.refresh_from_mailchimp(mc_client)
 
         if "error" in result:

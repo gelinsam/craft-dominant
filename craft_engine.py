@@ -1016,6 +1016,21 @@ class CraftCampaignEngine:
                 self._mailchimp = MailchimpClient(key, audience_id)
         return self._mailchimp
 
+    def mailchimp_for_event(self, event_id: str) -> MailchimpClient:
+        """Resolve an explicit event destination; never use the legacy default.
+
+        Audience names, city matches, and cross-list membership do not establish
+        permission. Every event must have an independently verified mapping.
+        """
+        from audience_routing import event_audience_id
+        audience_id = event_audience_id(event_id)
+        if not self.db.get_event(event_id):
+            raise RuntimeError('Mapped festival event does not exist')
+        key = os.environ.get('MAILCHIMP_API_KEY')
+        if not key:
+            raise RuntimeError('Mailchimp is not configured')
+        return MailchimpClient(key, audience_id)
+
     # ─────────────────────────────────────────────────────────
     # PHASE DETECTION — what phase is each event in?
     # ─────────────────────────────────────────────────────────
@@ -1495,7 +1510,7 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
     # WEBHOOK PROCESSING — track opens, clicks, bounces
     # ─────────────────────────────────────────────────────────
 
-    def process_mailchimp_webhook(self, data: Dict) -> Dict:
+    def process_mailchimp_webhook(self, data: Dict, audience_id: str = None) -> Dict:
         """Process Mailchimp webhook events (unsubscribe, cleaned, campaign activity).
 
         After writing a suppression row, updates the suppression sentinel
@@ -1510,12 +1525,20 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         if event_type == 'unsubscribe':
             email = data.get('data', {}).get('email', '').lower()
             if email:
-                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
+                if audience_id:
+                    from audience_suppression import AudienceSuppressionGuard
+                    AudienceSuppressionGuard(self.db, audience_id).record_email(email, 'unsubscribe', source='webhook_unsubscribe')
+                else:
+                    self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'unsubscribe')", (email,))
                 suppression_written = True
         elif event_type == 'cleaned':
             email = data.get('data', {}).get('email', '').lower()
             if email:
-                self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
+                if audience_id:
+                    from audience_suppression import AudienceSuppressionGuard
+                    AudienceSuppressionGuard(self.db, audience_id).record_email(email, 'bounce', source='webhook_cleaned')
+                else:
+                    self.db.conn.execute("INSERT OR IGNORE INTO suppressions (email, reason) VALUES (?, 'bounce')", (email,))
                 suppression_written = True
         elif event_type == 'campaign':
             # Campaign sent notification — we can pull reports
@@ -1535,7 +1558,7 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         self.db.conn.commit()
 
         # Update suppression sentinel AFTER successful commit
-        if suppression_written:
+        if suppression_written and not audience_id:
             try:
                 guard = SuppressionGuard(self.db, v2_repo=self._v2_repo)
                 guard.record_mutation(source=f"webhook_{event_type}")
@@ -1837,8 +1860,25 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
         if request.method == 'GET':
             return '', 200  # URL validation handshake; no mutation, no data.
 
-        signing_secret = os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRET', '')
-        if not signing_secret:
+        raw_body = request.get_data(cache=True)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = normalize_mailchimp_form(request.form)
+        audience_id = None
+        if os.environ.get('MAILCHIMP_EVENT_AUDIENCES') or os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRETS'):
+            # Untrusted list_id selects a key only. The selected key must then
+            # authenticate the exact raw body, including that same list_id.
+            try:
+                keys = json.loads(os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRETS', '{}'))
+                audience_id = payload.get('data', {}).get('list_id')
+                if not isinstance(audience_id, str) or not re.fullmatch(r'[a-fA-F0-9]{10}', audience_id):
+                    raise ValueError('Missing audience identity')
+                signing_secret = keys.get(audience_id) if isinstance(keys, dict) else None
+            except (ValueError, TypeError, AttributeError):
+                return jsonify({'error':'invalid_webhook_audience'}), 401
+        else:
+            signing_secret = os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRET', '')
+        if not isinstance(signing_secret, str) or not signing_secret:
             log.error("Mailchimp webhook POST refused: "
                       "MAILCHIMP_WEBHOOK_SIGNING_SECRET is not set")
             return jsonify({
@@ -1846,10 +1886,6 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
                 'message': 'MAILCHIMP_WEBHOOK_SIGNING_SECRET must be configured '
                            'before webhook events are accepted.',
             }), 503
-
-        # Raw bytes first. Touching request.form or request.get_json() before
-        # this can re-encode the body and break the signature.
-        raw_body = request.get_data(cache=True)
 
         ok, reason = verify_mailchimp_signature(
             signing_secret, request.headers.get('X-Mailchimp-Signature', ''), raw_body)
@@ -1868,11 +1904,7 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
                 log.warning("Mailchimp webhook POST rejected: bad or missing path secret")
                 return jsonify({'error': 'unauthorized'}), 401
 
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            payload = normalize_mailchimp_form(request.form)
-
-        result = engine.process_mailchimp_webhook(payload)
+        result = engine.process_mailchimp_webhook(payload, audience_id=audience_id)
         return jsonify(result)
 
     @app.route('/api/campaigns/<cid>/sync-stats', methods=['POST'])

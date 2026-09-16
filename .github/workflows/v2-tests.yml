@@ -101,3 +101,21 @@ jobs:
             fi
           fi
           echo "Postgres integration tests verified"
+
+  frontend-build:
+    name: Frontend build and proxy boundary tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+      - name: Verify proxy boundary
+        run: npm test
+      - name: Build production frontend
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'

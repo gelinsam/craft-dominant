@@ -543,3 +543,52 @@ class TestMailchimpConsentBoundary(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.client.ensure_members(['yes@example.com'], tag='attempt-one')
         self.assertIsNone(self.client.get_tag_segment_id('attempt-one'))
+
+
+class TestFestivalAudienceRouting(unittest.TestCase):
+    def setUp(self):
+        from craft_engine import CraftCampaignEngine
+        from unittest.mock import Mock
+        self.engine = CraftCampaignEngine.__new__(CraftCampaignEngine)
+        self.engine.db = Mock()
+        self.engine.db.get_event.return_value = {'event_id':'E'}
+
+    def test_single_legacy_audience_is_never_a_festival_fallback(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'MAILCHIMP_AUDIENCE_ID':'299007183e', 'MAILCHIMP_EVENT_AUDIENCES':'{}'}):
+            with self.assertRaisesRegex(RuntimeError, 'no verified'):
+                self.engine.mailchimp_for_event('Austin')
+
+    def test_explicit_routes_keep_city_audiences_separate(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'MAILCHIMP_API_KEY':'test-us16', 'MAILCHIMP_EVENT_AUDIENCES':'{"Austin":"aaaaaaaaaa","Philly":"bbbbbbbbbb"}'}):
+            self.assertEqual(self.engine.mailchimp_for_event('Austin').audience_id, 'aaaaaaaaaa')
+            self.assertEqual(self.engine.mailchimp_for_event('Philly').audience_id, 'bbbbbbbbbb')
+
+    def test_invalid_mapping_fails_closed(self):
+        from unittest.mock import patch
+        for raw in ('[]', '{', '{"E":"../other"}'):
+            with self.subTest(raw=raw), patch.dict(os.environ, {'MAILCHIMP_EVENT_AUDIENCES':raw}):
+                with self.assertRaises(RuntimeError):
+                    self.engine.mailchimp_for_event('E')
+
+
+class TestAudienceBoundWebhook(_Harness):
+    def test_signed_unsubscribe_only_mutates_its_own_audience(self):
+        from unittest.mock import patch
+        from audience_suppression import AudienceSuppressionGuard
+        with patch.dict(os.environ, {'MAILCHIMP_WEBHOOK_SIGNING_SECRETS':json.dumps({'aaaaaaaaaa':SIGNING_SECRET, 'bbbbbbbbbb':'different-key'})}):
+            response = self.post_form({'type':'unsubscribe', 'data[list_id]':'aaaaaaaaaa', 'data[email]':'local@example.com'})
+        self.assertEqual(response.status_code, 200)
+        a = AudienceSuppressionGuard(self.db, 'aaaaaaaaaa')
+        b = AudienceSuppressionGuard(self.db, 'bbbbbbbbbb')
+        self.assertEqual(a._actual_suppression_count(), 1)
+        self.assertEqual(b._actual_suppression_count(), 0)
+        self.assertNotIn('local@example.com', self.suppressed())
+
+    def test_another_audiences_key_cannot_authenticate_delivery(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'MAILCHIMP_WEBHOOK_SIGNING_SECRETS':json.dumps({'aaaaaaaaaa':SIGNING_SECRET, 'bbbbbbbbbb':'different-key'})}):
+            response = self.post_form({'type':'unsubscribe', 'data[list_id]':'bbbbbbbbbb', 'data[email]':'local@example.com'})
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn('local@example.com', self.suppressed())

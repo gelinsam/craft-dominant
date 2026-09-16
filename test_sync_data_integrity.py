@@ -655,3 +655,49 @@ class TestAuditMedianAndRestatement(unittest.TestCase):
         self.assertEqual(result['total_spend'], 200)
         self.assertEqual(result['spend_regression']['decrease'], 50)
         db.conn.close()
+
+
+class TestAudienceSuppressionIsolation(unittest.TestCase):
+    def setUp(self):
+        from audience_suppression import AudienceSuppressionGuard
+        self.db = Database(':memory:')
+        self.a = AudienceSuppressionGuard(self.db, 'aaaaaaaaaa')
+        self.b = AudienceSuppressionGuard(self.db, 'bbbbbbbbbb')
+
+    def tearDown(self):
+        self.db.conn.close()
+
+    def client(self, audience_id, emails):
+        from types import SimpleNamespace
+        return SimpleNamespace(audience_id=audience_id, get_suppressed_members=lambda: emails)
+
+    def test_one_list_refresh_cannot_establish_other_list_freshness(self):
+        from suppression_guard import SuppressionStatus
+        self.assertTrue(self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['a@example.com']))['refreshed'])
+        self.assertEqual(self.a.validate()[0], SuppressionStatus.HEALTHY)
+        self.assertEqual(self.b.validate()[0], SuppressionStatus.NEVER_SYNCED)
+        self.b.refresh_from_mailchimp(self.client('bbbbbbbbbb', ['b@example.com']))
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'a@example.com'})
+        self.assertEqual(self.b.get_suppressions_if_valid()[2], {'b@example.com'})
+
+    def test_wrong_provider_scope_cannot_replace_rows(self):
+        self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['a@example.com']))
+        result = self.a.refresh_from_mailchimp(self.client('bbbbbbbbbb', ['b@example.com']))
+        self.assertIn('error', result)
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'a@example.com'})
+
+    def test_webhook_during_refresh_is_preserved_and_refresh_fails(self):
+        from types import SimpleNamespace
+        self.a.refresh_from_mailchimp(self.client('aaaaaaaaaa', ['existing@example.com']))
+        def fetch():
+            self.a.record_email('new@example.com', 'unsubscribe')
+            return ['existing@example.com']
+        result = self.a.refresh_from_mailchimp(SimpleNamespace(audience_id='aaaaaaaaaa', get_suppressed_members=fetch))
+        self.assertIn('error', result)
+        self.assertEqual(self.a.get_suppressions_if_valid()[2], {'existing@example.com', 'new@example.com'})
+
+    def test_webhook_alone_never_proves_full_scope(self):
+        from suppression_guard import SuppressionStatus
+        self.a.record_email('a@example.com', 'unsubscribe')
+        self.assertEqual(self.a.validate()[0], SuppressionStatus.NEVER_SYNCED)
+        self.assertEqual(self.b._actual_suppression_count(), 0)
