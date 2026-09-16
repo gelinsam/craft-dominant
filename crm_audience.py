@@ -6,6 +6,7 @@ criteria, never arbitrary SQL. Provider eligibility must be checked separately.
 import csv
 import hashlib
 import io
+from datetime import datetime, timezone
 
 
 FILTERS = {
@@ -23,8 +24,39 @@ def email_key(value):
     return value.strip().lower() if isinstance(value, str) else ''
 
 
-def build_crm_audience(db, event_id, segment, purpose='ticket_sales'):
-    if segment not in FILTERS and segment != 'cross_sell':
+def _past_buyers(db, event, siblings, now):
+    """Exact city/type, completed dates, positive observed ticket counts.
+
+    This is purchase evidence, not proof of physical attendance. Never use the
+    legacy substring-name matcher, profile totals or a future edition as history.
+    """
+    dates = []
+    for sibling in siblings:
+        item = db.get_event(sibling)
+        if not item or (item.get('city'), item.get('event_type')) != (event['city'], event['event_type']):
+            raise ValueError('Edition sibling has missing or conflicting festival scope')
+        dates.append(datetime.fromisoformat(item['event_date']).date())
+    if not dates:
+        raise ValueError('Edition has no resolved event dates')
+    cutoff = min(min(dates), now.astimezone(timezone.utc).date()).isoformat()
+    placeholders = ','.join('?' for _ in siblings)
+    rows = db.conn.execute(f"""
+        SELECT lower(trim(o.email)) AS email,
+               COUNT(DISTINCT e.event_id) AS past_event_count,
+               MAX(date(e.event_date)) AS last_event_date,
+               SUM(o.ticket_count) AS past_ticket_count
+        FROM orders o JOIN events e ON e.event_id = o.event_id
+        WHERE e.event_type = ? AND e.city = ?
+          AND date(e.event_date) < ? AND o.ticket_count > 0
+          AND e.event_id NOT IN ({placeholders})
+        GROUP BY lower(trim(o.email))
+        ORDER BY email LIMIT 50001
+    """, [event['event_type'], event['city'], cutoff, *siblings]).fetchall()
+    return [dict(row) for row in rows]
+
+
+def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
+    if segment not in FILTERS and segment not in ('cross_sell', 'past_attendees'):
         raise ValueError('Unsupported CRM audience')
     if purpose not in ('ticket_sales', 'referral'):
         raise ValueError('Unsupported campaign purpose')
@@ -34,10 +66,17 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales'):
     if not event or not event.get('event_type') or not event.get('city'):
         raise ValueError('A known event with festival type and city is required')
     siblings = db.edition_sibling_ids(event_id)
+    if not siblings or event_id not in siblings:
+        raise ValueError('Current edition could not be resolved')
     buyers = set()
     for sibling in siblings:
         buyers.update(email_key(email) for email in db.get_event_buyers(sibling))
-    if segment == 'cross_sell':
+    if segment == 'past_attendees':
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError('Current time requires a timezone')
+        rows = _past_buyers(db, event, siblings, now)
+    elif segment == 'cross_sell':
         rows = db.get_cross_sell_candidates(event['event_type'], event['city'],
                                             exclude_emails=buyers, limit=50001)
     else:

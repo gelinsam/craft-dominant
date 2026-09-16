@@ -68,4 +68,38 @@ class CampaignPreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_import(self.prepare(),'source',self.sources[0]['csv'],self.stamp,self.now)
 
+    def test_scheduled_membership_excluded_across_provider_and_city(self):
+        self.history['active_campaigns'] = [dict(provider='mailchimp',campaign_id='other-city',
+            observed_at=self.stamp,recipient_emails=[' A@example.com '],membership_complete=True)]
+        result = self.prepare()
+        self.assertEqual(result['upload_csv'],'b@example.com\n')
+        self.assertEqual(result['excluded_active_campaign_recipients'],1)
+        self.assertNotIn('active_campaigns_unresolved',result['sending_blockers'])
+        self.assertIn('sending_disabled',result['sending_blockers'])
+
+    def test_partial_active_membership_excludes_known_people_but_retains_hold(self):
+        self.history['active_campaigns'] = [dict(provider='eventbrite',campaign_id='sending',
+            observed_at=self.stamp,recipient_emails=['a@example.com'],membership_complete=False)]
+        result = self.prepare()
+        self.assertEqual(result['upload_csv'],'b@example.com\n')
+        self.assertIn('active_campaigns_unresolved',result['sending_blockers'])
+
+    def test_stale_or_malformed_membership_cannot_clear_hold(self):
+        campaign = dict(provider='eventbrite',campaign_id='sending',observed_at=self.stamp,
+                        recipient_emails=['a@example.com'],membership_complete=True)
+        self.history['active_campaigns'] = [dict(campaign,observed_at=(self.now-timedelta(hours=2)).isoformat())]
+        with self.assertRaises(ValueError): self.prepare()
+        self.history['active_campaigns'] = [dict(campaign,recipient_emails='a@example.com')]
+        self.assertIn('active_campaigns_unresolved',self.prepare()['sending_blockers'])
+        self.history['active_campaigns'] = [dict(campaign,recipient_emails=['a@example.com\nBcc:x@example.com'])]
+        with self.assertRaises(ValueError): self.prepare()
+
+    def test_recent_and_scheduled_overlap_is_counted_once(self):
+        self.history['contacts'] = [dict(email='a@example.com',contacted_at=self.stamp)]
+        self.history['active_campaigns'] = [dict(provider='eventbrite',campaign_id='sending',
+            observed_at=self.stamp,recipient_emails=['a@example.com'],membership_complete=True)]
+        result = self.prepare()
+        self.assertEqual(result['excluded_recent_contacts'],1)
+        self.assertEqual(result['excluded_active_campaign_recipients'],0)
+
 if __name__=='__main__': unittest.main()

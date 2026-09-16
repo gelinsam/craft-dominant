@@ -1,4 +1,6 @@
 import unittest
+import sqlite3
+from datetime import datetime, timezone
 from unittest.mock import Mock
 from crm_audience import build_crm_audience, eventbrite_eligible_emails, recipient_digest
 
@@ -55,6 +57,44 @@ class CRMAudienceTests(unittest.TestCase):
     def test_membership_hash_changes_with_recipients(self):
         self.assertEqual(recipient_digest(['A@example.com', 'a@example.com']), recipient_digest(['a@example.com']))
         self.assertNotEqual(recipient_digest(['a@example.com']), recipient_digest(['b@example.com']))
+
+    def test_past_buyers_use_exact_scope_completed_dates_and_all_current_days(self):
+        conn = sqlite3.connect(':memory:')
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        conn.executescript('''
+          CREATE TABLE events(event_id TEXT, name TEXT, city TEXT, event_type TEXT, event_date TEXT);
+          CREATE TABLE orders(event_id TEXT, email TEXT, ticket_count INTEGER);
+        ''')
+        events = [
+            ('sat','Coffee','DC','coffee','2026-10-03'),
+            ('sun','Coffee','DC','coffee','2026-10-04'),
+            ('past','Unrelated display name','DC','coffee','2025-10-01'),
+            ('wine','Coffee-ish name','DC','wine','2025-10-01'),
+            ('philly','Coffee','Philly','coffee','2025-10-01'),
+            ('future','Coffee','DC','coffee','2026-09-25'),
+            ('unknown','Coffee','DC','coffee','not-a-date'),
+        ]
+        conn.executemany('INSERT INTO events VALUES (?,?,?,?,?)', events)
+        conn.executemany('INSERT INTO orders VALUES (?,?,?)', [
+            ('past',' Fan@example.com ',2), ('past','fan@example.com',1),
+            ('past','buyer@example.com',1), ('sun','BUYER@example.com',1),
+            ('wine','wine@example.com',2), ('philly','philly@example.com',2),
+            ('future','future@example.com',2), ('unknown','unknown@example.com',2),
+            ('past','refunded@example.com',0), ('past','unobserved@example.com',None),
+        ])
+        self.db.conn = conn
+        self.db.get_event.side_effect = lambda eid: dict(conn.execute('SELECT * FROM events WHERE event_id=?',(eid,)).fetchone())
+        result = build_crm_audience(self.db,'sat','past_attendees',now=datetime(2026,9,16,tzinfo=timezone.utc))
+        self.assertEqual([r['email'] for r in result['records']], ['fan@example.com'])
+        self.assertEqual(result['records'][0]['past_ticket_count'],3)
+        self.assertEqual(result['excluded_current_buyers'],1)
+        self.db.get_event_profiles.assert_not_called()
+
+    def test_unresolved_edition_cannot_silently_skip_buyer_exclusion(self):
+        self.db.edition_sibling_ids.return_value = []
+        with self.assertRaises(ValueError):
+            build_crm_audience(self.db,'sat','super_spreaders')
 
 
 if __name__ == '__main__':
