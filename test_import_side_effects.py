@@ -199,3 +199,21 @@ with patch('sqlite3.connect') as database, patch('threading.Thread') as thread:
     thread.assert_not_called()
 '''], capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ClaudeRequestCompatibilityTests(unittest.TestCase):
+    def test_legacy_temperature_is_omitted_from_current_model_requests(self):
+        from unittest.mock import Mock, patch
+        from craft_engine import ClaudeClient
+        response = Mock(status_code=200)
+        response.json.return_value = {'content': [{'type': 'text', 'text': '{"ok": true}'}]}
+        with patch('requests.post', return_value=response) as post:
+            result = ClaudeClient('synthetic-test-key').generate_json('System', 'User', temperature=0.3)
+        self.assertEqual(result, {'ok': True})
+        payload = post.call_args.kwargs['json']
+        self.assertNotIn('temperature', payload)
+        self.assertNotIn('top_p', payload)
+        self.assertNotIn('top_k', payload)
+        self.assertEqual(payload['model'], 'claude-sonnet-5')
+        self.assertEqual(payload['messages'], [{'role': 'user', 'content': 'User'}])
+        self.assertEqual(post.call_count, 1)

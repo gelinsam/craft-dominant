@@ -309,7 +309,11 @@ class ClaudeClient:
 
     def generate(self, system_prompt: str, user_prompt: str,
                  max_tokens: int = 4000, temperature: float = 0.7) -> Optional[str]:
-        """Call Claude and return the text response."""
+        """Call Claude and return text. Legacy temperature argument is ignored.
+
+        Current Claude models reject non-default sampling parameters. Keep the
+        Python argument for existing callers, but omit it from the API request.
+        """
         try:
             import requests
         except ImportError:
@@ -326,7 +330,6 @@ class ClaudeClient:
             json={
                 'model': self.model,
                 'max_tokens': max_tokens,
-                'temperature': temperature,
                 'system': system_prompt,
                 'messages': [{'role': 'user', 'content': user_prompt}],
             },
