@@ -33,7 +33,7 @@ const Badge = ({ status }) => {
   );
 };
 
-const CampaignCard = ({ campaign, onApprove, onReject, onSend, onDryRun, onSelect, selected }) => {
+const CampaignCard = ({ campaign, onApprove, onReject, onDryRun, onSelect, selected }) => {
   const isSelected = selected?.id === campaign.id;
   return (
     <div
@@ -106,16 +106,6 @@ const CampaignCard = ({ campaign, onApprove, onReject, onSend, onDryRun, onSelec
 
       {campaign.status === 'approved' && (
         <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-          <button
-            onClick={(e) => { e.stopPropagation(); onSend(campaign.id); }}
-            style={{
-              padding: '8px 20px', borderRadius: '8px', border: 'none',
-              background: '#2563eb', color: '#fff', fontWeight: '600',
-              fontSize: '13px', cursor: 'pointer',
-            }}
-          >
-            📨 Send Now
-          </button>
           <button
             onClick={(e) => { e.stopPropagation(); onDryRun(campaign.id); }}
             style={{
@@ -203,7 +193,7 @@ export default function CampaignsPage() {
   const [dryRunResult, setDryRunResult] = useState(null);
 
   const fetchCampaigns = useCallback(() => {
-    const url = filter === 'all' ? `${API_BASE}/api/campaigns` : `${API_BASE}/api/campaigns?status=${filter}`;
+    const url = filter === 'all' ? `/api/proxy/api/campaigns` : `/api/proxy/api/campaigns?status=${filter}`;
     fetch(url)
       .then(r => r.json())
       .then(data => { setCampaigns(Array.isArray(data) ? data : []); setLoading(false); })
@@ -214,31 +204,25 @@ export default function CampaignsPage() {
 
   // Fetch engine status on load
   useEffect(() => {
-    fetch(`${API_BASE}/api/engine/status`)
+    fetch(`/api/proxy/api/engine/status`)
       .then(r => r.json())
       .then(setEngineStatus)
       .catch(() => {});
   }, []);
 
   const handleApprove = async (id) => {
-    await fetch(`${API_BASE}/api/campaigns/${id}/approve`, { method: 'POST' });
+    await fetch(`/api/proxy/api/campaigns/${id}/approve`, { method: 'POST' });
     fetchCampaigns();
   };
 
   const handleReject = async (id) => {
-    await fetch(`${API_BASE}/api/campaigns/${id}/reject`, { method: 'POST' });
-    fetchCampaigns();
-  };
-
-  const handleSend = async (id) => {
-    if (!confirm('Send this campaign now? This will email all recipients in the segment.')) return;
-    await fetch(`${API_BASE}/api/campaigns/${id}/send`, { method: 'POST' });
+    await fetch(`/api/proxy/api/campaigns/${id}/reject`, { method: 'POST' });
     fetchCampaigns();
   };
 
   const handleDryRun = async (id) => {
     try {
-      const resp = await fetch(`${API_BASE}/api/campaigns/${id}/dry-run`, { method: 'POST' });
+      const resp = await fetch(`/api/proxy/api/campaigns/${id}/dry-run`, { method: 'POST' });
       const data = await resp.json();
       setDryRunResult(data);
     } catch (err) {
@@ -249,7 +233,7 @@ export default function CampaignsPage() {
   const handleGenerate = async () => {
     setGenerating(true);
     try {
-      const resp = await fetch(`${API_BASE}/api/campaigns/generate`, { method: 'POST' });
+      const resp = await fetch(`/api/proxy/api/campaigns/generate`, { method: 'POST' });
       const data = await resp.json();
       alert(`Generated ${data.generated || 0} campaigns`);
       fetchCampaigns();
@@ -344,7 +328,6 @@ export default function CampaignsPage() {
                 onSelect={setSelected}
                 onApprove={handleApprove}
                 onReject={handleReject}
-                onSend={handleSend}
                 onDryRun={handleDryRun}
               />
             ))}

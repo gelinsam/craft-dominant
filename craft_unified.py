@@ -4118,7 +4118,54 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
     """Create Flask app with all endpoints."""
     import threading
     app = Flask(__name__)
-    CORS(app)
+
+    # --- CORS: named origins only -------------------------------------------
+    # This was CORS(app), i.e. Access-Control-Allow-Origin: *, on an API that
+    # serves customer emails and purchase history. The dashboard now reaches the
+    # backend through a server-side proxy on its own origin, so no browser needs
+    # cross-origin access at all; these entries exist only so a direct browser
+    # call from the known dashboards still works during the cutover.
+    # Server-to-server callers (the Vercel proxy, Railway itself) do not send
+    # Origin and are unaffected by this.
+    allowed_origins = [
+        o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '').split(',') if o.strip()
+    ] or [
+        'https://craft-dominant.vercel.app',
+    ]
+    CORS(app, origins=allowed_origins, supports_credentials=False)
+
+    # --- Authentication: deny by default ------------------------------------
+    # Every /api/ route required a bearer token nowhere and served customer PII
+    # to anyone. Rather than annotate ~47 route functions across three modules
+    # and rely on nobody forgetting the decorator on the next one, this gate is
+    # structural: a new endpoint is protected the moment it exists, and opening
+    # one up is an explicit, reviewable edit to PUBLIC_PATHS.
+    #
+    # craft_v2 registers its own routes on this same app and applies
+    # require_command_auth as well; both use command_auth_error, so the
+    # duplicate check is harmless.
+    PUBLIC_PATHS = {
+        '/',                        # service banner
+        '/api/health',              # Railway healthcheck, no data
+        '/api/v2/health',           # liveness probe; deliberately redacts row
+                                    # counts and key names, and
+                                    # test_analytics_durability pins that
+        '/api/webhook/mailchimp',   # Mailchimp posts here; it cannot send a bearer
+    }
+
+    @app.before_request
+    def _require_server_auth():
+        if request.method == 'OPTIONS':
+            return None  # never block CORS preflight
+        path = request.path.rstrip('/') or '/'
+        if path in PUBLIC_PATHS or not path.startswith('/api/'):
+            return None
+        denied = command_auth_error()
+        if denied is not None:
+            payload, status = denied
+            return jsonify(payload), status
+        return None
+
     engine = DecisionEngine(db)
     # Sync status tracking
     _sync_state = {'done': False, 'running': auto_sync, 'result': None, 'error': None}
@@ -4477,7 +4524,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'interrupted_runs': interrupted,
             'error': _sync_state['error']
         })
-    @app.route('/api/sync')
+    # POST is the real verb: this triggers a full Eventbrite traversal.
+    # GET is retained so existing callers and probes keep working, but the
+    # dashboard proxy only forwards POST.
+    @app.route('/api/sync', methods=['GET', 'POST'])
     def sync_endpoint():
         """Trigger Eventbrite sync (runs in background)."""
         api_key = os.environ.get('EVENTBRITE_API_KEY')
@@ -4561,11 +4611,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         if not meta_token or not meta_accounts:
             return jsonify({'error': 'META_ACCESS_TOKEN or META_AD_ACCOUNT_ID not set',
                             'token_set': bool(meta_token),
-                            'token_preview': f'{meta_token[:10]}...' if meta_token else None,
                             'accounts': meta_accounts})
         # Test the API with first account
         acct = meta_accounts[0]
-        results = {'token_preview': f'{meta_token[:10]}...{meta_token[-5:]}',
+        results = {'token_set': True,
                     'accounts': meta_accounts, 'tests': []}
         try:
             meta = MetaAdsSync(meta_token, acct, db)
@@ -5088,7 +5137,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                 })
         return jsonify({
             'event': event,
-            'export_token': os.environ.get('EXPORT_API_KEY', ''),
+            # export_token removed: this response used to carry EXPORT_API_KEY,
+            # the very credential the export routes validate. CSV downloads now
+            # go through the dashboard's server-side proxy, so the browser needs
+            # no credential of its own.
             'current_buyers': len(current_buyers),
             'current_tickets': current_tickets,
             'current_revenue': round(current_revenue, 2),
@@ -5611,18 +5663,13 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             'cannibalization': cannibal_intel,
             'revenue_projection': revenue_projection,
             'behavioral_insights': behavioral_intel,
-            'export_token': os.environ.get('EXPORT_API_KEY', ''),
+            # export_token removed -- see /api/targeting.
         })
 
     # === Export: Cross-sell and VIP audiences ===
     @app.route('/api/export/intelligence-csv')
     def export_intelligence_csv():
         """Export intelligence audiences (cross-sell, super-spreaders, VIPs, churn) as CSV."""
-        export_key = os.environ.get('EXPORT_API_KEY', '')
-        if export_key:
-            provided = request.args.get('key', '') or request.headers.get('X-Export-Key', '')
-            if provided != export_key:
-                return jsonify({'error': 'Unauthorized'}), 401
         event_id = request.args.get('event_id')
         audience = request.args.get('audience')  # cross_sell, super_spreaders, vips, churn_critical, churn_urgent
         if not event_id or not audience:
@@ -5698,18 +5745,16 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         filename = f"{safe_name}_{audience}.csv"
         return Response(
             csv_data, mimetype='text/csv',
-            headers={'Content-Disposition': f'attachment; filename={filename}',
-                     'Access-Control-Allow-Origin': '*'})
+            headers={'Content-Disposition': f'attachment; filename={filename}'})
 
     @app.route('/api/export/csv')
     def export_csv():
-        """Export a targeting audience as CSV."""
-        # --- Auth check: require EXPORT_API_KEY if set ---
-        export_key = os.environ.get('EXPORT_API_KEY', '')
-        if export_key:
-            provided = request.args.get('key', '') or request.headers.get('X-Export-Key', '')
-            if provided != export_key:
-                return jsonify({'error': 'Unauthorized — set EXPORT_API_KEY in Railway and pass ?key= parameter'}), 401
+        """Export a targeting audience as CSV.
+
+        Authorisation is the app-wide bearer gate in create_app. The previous
+        ?key= scheme authenticated against a secret this API published in its
+        own responses, which is not authentication.
+        """
         event_id = request.args.get('event_id')
         audience = request.args.get('audience')  # past_attendees, city_prospects, type_fans, at_risk
         if not event_id or not audience:
@@ -5848,8 +5893,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         return Response(
             csv_data,
             mimetype='text/csv',
-            headers={'Content-Disposition': f'attachment; filename={filename}',
-                     'Access-Control-Allow-Origin': '*'}
+            headers={'Content-Disposition': f'attachment; filename={filename}'}
         )
     # === Overlap Analysis ===
     # In-memory cache so CSV export can reference same data
@@ -6260,8 +6304,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             filename = re.sub(r'[^a-zA-Z0-9_\-.]', '_', filename)
             from flask import Response
             return Response(csv_data, mimetype='text/csv',
-                            headers={'Content-Disposition': f'attachment; filename={filename}',
-                                     'Access-Control-Allow-Origin': '*'})
+                            headers={'Content-Disposition': f'attachment; filename={filename}'})
         except Exception as e:
             log.error(f"Overlap CSV export error: {e}")
             return jsonify({'error': str(e)}), 500

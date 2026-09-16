@@ -51,6 +51,121 @@ from provider_outcome import (
 log = logging.getLogger('craft.engine')
 
 # =============================================================================
+# MAILCHIMP WEBHOOK AUTHENTICITY
+# =============================================================================
+# Mailchimp's Marketing API guide "Synchronize Audience Data with Webhooks"
+# documents optional HMAC signing for audience webhooks:
+#
+#   X-Mailchimp-Signature: t=<unix_seconds>,v1=<64 hex chars>
+#   v1 = HMAC-SHA256(key=signing_secret, message="{t}.{raw_body}")
+#
+# with three rules that are easy to get wrong and are therefore spelled out
+# here: verify against the RAW body (parsing or URL-decoding first changes the
+# bytes), compare in constant time, and reject anything outside a five-minute
+# window.
+#
+# Scope of that window, stated precisely because it is easy to overclaim: it is
+# a FRESHNESS check, not deduplication. It bounds how long a captured delivery
+# stays replayable to five minutes; it does not detect the same valid delivery
+# arriving twice inside that window. Suppression inserts are idempotent: they
+# use INSERT OR IGNORE keyed on email, and the sentinel recomputes the count.
+# However, the processor also appends email_events rows; duplicate deliveries
+# can duplicate telemetry. This window does not deduplicate those writes or
+# guarantee exactly-once processing.
+
+# "reject ... where the timestamp is more than 5 minutes old" — Mailchimp.
+MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS = 300
+
+_MC_SIG_TIMESTAMP = re.compile(r'(?:\A|,)\s*t=(\d{1,20})\s*(?=,|\Z)')
+_MC_SIG_V1 = re.compile(r'(?:\A|,)\s*v1=([0-9a-fA-F]{64})\s*(?=,|\Z)')
+
+
+def verify_mailchimp_signature(signing_secret: str, signature_header: str,
+                               raw_body: bytes,
+                               tolerance_seconds: int = MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS,
+                               now: Optional[float] = None) -> Tuple[bool, str]:
+    """Verify an X-Mailchimp-Signature header against the raw request body.
+
+    Returns (ok, reason). The reason is safe to log and to return to the
+    caller: it names the failure class, never any part of the secret or the
+    expected signature.
+    """
+    if not signing_secret:
+        return False, 'signing_secret_not_configured'
+    if not signature_header:
+        return False, 'missing_signature_header'
+
+    ts_match = _MC_SIG_TIMESTAMP.search(signature_header)
+    sig_match = _MC_SIG_V1.search(signature_header)
+    if not ts_match or not sig_match:
+        # Also catches an unsupported scheme version: a header carrying only
+        # v2=... has no v1 to verify, and must not be treated as signed.
+        return False, 'malformed_signature_header'
+
+    try:
+        timestamp = int(ts_match.group(1))
+    except ValueError:
+        return False, 'malformed_signature_header'
+
+    current = time.time() if now is None else now
+    age = current - timestamp
+    if age > tolerance_seconds:
+        return False, 'stale_timestamp'
+    if age < -tolerance_seconds:
+        # A timestamp far in the future is equally not a live delivery.
+        return False, 'timestamp_in_future'
+
+    if not isinstance(raw_body, (bytes, bytearray)):
+        raw_body = str(raw_body).encode()
+
+    signed_payload = f'{timestamp}.'.encode() + bytes(raw_body)
+    expected = hmac.new(signing_secret.encode(), signed_payload,
+                        hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected, sig_match.group(1).lower()):
+        return False, 'signature_mismatch'
+    return True, 'ok'
+
+
+def normalize_mailchimp_form(form) -> Dict[str, Any]:
+    """Turn Mailchimp's form-encoded delivery into the nested dict we consume.
+
+    Mailchimp posts application/x-www-form-urlencoded, not JSON, and expresses
+    nesting with bracket notation:
+
+        type=unsubscribe&data[email]=a@b.com&data[merges][FNAME]=Ada
+
+    A flat ``form.to_dict()`` leaves the key as the literal string
+    ``data[email]``, so a consumer reading ``payload['data']['email']`` finds
+    nothing -- and the handler happily reports success while recording no
+    suppression. That is how a genuine unsubscribe gets lost silently, which is
+    worse than rejecting it, so the shape is reconstructed here.
+    """
+    out: Dict[str, Any] = {}
+    if not form:
+        return out
+    for key, value in form.items():
+        head, _, rest = key.partition('[')
+        if not rest:
+            out[key] = value
+            continue
+        # data[merges][FNAME] -> ['merges', 'FNAME']
+        parts = [p for p in re.findall(r'\[([^\[\]]*)\]', '[' + rest) if p != '']
+        node = out.setdefault(head, {})
+        for part in parts[:-1]:
+            nxt = node.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        if parts:
+            node[parts[-1]] = value
+        else:
+            out[head] = value
+    return out
+
+
+# =============================================================================
 # SCHEMA — campaigns, sends, tracking, learnings
 # =============================================================================
 ENGINE_SCHEMA = """
@@ -479,50 +594,6 @@ class MailchimpClient:
 
     # ── Campaign creation & sending ────────────────────────
 
-    def create_campaign(self, subject: str, preview_text: str, html: str,
-                        tag: str = None, segment_id: int = None,
-                        campaign_title: str = '') -> Optional[str]:
-        """Create a Mailchimp campaign. Returns campaign ID or None.
-
-        If tag is provided, creates a segment condition for that tag.
-        If segment_id is provided, uses that directly.
-        """
-        recipients = {'list_id': self.audience_id}
-
-        if segment_id:
-            recipients['segment_opts'] = {'saved_segment_id': segment_id}
-        elif tag:
-            recipients['segment_opts'] = {
-                'match': 'all',
-                'conditions': [{
-                    'condition_type': 'StaticSegment',
-                    'field': 'static_segment',
-                    'op': 'static_is',
-                    'value': tag,
-                }],
-            }
-
-        data = {
-            'type': 'regular',
-            'recipients': recipients,
-            'settings': {
-                'subject_line': subject,
-                'preview_text': preview_text or '',
-                'title': campaign_title or subject[:50],
-                'from_name': self.from_name,
-                'reply_to': self.from_email,
-                'auto_footer': True,
-            },
-            'tracking': {
-                'opens': True,
-                'html_clicks': True,
-                'text_clicks': True,
-            },
-        }
-
-        outcome = self._create_campaign_strict(data, html)
-        return outcome.provider_campaign_id if outcome.is_created else None
-
     def create_campaign_strict(self, subject: str, preview_text: str, html: str,
                                tag: str = None, segment_id: int = None,
                                campaign_title: str = '') -> ProviderCreateOutcome:
@@ -718,16 +789,6 @@ class MailchimpClient:
             http_status=resp.http_status,
             provider_campaign_id=mc_campaign_id,
         )
-
-    def send_campaign(self, mc_campaign_id: str) -> bool:
-        """DEPRECATED lossy send. Do NOT use in the execution path.
-
-        Collapses AMBIGUOUS into False, which reads as "definitely not
-        sent" and would let a caller retry a send that may already have
-        reached customers.  Kept only for non-V2 callers.
-        Use ``send_campaign_strict``.
-        """
-        return self.send_campaign_strict(mc_campaign_id).is_confirmed_sent
 
     def get_campaign_status(self, mc_campaign_id: str) -> ProviderResponse:
         """Fetch campaign info for reconciliation. Raises on failure.
@@ -1375,31 +1436,24 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
         self.db.conn.commit()
         return {'campaign_id': campaign_id, 'status': 'rejected'}
 
-    def send_campaign(self, campaign_id: str, dry_run: bool = False) -> Dict:
-        """Execute a campaign: pull audience from SQL, push to Mailchimp, create & send campaign.
+    def validate_campaign(self, campaign_id: str) -> Dict:
+        """Validate a campaign and report the audience it would reach.
 
-        Flow:
-        1. Pull audience emails from segment SQL (local SQLite)
-        2. Batch add/update those contacts in Mailchimp with a campaign-specific tag
-        3. Create a Mailchimp campaign targeting that tag
-        4. Send the campaign via Mailchimp API
+        This performs no external writes of any kind. It replaces the former
+        send_campaign(), whose non-dry-run branch pushed contacts to Mailchimp,
+        created a campaign and sent it -- bypassing every V2 safety gate
+        (suppression trust, execution-time buyer exclusion, durable send claim,
+        provider outcome classification, reconciliation) and reachable over an
+        unauthenticated HTTP route.
 
-        Args:
-            campaign_id: ID of an approved campaign
-            dry_run: If True, validates everything but doesn't actually send
+        Customer email now has exactly one execution path: the V2 intervention
+        lifecycle in execution_adapter.ExecutionAdapter.
         """
-        if not dry_run and not self.mailchimp:
-            return {'error': 'MAILCHIMP_API_KEY or MAILCHIMP_AUDIENCE_ID not set'}
-
         row = self.db.conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
         if not row:
             return {'error': 'Campaign not found'}
         campaign = dict(row)
 
-        if not dry_run and campaign['status'] not in ('approved',):
-            return {'error': f"Campaign status is '{campaign['status']}', must be 'approved'"}
-
-        # Pull audience from local DB
         try:
             recipients = self.db.conn.execute(campaign['segment_sql']).fetchall()
         except Exception as e:
@@ -1407,91 +1461,14 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
 
         emails = [r['email'] if hasattr(r, 'keys') else r[0] for r in recipients]
 
-        if dry_run:
-            return {
-                'campaign_id': campaign_id,
-                'status': 'dry_run',
-                'audience_count': len(emails),
-                'sample_recipients': emails[:10],
-                'subject_line': campaign['subject_line'],
-                'phase': campaign['phase'],
-            }
-
-        # Mark sending
-        self.db.conn.execute("UPDATE campaigns SET status = 'sending', updated_at = ? WHERE id = ?",
-                             (datetime.now().isoformat(), campaign_id))
-        self.db.conn.commit()
-
-        try:
-            # Step 1: Push audience to Mailchimp with campaign-specific tag
-            tag_name = f"craft-{campaign_id}"
-            log.info(f"Pushing {len(emails)} contacts to Mailchimp with tag '{tag_name}'...")
-            member_stats = self.mailchimp.ensure_members(emails, tag=tag_name)
-            log.info(f"Mailchimp members: {member_stats}")
-
-            # Step 2: Find the segment ID for this tag
-            segment_id = self.mailchimp.get_tag_segment_id(tag_name)
-
-            # Step 3: Create the Mailchimp campaign
-            subject = campaign['subject_line'].replace('{{first_name}}', '*|FNAME|*')
-            html = campaign['body_html'].replace('{{first_name}}', '*|FNAME|*')
-
-            mc_campaign_id = self.mailchimp.create_campaign(
-                subject=subject,
-                preview_text=campaign.get('preview_text', ''),
-                html=html,
-                tag=tag_name,
-                segment_id=segment_id,
-                campaign_title=f"Craft AI: {campaign_id} — {campaign.get('phase', '')}",
-            )
-
-            if not mc_campaign_id:
-                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                    (datetime.now().isoformat(), campaign_id))
-                self.db.conn.commit()
-                return {'error': 'Failed to create Mailchimp campaign'}
-
-            # Step 4: Send it
-            sent_ok = self.mailchimp.send_campaign(mc_campaign_id)
-            if not sent_ok:
-                self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                    (datetime.now().isoformat(), campaign_id))
-                self.db.conn.commit()
-                return {'error': f'Mailchimp campaign {mc_campaign_id} created but failed to send'}
-
-            # Record sends in local DB for tracking
-            sent_count = member_stats.get('added', 0) + member_stats.get('updated', 0)
-            for email in emails:
-                try:
-                    self.db.conn.execute("""
-                        INSERT OR IGNORE INTO campaign_sends (campaign_id, email, first_name, mailchimp_campaign_id, status)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (campaign_id, email.lower().strip(), '', mc_campaign_id, 'sent'))
-                except Exception:
-                    pass
-
-            # Update campaign record
-            self.db.conn.execute("""
-                UPDATE campaigns SET status = 'sent', sends = ?, sent_at = ?, updated_at = ?
-                WHERE id = ?
-            """, (len(emails), datetime.now().isoformat(), datetime.now().isoformat(), campaign_id))
-            self.db.conn.commit()
-
-            log.info(f"Campaign {campaign_id} sent via Mailchimp ({mc_campaign_id}): {len(emails)} recipients")
-            return {
-                'campaign_id': campaign_id,
-                'mailchimp_campaign_id': mc_campaign_id,
-                'sent': len(emails),
-                'member_stats': member_stats,
-                'status': 'sent',
-            }
-
-        except Exception as e:
-            log.error(f"Campaign send failed: {e}", exc_info=True)
-            self.db.conn.execute("UPDATE campaigns SET status = 'error', updated_at = ? WHERE id = ?",
-                                (datetime.now().isoformat(), campaign_id))
-            self.db.conn.commit()
-            return {'error': f'Send failed: {str(e)}'}
+        return {
+            'campaign_id': campaign_id,
+            'status': 'dry_run',
+            'audience_count': len(emails),
+            'sample_recipients': emails[:10],
+            'subject_line': campaign['subject_line'],
+            'phase': campaign['phase'],
+        }
 
     # ─────────────────────────────────────────────────────────
     # WEBHOOK PROCESSING — track opens, clicks, bounces
@@ -1772,14 +1749,10 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
     def reject_campaign(cid):
         return jsonify(engine.reject(cid))
 
-    @app.route('/api/campaigns/<cid>/send', methods=['POST'])
-    def send_campaign(cid):
-        return jsonify(engine.send_campaign(cid))
-
     @app.route('/api/campaigns/<cid>/dry-run', methods=['POST'])
     def dry_run_campaign(cid):
         """Validate a campaign without sending — shows audience count and sample recipients."""
-        return jsonify(engine.send_campaign(cid, dry_run=True))
+        return jsonify(engine.validate_campaign(cid))
 
     @app.route('/api/campaigns/<cid>/analyze', methods=['POST'])
     def analyze_campaign(cid):
@@ -1815,11 +1788,70 @@ def register_engine_routes(app, engine: CraftCampaignEngine):
 
     @app.route('/api/webhook/mailchimp', methods=['GET', 'POST'])
     def mailchimp_webhook():
-        """Mailchimp webhook handler. GET validates the webhook URL, POST receives events."""
+        """Mailchimp audience webhook. GET validates the URL, POST receives events.
+
+        This endpoint stays outside the bearer gate because Mailchimp cannot
+        send an Authorization header. Unverified, that made it a public write
+        into a safety-critical dataset: a POST of
+        {"type": "unsubscribe", "data": {"email": ...}} suppressed any address
+        and moved the suppression sentinel with it.
+
+        Authenticity is Mailchimp's documented HMAC signature. Per the Marketing
+        API guide "Synchronize Audience Data with Webhooks", every delivery on a
+        signed webhook carries
+
+            X-Mailchimp-Signature: t=<unix_ts>,v1=<hex>
+
+        where v1 is HMAC-SHA256(signing_secret, "{t}.{raw_body}") over the exact
+        request bytes, and deliveries outside a five-minute window are rejected.
+        That window bounds replayability; it is not deduplication -- see the
+        note on MAILCHIMP_SIGNATURE_TOLERANCE_SECONDS.
+
+        Fails closed. With no signing secret configured the POST is refused,
+        never processed unsigned -- signature verification is optional in
+        Mailchimp's UI, and an unsigned webhook must not be silently trusted
+        here. GET never touches the database, so the URL-validation handshake
+        cannot be broken by a misconfigured secret.
+        """
         if request.method == 'GET':
-            return '', 200  # Mailchimp sends GET to validate webhook URL
-        data = request.get_json() or request.form.to_dict() or {}
-        result = engine.process_mailchimp_webhook(data)
+            return '', 200  # URL validation handshake; no mutation, no data.
+
+        signing_secret = os.environ.get('MAILCHIMP_WEBHOOK_SIGNING_SECRET', '')
+        if not signing_secret:
+            log.error("Mailchimp webhook POST refused: "
+                      "MAILCHIMP_WEBHOOK_SIGNING_SECRET is not set")
+            return jsonify({
+                'error': 'webhook_signing_secret_not_configured',
+                'message': 'MAILCHIMP_WEBHOOK_SIGNING_SECRET must be configured '
+                           'before webhook events are accepted.',
+            }), 503
+
+        # Raw bytes first. Touching request.form or request.get_json() before
+        # this can re-encode the body and break the signature.
+        raw_body = request.get_data(cache=True)
+
+        ok, reason = verify_mailchimp_signature(
+            signing_secret, request.headers.get('X-Mailchimp-Signature', ''), raw_body)
+        if not ok:
+            log.warning(f"Mailchimp webhook POST rejected: {reason}")
+            return jsonify({'error': 'invalid_signature', 'reason': reason}), 401
+
+        # Optional second factor: a hard-to-guess component in the callback URL,
+        # which Mailchimp also recommends. Deliberately a DIFFERENT secret from
+        # the signing key -- one is a shared bearer, the other proves payload
+        # integrity, and they must not be interchangeable.
+        path_secret = os.environ.get('MAILCHIMP_WEBHOOK_PATH_SECRET', '')
+        if path_secret:
+            supplied = request.args.get('secret', '')
+            if not supplied or not hmac.compare_digest(supplied, path_secret):
+                log.warning("Mailchimp webhook POST rejected: bad or missing path secret")
+                return jsonify({'error': 'unauthorized'}), 401
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = normalize_mailchimp_form(request.form)
+
+        result = engine.process_mailchimp_webhook(payload)
         return jsonify(result)
 
     @app.route('/api/campaigns/<cid>/sync-stats', methods=['POST'])

@@ -585,7 +585,7 @@ export default function CraftDashboard() {
   const CRM_LIMIT = 50;
 
   const fetchDashboard = () => {
-    fetch(`${API_BASE}/api/dashboard`).then(r => r.json()).then(d => {
+    fetch(`/api/proxy/api/dashboard`).then(r => r.json()).then(d => {
       setDashboard(d);
       if (d.events?.length) setSelectedEvent(d.events[0]);
       setLoading(false);
@@ -601,15 +601,15 @@ export default function CraftDashboard() {
     if (crmSegment) params.set('segment', crmSegment);
     if (crmCity) params.set('city', crmCity);
     if (crmType) params.set('event_type', crmType);
-    fetch(`${API_BASE}/api/customers?${params}`).then(r => r.json()).then(d => { setCustomers(d.customers || []); setCustomerTotal(d.total || 0); });
+    fetch(`/api/proxy/api/customers?${params}`).then(r => r.json()).then(d => { setCustomers(d.customers || []); setCustomerTotal(d.total || 0); });
   };
 
   useEffect(() => {
     if (tab === 'crm' && crmView === 'browse') {
       fetchCustomers();
       if (!crmCities.length) {
-        fetch(`${API_BASE}/api/customers/cities`).then(r => r.json()).then(setCrmCities).catch(() => {});
-        fetch(`${API_BASE}/api/customers/event-types`).then(r => r.json()).then(setCrmTypes).catch(() => {});
+        fetch(`/api/proxy/api/customers/cities`).then(r => r.json()).then(setCrmCities).catch(() => {});
+        fetch(`/api/proxy/api/customers/event-types`).then(r => r.json()).then(setCrmTypes).catch(() => {});
       }
     }
   }, [tab, crmView, crmSearch, crmSegment, crmCity, crmType, crmSort, crmOrder, crmPage]);
@@ -617,15 +617,15 @@ export default function CraftDashboard() {
   const fetchTargeting = useCallback((eventId) => {
     if (!eventId) { setTargeting(null); return; }
     setTargetingLoading(true); setSelectedAudience(null);
-    fetch(`${API_BASE}/api/targeting/${eventId}`).then(r => r.json()).then(d => { setTargeting(d); setTargetingLoading(false); }).catch(() => setTargetingLoading(false));
+    fetch(`/api/proxy/api/targeting/${eventId}`).then(r => r.json()).then(d => { setTargeting(d); setTargetingLoading(false); }).catch(() => setTargetingLoading(false));
     setIntelLoading(true);
-    fetch(`${API_BASE}/api/intelligence/${eventId}`).then(r => r.json()).then(d => { setIntel(d); setIntelLoading(false); }).catch(() => setIntelLoading(false));
+    fetch(`/api/proxy/api/intelligence/${eventId}`).then(r => r.json()).then(d => { setIntel(d); setIntelLoading(false); }).catch(() => setIntelLoading(false));
   }, []);
 
   useEffect(() => {
     if (tab === 'overlap' && !overlap && !overlapLoading) {
       setOverlapLoading(true);
-      fetch(`${API_BASE}/api/overlap`).then(r => r.json()).then(d => {
+      fetch(`/api/proxy/api/overlap`).then(r => r.json()).then(d => {
         setOverlap(d);
         if (d.cities?.length && !overlapCity) setOverlapCity(d.cities[0]);
         setOverlapLoading(false);
@@ -637,29 +637,26 @@ export default function CraftDashboard() {
   useEffect(() => { if (tab === 'crm' && crmView === 'targeting' && !targetEvent && dashboard?.events?.length) setTargetEvent(dashboard.events[0].event_id); }, [tab, crmView, dashboard]);
 
   const handleSelectCustomer = (email) => {
-    fetch(`${API_BASE}/api/customers/${encodeURIComponent(email)}`).then(r => r.json()).then(d => { setSelectedCustomer(d.customer); setCustomerOrders(d.orders || []); });
+    fetch(`/api/proxy/api/customers/${encodeURIComponent(email)}`).then(r => r.json()).then(d => { setSelectedCustomer(d.customer); setCustomerOrders(d.orders || []); });
   };
   const handleExportCSV = (audienceKey) => {
     if (!targetEvent) return;
-    const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
-    window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=${audienceKey}${keyParam}`, '_blank');
+    window.open(`/api/proxy/api/export/csv?event_id=${targetEvent}&audience=${audienceKey}`, '_blank');
   };
   const handleExportAll = () => {
     if (!targetEvent) return;
-    const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
-    window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=all${keyParam}`, '_blank');
+    window.open(`/api/proxy/api/export/csv?event_id=${targetEvent}&audience=all`, '_blank');
   };
   const handleIntelExport = (audienceKey) => {
     if (!targetEvent) return;
-    const keyParam = intel?.export_token ? `&key=${encodeURIComponent(intel.export_token)}` : '';
-    window.open(`${API_BASE}/api/export/intelligence-csv?event_id=${targetEvent}&audience=${audienceKey}${keyParam}`, '_blank');
+    window.open(`/api/proxy/api/export/intelligence-csv?event_id=${targetEvent}&audience=${audienceKey}`, '_blank');
   };
   const toggleIntel = (key) => setIntelOpen(prev => ({ ...prev, [key]: !prev[key] }));
 
   const triggerSync = () => {
     setSyncing(true); setSyncError(null);
-    fetch(`${API_BASE}/api/sync`).then(r => r.json()).then(() => {
-      const poll = () => { fetch(`${API_BASE}/api/sync-status`).then(r => r.json()).then(s => { if (s.done) { setSyncing(false); if (s.error) setSyncError(s.error); fetchDashboard(); } else setTimeout(poll, 5000); }); };
+    fetch(`/api/proxy/api/sync`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const poll = () => { fetch(`/api/proxy/api/sync-status`).then(r => r.json()).then(s => { if (s.done) { setSyncing(false); if (s.error) setSyncError(s.error); fetchDashboard(); } else setTimeout(poll, 5000); }); };
       setTimeout(poll, 5000);
     });
   };
@@ -842,13 +839,12 @@ export default function CraftDashboard() {
                           {targeting.timing_recommendations.map((rec, i) => {
                             const u = URGENCY_COLORS[rec.urgency] || URGENCY_COLORS.soon;
                             const timingParam = rec.timing_segments?.join(',') || 'all';
-                            const keyParam = targeting?.export_token ? `&key=${encodeURIComponent(targeting.export_token)}` : '';
-                            return (
+                                                    return (
                               <div key={i} className="flex items-center gap-3 p-3 rounded-lg" style={{ backgroundColor: u.bg }}>
                                 <span className="text-xs font-bold px-2 py-1 rounded shrink-0" style={{ backgroundColor: u.color, color: 'white' }}>{u.label}</span>
                                 <span className="text-sm font-medium text-gray-800 flex-1">{rec.action}</span>
                                 <button
-                                  onClick={() => window.open(`${API_BASE}/api/export/csv?event_id=${targetEvent}&audience=timing&timing=${timingParam}${keyParam}`, '_blank')}
+                                  onClick={() => window.open(`/api/proxy/api/export/csv?event_id=${targetEvent}&audience=timing&timing=${timingParam}`, '_blank')}
                                   className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-white transition-colors hover:opacity-90"
                                   style={{ backgroundColor: u.color }}>
                                   {'\u2B07\uFE0F'} Download {rec.count} emails
@@ -1267,7 +1263,7 @@ export default function CraftDashboard() {
                       <OverlapNetwork
                         matrix={overlap.matrices[overlapCity]}
                         apiBase={API_BASE}
-                        onCellClick={(i, j) => window.open(`${API_BASE}/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}
+                        onCellClick={(i, j) => window.open(`/api/proxy/api/export/overlap-csv?city=${encodeURIComponent(overlapCity)}&row=${i}&col=${j}`, '_blank')}
                       />
                     </div>
                   </Card>
@@ -1340,18 +1336,18 @@ export default function CraftDashboard() {
                                   </div>
                                   <div className="flex gap-2 flex-wrap">
                                     {pair.only_a_count > 0 && (
-                                      <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_a`, '_blank')}
+                                      <button onClick={() => window.open(`/api/proxy/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_a`, '_blank')}
                                         className="px-3 py-1 bg-purple-600 text-white text-xs rounded-lg font-medium hover:bg-purple-700">
                                         {pair.only_a_count.toLocaleString()} — {pair.event_a.length > 20 ? pair.event_a.slice(0,20)+'...' : pair.event_a} only
                                       </button>
                                     )}
                                     {pair.only_b_count > 0 && (
-                                      <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_b`, '_blank')}
+                                      <button onClick={() => window.open(`/api/proxy/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=only_b`, '_blank')}
                                         className="px-3 py-1 bg-purple-500 text-white text-xs rounded-lg font-medium hover:bg-purple-600">
                                         {pair.only_b_count.toLocaleString()} — {pair.event_b.length > 20 ? pair.event_b.slice(0,20)+'...' : pair.event_b} only
                                       </button>
                                     )}
-                                    <button onClick={() => window.open(`${API_BASE}/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=overlap`, '_blank')}
+                                    <button onClick={() => window.open(`/api/proxy/api/export/overlap-csv?pair_id=${pair.pair_id}&audience=overlap`, '_blank')}
                                       className="px-3 py-1 bg-gray-200 text-gray-700 text-xs rounded-lg font-medium hover:bg-gray-300">
                                       {pair.overlap_count.toLocaleString()} shared
                                     </button>

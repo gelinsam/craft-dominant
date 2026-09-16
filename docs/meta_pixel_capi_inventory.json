@@ -1,0 +1,173 @@
+{
+  "_source": "metaadspro-tracker/index.html (retired). Operational tracking configuration only.",
+  "_contains_no_credentials": true,
+  "_extracted": "2026-09-15",
+  "_note": "Pixel IDs, Eventbrite event IDs and Squarespace slugs are public identifiers, not secrets. The access tokens that were in the same file are deliberately excluded and are being rotated separately.",
+  "events": [
+    {
+      "abbr": "ACF",
+      "name": "Austin Coffee Festival",
+      "eventbrite_event_id": "1977143837441",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "plums-dolphin-47gw",
+      "meta_pixel_id": "1869569543746238",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "DCCF",
+      "name": "DC Coffee Festival",
+      "eventbrite_event_id": "1750734015569",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "mayflower-chartreuse-ldb3",
+      "meta_pixel_id": "1736685277293414",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "DCWF",
+      "name": "DC Wine Fest Spring",
+      "eventbrite_event_id": "1815953238019",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "sam-gelin-i77a",
+      "meta_pixel_id": "951940349224456",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "PWF",
+      "name": "Philly Wine Fest Spring",
+      "eventbrite_event_id": "1669645688199",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "sam-gelin-k4ck",
+      "meta_pixel_id": "1243832410756022",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "LACF",
+      "name": "LA Coffee Festival",
+      "eventbrite_event_id": null,
+      "ticketing_platform": "sho-soft",
+      "squarespace_site_slug": "swan-alligator-brax",
+      "meta_pixel_id": "1557139702211037",
+      "pixel_status": "active",
+      "capi_status": "n/a (sho-soft)",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "DMR",
+      "name": "DC Margarita Rumble",
+      "eventbrite_event_id": "1981430921224",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "sam-gelin-ew7k",
+      "meta_pixel_id": "2480527455728810",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "NMR",
+      "name": "NYC Margarita Rumble",
+      "eventbrite_event_id": "1669729719539",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "sam-gelin-ew7k",
+      "meta_pixel_id": "1575782813499465",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "DACF",
+      "name": "Dallas Coffee Festival",
+      "eventbrite_event_id": "1334352507269",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "wolf-semicircle-m6ap",
+      "meta_pixel_id": "2862606687412144",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "PCF",
+      "name": "Philly Cocktail Fest",
+      "eventbrite_event_id": "1334838139809",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "pug-mandolin-c4t2",
+      "meta_pixel_id": "916783467637276",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "SDCF",
+      "name": "San Diego Coffee Festival",
+      "eventbrite_event_id": "1976519304446",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "bison-grasshopper-8en3",
+      "meta_pixel_id": "26387886817531523",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "NYCF",
+      "name": "NYC Coffee Festival",
+      "eventbrite_event_id": "1754410953389",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "cinnamon-horse-3s68",
+      "meta_pixel_id": "1415803390292369",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "DCCK",
+      "name": "The Official DC Cocktail Festival",
+      "eventbrite_event_id": "1334045428789",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "taylor-conlin-5r10",
+      "meta_pixel_id": "940990865086582",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "PhCF",
+      "name": "Philly Coffee Festival",
+      "eventbrite_event_id": "1976675236844",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "alligator-olive-e4gn",
+      "meta_pixel_id": "1894383624578532",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "SeaCF",
+      "name": "Seattle Coffee Festival",
+      "eventbrite_event_id": "1976544126690",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "bulldog-violin-d64j",
+      "meta_pixel_id": "940535198772785",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    },
+    {
+      "abbr": "SFCF",
+      "name": "SF Coffee Festival",
+      "eventbrite_event_id": "1977403519156",
+      "ticketing_platform": "eventbrite",
+      "squarespace_site_slug": "sam-gelin-e2xb",
+      "meta_pixel_id": "819367473968869",
+      "pixel_status": "active",
+      "capi_status": "active",
+      "squarespace_pixel_installed": true
+    }
+  ]
+}
