@@ -1,0 +1,137 @@
+[
+  {
+    "event_name": "Austin Coffee Festival 2026",
+    "campaign_id": "55889125",
+    "event_id": "1977144060107",
+    "active_recipients": 229,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Dallas Coffee Festival 2027",
+    "campaign_id": "55889141",
+    "event_id": "1988916722457",
+    "active_recipients": 63,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "DC Cocktail Festival 2027",
+    "campaign_id": "55889187",
+    "event_id": "1988008417693",
+    "active_recipients": 39,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "DC Wine Fest Fall 2026",
+    "campaign_id": "55889111",
+    "event_id": "1990424293643",
+    "active_recipients": 161,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Beer Fest Winter 2027",
+    "campaign_id": "55889154",
+    "event_id": "1987693037382",
+    "active_recipients": 108,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Cocktail Fest 2027",
+    "campaign_id": "55889194",
+    "event_id": "1987780601288",
+    "active_recipients": 34,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Coffee Festival 2026",
+    "campaign_id": "55889051",
+    "event_id": "1976675366231",
+    "active_recipients": 94,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Whiskey Walk 2027",
+    "campaign_id": "55889168",
+    "event_id": "1987873714793",
+    "active_recipients": 81,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Wine Fest Fall 2026",
+    "campaign_id": "55889075",
+    "event_id": "1987973215402",
+    "active_recipients": 99,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "Philly Wine Fest Spring 2027",
+    "campaign_id": "55889202",
+    "event_id": "1989875650637",
+    "active_recipients": 112,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "San Diego Coffee Festival 2026",
+    "campaign_id": "55889094",
+    "event_id": "1976528417704",
+    "active_recipients": 105,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "San Francisco Coffee Festival 2026",
+    "campaign_id": "55889135",
+    "event_id": "1977403519156",
+    "active_recipients": 804,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Eventbrite displayed 804 active recipients; the list export had 805 eligible addresses. Resolve this difference and refresh eligibility before scheduling."
+  },
+  {
+    "event_name": "Seattle Coffee Festival 2026",
+    "campaign_id": "55889107",
+    "event_id": "1976544497800",
+    "active_recipients": 17,
+    "verified_at": "2026-09-16",
+    "state": "draft",
+    "note": "Refresh current-buyer exclusions, subscription eligibility and recent-contact history before scheduling."
+  },
+  {
+    "event_name": "NYC Coffee Festival 2026",
+    "campaign_id": "55889222",
+    "event_id": "1754410953389",
+    "active_recipients": 0,
+    "verified_at": "2026-09-16",
+    "state": "blocked",
+    "note": "Content saved with no recipients. Verified historical NYC purchases are needed to build a qualified audience. Other cities and festival types are excluded."
+  },
+  {
+    "event_name": "DC Coffee Festival 2026",
+    "campaign_id": "55888508",
+    "event_id": "1750774035269",
+    "active_recipients": null,
+    "verified_at": "2026-09-16",
+    "state": "scheduled",
+    "note": "Previously scheduled by you for September 18, 2026 at 2:30 PM EDT. Open Eventbrite to confirm its current status; do not create a duplicate."
+  }
+]

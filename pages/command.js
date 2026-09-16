@@ -502,7 +502,7 @@ export default function CommandPage() {
       <div className="mx-auto max-w-7xl px-6 py-8 lg:px-8 lg:py-12">
         <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
-            <div className="text-xs font-bold uppercase tracking-[0.22em] text-indigo-600">Craft Dominant V2</div>
+            <a href="/" className="text-sm font-medium text-indigo-700">← Back to pacing & actions</a>
             <h1 className="mt-2 text-4xl font-semibold tracking-tight text-slate-950">Command Center</h1>
             <p className="mt-2 max-w-2xl text-slate-600">
               Ranked economic interventions across upcoming events. Revenue at risk is separated from modeled recoverable value so the system does not confuse exposure with expected lift.
