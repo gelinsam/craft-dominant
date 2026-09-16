@@ -102,4 +102,15 @@ class CampaignPreparationTests(unittest.TestCase):
         self.assertEqual(result['excluded_recent_contacts'],1)
         self.assertEqual(result['excluded_active_campaign_recipients'],0)
 
+    def test_stored_purchase_history_never_becomes_verified_by_preparation(self):
+        from unittest.mock import patch
+        self.request['segment']='one_and_done'
+        with patch('campaign_preparation.build_crm_audience',return_value={
+            'event_type':'coffee','city':'DC','records':[{'email':'a@example.com'}],
+            'history_coverage':'stored_records_only','purchase_window_start':'2023-09-16',
+            'purchase_window_end':'2025-09-16','edition_count':4}):
+            result=self.prepare()
+        self.assertIn('purchase_history_coverage_unverified',result['sending_blockers'])
+        self.assertEqual(result['audience_evidence']['edition_count'],4)
+
 if __name__=='__main__': unittest.main()

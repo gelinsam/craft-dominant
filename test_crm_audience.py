@@ -2,7 +2,7 @@ import unittest
 import sqlite3
 from datetime import datetime, timezone
 from unittest.mock import Mock
-from crm_audience import build_crm_audience, eventbrite_eligible_emails, recipient_digest
+from crm_audience import build_crm_audience, eventbrite_eligible_emails, recipient_digest, _years_before
 
 
 class CRMAudienceTests(unittest.TestCase):
@@ -97,6 +97,66 @@ class CRMAudienceTests(unittest.TestCase):
         self.db.edition_sibling_ids.return_value = []
         with self.assertRaises(ValueError):
             build_crm_audience(self.db,'sat','super_spreaders')
+
+    def winback_db(self):
+        conn=sqlite3.connect(':memory:'); conn.row_factory=sqlite3.Row
+        self.addCleanup(conn.close)
+        conn.executescript('CREATE TABLE events(event_id TEXT,name TEXT,city TEXT,event_type TEXT,event_date TEXT,status TEXT); CREATE TABLE orders(event_id TEXT,email TEXT,ticket_count INTEGER);')
+        conn.executemany('INSERT INTO events(event_id,name,city,event_type,event_date) VALUES (?,?,?,?,?)',[
+            ('old-sat','Wine 2024','DC','wine','2024-05-01'),
+            ('old-sun','Wine 2024','DC','wine','2024-05-02'),
+            ('later','Wine 2025','DC','wine','2025-05-01'),
+            ('current','Wine 2026','DC','wine','2026-10-01'),
+            ('future','Wine 2027','DC','wine','2027-05-01'),
+            ('ancient','Wine 2022','DC','wine','2022-05-01'),
+            ('coffee','Coffee','DC','coffee','2024-05-01'),
+            ('philly','Wine','Philly','wine','2024-05-01'),
+            ('vendor','Wine Vendor Payment','DC','wine','2024-05-01'),
+        ])
+        self.db.conn=conn
+        self.db.get_event.side_effect=lambda eid: dict(conn.execute('SELECT * FROM events WHERE event_id=?',(eid,)).fetchone())
+        self.db.edition_sibling_ids.side_effect=lambda eid: ['old-sat','old-sun'] if eid in ('old-sat','old-sun') else [eid]
+        self.db.get_event_buyers.side_effect=lambda eid: {r[0] for r in conn.execute('SELECT email FROM orders WHERE event_id=?',(eid,))}
+        return conn
+
+    def test_one_and_done_counts_editions_not_orders_days_or_tickets(self):
+        conn=self.winback_db()
+        conn.executemany('INSERT INTO orders VALUES (?,?,?)',[
+            ('old-sat',' Group@example.com ',4),('old-sun','group@example.com',2),
+            ('old-sat','repeat@example.com',1),('later','repeat@example.com',1),
+            ('old-sat','current@example.com',1),('current','current@example.com',1),
+            ('old-sat','future@example.com',1),('future','future@example.com',1),
+            ('later','notyet@example.com',1),('ancient','ancient@example.com',1),
+            ('vendor','vendor@example.com',1),('old-sat','unknown@example.com',None),
+            ('old-sat','refunded@example.com',0),
+            ('coffee','group@example.com',2),('philly','group@example.com',2),
+        ])
+        r=build_crm_audience(self.db,'current','one_and_done',now=datetime(2026,9,16,tzinfo=timezone.utc))
+        self.assertEqual([x['email'] for x in r['records']],['group@example.com'])
+        self.assertEqual(r['records'][0]['past_ticket_count'],6)
+        self.assertEqual(r['records'][0]['purchased_edition_count'],1)
+        self.assertEqual(r['records'][0]['missed_completed_editions'],1)
+        self.assertEqual(r['history_coverage'],'stored_records_only')
+
+    def test_one_and_done_requires_a_later_completed_opportunity(self):
+        conn=self.winback_db()
+        conn.execute("DELETE FROM events WHERE event_id='later'")
+        conn.execute("INSERT INTO orders VALUES ('old-sat','a@example.com',1)")
+        self.assertEqual(build_crm_audience(self.db,'current','one_and_done',now=datetime(2026,9,16,tzinfo=timezone.utc))['records'],[])
+
+    def test_uncertain_quantity_in_another_edition_prevents_one_and_done_claim(self):
+        conn=self.winback_db()
+        conn.executemany('INSERT INTO orders VALUES (?,?,?)',[('old-sat','a@example.com',1),('later','a@example.com',None)])
+        self.assertEqual(build_crm_audience(self.db,'current','one_and_done',now=datetime(2026,9,16,tzinfo=timezone.utc))['records'],[])
+
+    def test_cancelled_later_edition_is_not_a_missed_opportunity(self):
+        conn=self.winback_db()
+        conn.execute("UPDATE events SET status='cancelled' WHERE event_id='later'")
+        conn.execute("INSERT INTO orders VALUES ('old-sat','a@example.com',1)")
+        self.assertEqual(build_crm_audience(self.db,'current','one_and_done',now=datetime(2026,9,16,tzinfo=timezone.utc))['records'],[])
+
+    def test_calendar_anniversary_handles_leap_day(self):
+        self.assertEqual(_years_before(datetime(2024,2,29).date(),1).isoformat(),'2023-02-28')
 
 
 if __name__ == '__main__':

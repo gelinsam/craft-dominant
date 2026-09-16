@@ -52,6 +52,8 @@ def prepare_draft(db, request, sources, contact_history, now):
     # A denial in any supplied source beats eligibility in another.
     allowed -= denied
     blockers = []
+    if audience.get('history_coverage') == 'stored_records_only':
+        blockers.append('purchase_history_coverage_unverified')
     if contact_history.get('complete') is not True:
         blockers.append('contact_history_incomplete')
     require_fresh(contact_history['observed_at'], now)
@@ -110,6 +112,9 @@ def prepare_draft(db, request, sources, contact_history, now):
         'recipient_count': len(recipients), 'recipient_sha256': recipient_digest(recipients),
         'excluded_recent_contacts': len(eligible & recent),
         'excluded_active_campaign_recipients': len((eligible - recent) & reserved),
+        'audience_evidence': {k:audience[k] for k in (
+            'history_coverage', 'purchase_window_start', 'purchase_window_end', 'edition_count'
+        ) if k in audience},
         'upload_csv': output.getvalue(), 'state': 'AWAITING_BROWSER_IMPORT',
         'sending_blockers': blockers + ['fresh_presend_recheck_required', 'sending_disabled'],
         'external_send_enabled': False,

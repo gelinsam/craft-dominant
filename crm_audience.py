@@ -24,6 +24,95 @@ def email_key(value):
     return value.strip().lower() if isinstance(value, str) else ''
 
 
+def _years_before(day, years):
+    # Calendar anniversaries, including February 29.
+    try:
+        return day.replace(year=day.year-years)
+    except ValueError:
+        return day.replace(year=day.year-years, day=28)
+
+
+def _one_and_done_buyers(db, event, now):
+    """Observed one-edition buyers who skipped a later completed edition.
+
+    Reuse the production edition resolver: orders and timed-entry days are not
+    visits. Missing provider history is not proof of absence; the output stays
+    candidate evidence until historical coverage is independently established.
+    """
+    today = now.astimezone(timezone.utc).date()
+    events = [dict(r) for r in db.conn.execute("""
+        SELECT event_id, name, event_date, status FROM events
+        WHERE city = ? AND event_type = ?
+          AND lower(name) NOT LIKE '%exhibitor%'
+          AND lower(name) NOT LIKE '%vendor%'
+          AND lower(name) NOT LIKE '%sponsor%'
+    """, (event['city'], event['event_type'])).fetchall()]
+    by_id = {e['event_id']: e for e in events}
+    groups, membership = {}, {}
+    for e in events:
+        eid = e['event_id']
+        if eid in membership:
+            continue
+        ids = frozenset(db.edition_sibling_ids(eid))
+        if eid not in ids or not ids.issubset(by_id):
+            raise ValueError('Historical edition has unresolved or conflicting scope')
+        if ids & membership.keys():
+            raise ValueError('Historical editions have inconsistent membership')
+        key = tuple(sorted(ids))
+        try:
+            if any((by_id[i].get('status') or '').lower() in ('cancelled', 'canceled', 'deleted') for i in ids):
+                raise ValueError('Cancelled edition is not a return opportunity')
+            dates = [datetime.fromisoformat(by_id[i]['event_date']).date() for i in ids]
+            groups[key] = (min(dates), max(dates))
+        except (ValueError, TypeError):
+            groups[key] = None
+        membership.update({i:key for i in ids})
+    rows = db.conn.execute("""
+        SELECT lower(trim(o.email)) AS email, o.event_id,
+               SUM(CASE WHEN o.ticket_count > 0 THEN o.ticket_count ELSE 0 END) AS tickets,
+               MAX(CASE WHEN o.ticket_count IS NULL THEN 1 ELSE 0 END) AS unknown_quantity
+        FROM orders o JOIN events e ON e.event_id=o.event_id
+        WHERE e.city=? AND e.event_type=?
+          AND lower(e.name) NOT LIKE '%exhibitor%'
+          AND lower(e.name) NOT LIKE '%vendor%'
+          AND lower(e.name) NOT LIKE '%sponsor%'
+        GROUP BY lower(trim(o.email)), o.event_id
+    """, (event['city'], event['event_type'])).fetchall()
+    people, uncertain = {}, set()
+    for row in rows:
+        email = email_key(row['email'])
+        key = membership[row['event_id']]
+        if row['unknown_quantity'] or groups[key] is None:
+            uncertain.add(email)
+        if row['tickets'] > 0:
+            person = people.setdefault(email, {'editions':set(), 'tickets':0})
+            person['editions'].add(key)
+            person['tickets'] += row['tickets']
+    start, end = _years_before(today, 3), _years_before(today, 1)
+    selected = []
+    for email, person in people.items():
+        if email in uncertain or len(person['editions']) != 1:
+            continue
+        key = next(iter(person['editions']))
+        first, last = groups[key]
+        if not start <= last <= end:
+            continue
+        later = [k for k, dates in groups.items()
+                 if dates is not None and dates[0] > last and dates[1] < today]
+        if not later:
+            continue
+        selected.append({'email':email, 'purchased_edition_count':1,
+                         'last_event_date':last.isoformat(),
+                         'past_ticket_count':person['tickets'],
+                         'missed_completed_editions':len(later)})
+        if len(selected) > 50000:
+            raise ValueError('Audience exceeds supported size; refusing a truncated list')
+    return selected, {'history_coverage':'stored_records_only',
+                      'purchase_window_start':start.isoformat(),
+                      'purchase_window_end':end.isoformat(),
+                      'edition_count':len(groups)}
+
+
 def _past_buyers(db, event, siblings, now):
     """Exact city/type, completed dates, positive observed ticket counts.
 
@@ -59,7 +148,7 @@ def _past_buyers(db, event, siblings, now):
 
 
 def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
-    if segment not in FILTERS and segment not in ('cross_sell', 'past_attendees'):
+    if segment not in FILTERS and segment not in ('cross_sell', 'past_attendees', 'one_and_done'):
         raise ValueError('Unsupported CRM audience')
     if purpose not in ('ticket_sales', 'referral'):
         raise ValueError('Unsupported campaign purpose')
@@ -76,11 +165,15 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
     buyers = set()
     for sibling in siblings:
         buyers.update(email_key(email) for email in db.get_event_buyers(sibling))
-    if segment == 'past_attendees':
+    evidence = {}
+    if segment in ('past_attendees', 'one_and_done'):
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError('Current time requires a timezone')
-        rows = _past_buyers(db, event, siblings, now)
+        if segment == 'one_and_done':
+            rows, evidence = _one_and_done_buyers(db, event, now)
+        else:
+            rows = _past_buyers(db, event, siblings, now)
     elif segment == 'cross_sell':
         rows = db.get_cross_sell_candidates(event['event_type'], event['city'],
                                             exclude_emails=buyers, limit=50001)
@@ -105,6 +198,7 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
         'segment': segment, 'purpose': purpose, 'stage': 'candidates',
         'excluded_current_buyers': len(excluded_buyers),
         'records': [selected[email] for email in sorted(selected)],
+        **evidence,
     }
 
 
