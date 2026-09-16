@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Treemap, ScatterChart, Scatter, ZAxis, Legend } from 'recharts';
 
+import AttentionHub from '../components/AttentionHub';
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'https://craft-dominant-production.up.railway.app';
 
 const DECISIONS = {
@@ -682,7 +684,7 @@ export default function CraftDashboard() {
               {Object.entries(decisions || {}).map(([d, n]) => { const cfg = DECISIONS[d]; return cfg && n > 0 ? (<div key={d} className="flex items-center gap-1 px-3 py-1 rounded-full" style={{ backgroundColor: cfg.bg }}><span>{cfg.icon}</span><span className="font-bold" style={{ color: cfg.color }}>{n}</span></div>) : null; })}
             </div>
             <div className="flex bg-gray-100 rounded-lg p-1">
-              {['events', 'crm', 'overlap'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : t === 'crm' ? 'CRM' : 'Overlap'}</button>))}
+              {['events', 'crm', 'overlap', 'actions'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : t === 'crm' ? 'CRM' : t === 'actions' ? 'Actions' : 'Overlap'}</button>))}
             </div>
             <a href="/audiences" className="text-sm font-medium text-blue-700">Audiences</a>
             <button onClick={() => { if (!syncing) triggerSync(); }} className={`px-3 py-2 rounded-lg text-sm font-medium ${syncing ? 'bg-gray-200 text-gray-400' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} disabled={syncing}>{syncing ? 'Syncing...' : 'Refresh Data'}</button>
@@ -710,6 +712,8 @@ export default function CraftDashboard() {
           <Card className="p-4"><Stat label="CAC" value={`$${portfolio?.portfolio_cac?.toFixed(2) || '0.00'}`} /></Card>
           <Card className="p-4"><Stat label="Customers" value={cs?.total?.toLocaleString() || 0} /></Card>
         </div>
+
+        <AttentionHub expanded={tab === 'actions'} onOpen={() => setTab('actions')} refreshKey={dashboard?.updated_at} />
 
         {tab === 'events' && (
           <div className="grid grid-cols-12 gap-6">
