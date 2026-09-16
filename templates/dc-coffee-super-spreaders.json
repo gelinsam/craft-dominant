@@ -1,0 +1,16 @@
+{
+  "id": "dc-coffee-super-spreaders-v1",
+  "approved_by": "Sam",
+  "scope": {
+    "festival": "DC Coffee Festival",
+    "year": 2026
+  },
+  "subject": "Some send memes, you send coffee",
+  "from_name": "DC Coffee Festival",
+  "heading": "And that makes you our favorite",
+  "body": "Rally your crew, and let's make it another great day together.  We've put together a great list for this year's DC Coffee Festival and can't wait for you to try all of the new coffees being poured.",
+  "closing": "See you there!",
+  "event_card": "Use Eventbrite's verified DC Coffee Festival 2026 event card with Tickets button.",
+  "status": "COPY_APPROVED_NOT_SEND_AUTHORIZATION",
+  "style": "Preserve the approved Eventbrite design from the September 16 screenshot."
+}

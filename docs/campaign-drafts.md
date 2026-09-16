@@ -1,47 +1,88 @@
-# Draft campaign workflow: integration candidate
+# Durable campaign draft preparation
 
-Adopts MIT-licensed DBOS 2.31.1 as a dependency. No vendor code was copied. DBOS
-provides checkpoint persistence and restart recovery. Craft retains its existing
-CRM and festival-edition resolver. Dittofeed would duplicate CRM/journey storage;
-Listmonk would introduce another sending platform. Neither solves the observed
-Eventbrite browser workflow, so neither is added.
+## Reuse decision
 
-This is an optional draft worker, not imported by the web application. Production
-startup, dependencies, schedules and sending flags are untouched. No send method
-or browser credentials are present. Do not enable it as a production service yet.
+Uses MIT-licensed DBOS 2.31.1 for checkpoints and restart recovery. No vendor code
+was copied. Craft's existing CRM queries and festival-edition resolver are reused.
+Dittofeed would duplicate CRM/journey storage; Listmonk would introduce a different
+sending platform. Neither supplies the verified Eventbrite browser workflow.
 
-prepare_draft rebuilds current CRM candidates and intersects explicitly scoped
-Eventbrite exports. A denial in any supplied list wins. Evidence older than one
-hour, unknown cross-provider contact history, active campaigns, empty audiences,
-or wrong city/festival scope block preparation. Seven days is the default contact
-cooldown, configurable from 1 to 90 days. A dedicated destination export must match
-all recipients exactly. Verification expires with the preparation snapshot.
+## Runtime
 
-The evidence collector must establish source mapping and complete contact-history
-coverage. Caller-supplied completeness is a contract, not an independently verified
-fact. The existing DC pilot cannot be run through this gate yet: active DC sending
-and incomplete cross-provider contact history remain unresolved.
+The dependency is installed with the application, but the web app does not import
+or launch DBOS. The on-demand worker has no listener, scheduler or send operation;
+DBOS's admin server is explicitly disabled. An operator/browser agent invokes:
 
-Install requirements-workflows.txt in an isolated Python 3.12 worker. Call
-start_runtime with a read-only CRM database factory and an explicit system database
-URL. Use a dedicated Postgres database in production. DBOS stores workflow inputs
-and results, including contact emails; protect and retain that database accordingly.
-No public listener is started. Local tests use only synthetic contacts and SQLite.
+    python campaign_worker.py --input INPUT.json --output NEW_OUTPUT.json \
+      --analytics-db /data/craft_unified.db \
+      --workflow-db-url sqlite:////data/craft_campaign_drafts.sqlite
 
-submit requires a unique run_id for every fresh selection. Retrying the same run
-reuses its inputs/result; callers must never reuse an ID with changed criteria.
-Recovery of a checkpoint is not a fresh purchase or consent check. Re-run selection
-with a new ID after expiration, and recheck immediately before any eventual send.
+Use a dedicated protected Postgres system database for concurrent workers. The
+single-worker pilot can use a separate SQLite file on the existing durable volume.
+DBOS stores email-bearing inputs and results: protect and retain the system
+store like CRM data. Output files are created with mode 0600 and never overwritten.
+The analytics connection is read-only and holds one consistent snapshot. No
+schema setup, ingestion, analytics writes, or application startup is invoked.
 
-Browser bridge procedure: prepare package; import headerless upload_csv to a new,
-named draft list; export that exact list; verify_import with observed list ID and
-export timestamp. If an import result is uncertain, inspect/export before retrying.
-DBOS does not make external browser side effects exactly-once. No unattended
-Eventbrite adapter, campaign creation, live consent/history collector, send approval
-flow, or revenue attribution is implemented by this change.
+INPUT.json contains request, sources and contact_history. Sources are Eventbrite
+CSV exports with verified list_id, event_type, city and observed_at. Request
+includes run_id, event_id, segment, purpose, and optional cooldown_days (default
+7, allowed 1–90). Contact history includes complete, observed_at, scope,
+active_campaigns and contacts (email/contacted_at). Never invent completeness.
 
-Validation: unit tests cover cross-list suppression, current-edition purchase
-exclusion, contact cooldown, missing history, active campaigns, stale evidence,
-wrong scope and exact provider membership. The real SDK integration test kills a
-process after a checkpoint and requires restart recovery without rebuilding it.
-Merge requires that integration test and architectural review, not just unit tests.
+## Decision boundaries
+
+Fresh CRM candidates intersect provider eligibility. Denials in any supplied list
+win. Wrong city/festival, stale/future eligibility, empty recipients, and malformed
+data block preparation. Unknown history or active campaigns allow useful drafts
+but remain explicit sending blockers. All packages have external_send_enabled=false
+and require a fresh pre-send check. No result from this worker authorizes sending.
+
+A dedicated destination export must match all intended recipients exactly. The
+preparation and export must be no more than one hour old at verification. Browser
+membership verification is not a proof of cross-provider contact-history coverage.
+
+A fresh selection requires a new run_id. Recovery reuses a saved snapshot; it does
+not refresh purchases or consent. prepare_and_wait rejects a reused run_id with
+changed inputs. Browser operations are outside retryable DBOS steps: a timeout
+after an import must be reconciled before retrying, not assumed to mean failure.
+
+## Verified Eventbrite browser procedure
+
+Use the authorized browser session through the computer-use tool. Do not extract
+cookies or copy sessions to Railway. This bridge requires that browser to be
+available; it is not a server-side Eventbrite marketing API.
+
+1. Read the campaign index and recent delivery reports. The observed DC campaign
+   55883602 is Sending and its Delivery report says no delivery information yet.
+   Record this as incomplete history with an active campaign, never zero contacts.
+2. Read current Craft CRM selection and independently verify provider source-list
+   mapping. Export subscriber CSV via Manage subscribers > Download CSV, then the
+   generated Download subscribers csv link. Preserve subscription/bounce fields.
+3. Run the draft worker against current CRM with fresh evidence. Preserve all hold
+   reasons in the resulting package. Use the exact upload_csv recipient set.
+4. Search for an existing run-specific list before creating anything. Create a
+   dedicated named list, upload the headerless CSV, and wait for import completion.
+   An uncertain result requires list inspection/export; never blindly re-import.
+5. Export the destination and call campaign_preparation.verify_import. Require
+   exact membership, eligibility and row count. Record destination ID, digest and
+   observed timestamp with the run. Refresh stale evidence instead of reusing it.
+6. Use templates/dc-coffee-super-spreaders.json for the approved DC copy. Preserve
+   the user's current draft; create no duplicate campaign when a matching draft
+   exists. Verify subject, body, event card, audience ID and recipient count. Stop
+   before any Send, Schedule or Send test email action. Do not alter active sends.
+
+The existing source-list pilot is 35083291 (DC coffee 2025), with destination
+35155601. User draft campaign 55888508 is DC Super spreaders. IDs are verified
+observations for this pilot, not default routing for other festivals.
+
+## Verification and limits
+
+Tests cover current-edition buyers, cross-list suppression, cooldown, missing
+history, active campaigns, stale evidence, scope, exact membership, read-only
+analytics, private outputs and forced process death after a real DBOS checkpoint.
+The integration test must restart without repeating audience construction.
+
+No public marketing campaign API has been established. Browser steps remain
+agent-operated. Complete cross-provider contact-history collection and revenue
+attribution are unfinished; they must be visible blockers, not implied coverage.

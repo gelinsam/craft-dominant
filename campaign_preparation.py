@@ -26,7 +26,8 @@ def prepare_draft(db, request, sources, contact_history, now):
     """Build one immutable candidate package from current CRM and supplied evidence.
 
     Contact-history completeness must be established by the evidence collector.
-    Missing coverage blocks preparation. No empty-history default is allowed.
+    Missing coverage remains a send blocker on the draft. No empty-history
+    default is allowed for the known contacts field.
     """
     if now.tzinfo is None:
         raise ValueError('Current time requires a timezone')
@@ -50,13 +51,14 @@ def prepare_draft(db, request, sources, contact_history, now):
         denied.update(all_emails - eligible)
     # A denial in any supplied source beats eligibility in another.
     allowed -= denied
+    blockers = []
     if contact_history.get('complete') is not True:
-        raise ValueError('Contact history coverage is incomplete')
+        blockers.append('contact_history_incomplete')
     require_fresh(contact_history['observed_at'], now)
-    if contact_history.get('active_campaigns'):
-        raise ValueError('Active campaigns must be reconciled before preparation')
+    if 'active_campaigns' not in contact_history or contact_history['active_campaigns']:
+        blockers.append('active_campaigns_unresolved')
     if contact_history.get('scope') != 'all_festivals_all_providers':
-        raise ValueError('Cross-festival and cross-provider history is required')
+        blockers.append('cross_provider_history_incomplete')
     cooldown = request.get('cooldown_days', 7)
     if not isinstance(cooldown, int) or isinstance(cooldown, bool) or not 1 <= cooldown <= 90:
         raise ValueError('Cooldown must be 1–90 days')
@@ -81,6 +83,7 @@ def prepare_draft(db, request, sources, contact_history, now):
         'prepared_at': now.isoformat(), 'source_list_ids': sorted(source_ids),
         'recipient_count': len(recipients), 'recipient_sha256': recipient_digest(recipients),
         'upload_csv': output.getvalue(), 'state': 'AWAITING_BROWSER_IMPORT',
+        'sending_blockers': blockers + ['fresh_presend_recheck_required', 'sending_disabled'],
         'external_send_enabled': False,
     }
 

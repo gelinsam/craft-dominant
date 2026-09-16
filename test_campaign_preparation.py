@@ -35,12 +35,12 @@ class CampaignPreparationTests(unittest.TestCase):
         self.sources.append(dict(self.sources[0],list_id='second',csv=HEADER+'a@example.com,No,,No\n'))
         self.assertEqual(self.prepare()['upload_csv'],'b@example.com\n')
 
-    def test_unknown_history_and_active_campaign_block(self):
+    def test_unknown_history_and_active_campaign_stay_on_draft(self):
         self.history['complete']=False
-        with self.assertRaises(ValueError): self.prepare()
+        self.assertIn('contact_history_incomplete',self.prepare()['sending_blockers'])
         self.history['complete']=True
         self.history['active_campaigns']=['currently-sending']
-        with self.assertRaises(ValueError): self.prepare()
+        self.assertIn('active_campaigns_unresolved',self.prepare()['sending_blockers'])
 
     def test_wrong_city_and_stale_source_block(self):
         self.sources[0]['city']='NYC'
