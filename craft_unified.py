@@ -5270,6 +5270,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             }
         })
     # === Intelligence Engine ===
+    @app.route('/api/intelligence/campaign-history', methods=['GET'])
+    def campaign_history_intelligence():
+        # Covered by the shared deny-by-default COMMAND_API_KEY gate above.
+        from campaign_history_report import load_report
+        report = load_report()
+        response = jsonify(report if report is not None else {'error': 'campaign_evidence_unavailable'})
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response, 200 if report is not None else 503
+
     @app.route('/api/intelligence/<event_id>')
     def intelligence(event_id: str):
         """Advanced intelligence for an event: cross-sell, velocity, promo codes,

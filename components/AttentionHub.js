@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import drafts from '../data/festival-drafts.json';
+import CampaignIntelligence from './CampaignIntelligence';
 import { summarizeCommand, draftPresentation, campaignUrl } from '../lib/attention.mjs';
 
 export default function AttentionHub({ expanded, onOpen, refreshKey }) {
@@ -65,10 +66,11 @@ export default function AttentionHub({ expanded, onOpen, refreshKey }) {
           {opportunities.length > 6 && <a href="/command" className="mt-3 inline-block text-sm text-blue-700">See all {opportunities.length} opportunities →</a>}
         </>}
       </div>
+      <CampaignIntelligence />
       <div>
         <h2 className="text-lg font-semibold">Festival email drafts</h2>
         <p className="mt-1 text-sm text-slate-600">Super-spreader drafts last checked September 16, 2026. These are saved audience snapshots; status and counts are not live Eventbrite data. Check each draft before scheduling in Eventbrite.</p>
-        <p className="mt-2 text-sm text-slate-500">Campaign results are not yet connected. A saved draft is not evidence of a send or a sale.</p>
+        <p className="mt-2 text-sm text-slate-500">Historical email evidence appears above. Results for these saved drafts are not yet connected; a draft is not evidence of a send or a sale.</p>
         <label className="mt-4 block text-sm font-medium">Find a festival<input type="search" value={filter} onChange={e => setFilter(e.target.value)} placeholder="City or festival name" className="mt-1 block w-full max-w-sm rounded-lg border px-3 py-2 font-normal" /></label>
         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map(d => {
