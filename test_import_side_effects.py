@@ -184,3 +184,18 @@ class TestExactlyOneStartupSync(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProductionEntryImport(unittest.TestCase):
+    def test_v2_import_does_not_construct_database_or_start_threads(self):
+        import subprocess
+        result = subprocess.run([sys.executable, '-c', '''
+from unittest.mock import patch
+import craft_unified
+with patch('sqlite3.connect') as database, patch('threading.Thread') as thread:
+    import craft_v2
+    assert callable(craft_v2.create_app_v2)
+    database.assert_not_called()
+    thread.assert_not_called()
+'''], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)

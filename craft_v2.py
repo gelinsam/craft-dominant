@@ -725,6 +725,21 @@ def _build_app():
         }
         return jsonify(result), 200 if overall == "ok" else 503
 
+    @app.get("/api/v2/diagnostics/mailchimp-audiences")
+    @require_command_auth
+    def mailchimp_audience_inventory():
+        if not _campaign_engine or not _campaign_engine.mailchimp:
+            return jsonify({"error": "mailchimp_not_configured"}), 503
+        try:
+            audiences = _campaign_engine.mailchimp.audience_inventory()
+        except Exception:
+            log.exception("Mailchimp audience inventory failed")
+            return jsonify({"error": "mailchimp_inventory_incomplete"}), 502
+        return jsonify({"read_only": True, "audiences": audiences,
+                        "audience_count": len(audiences),
+                        "external_send_enabled": external_send_enabled(),
+                        "routing_status": "single_audience_configuration_requires_mapping"})
+
     @app.get("/api/v2/diagnostics/analytics")
     @require_command_auth
     def v2_analytics_diagnostics():
@@ -827,4 +842,6 @@ def _build_app():
     return app
 
 
-app = _build_app()
+# Production uses the explicit factory. Importing diagnostics or tests must
+# never open databases, run migrations, or start ingestion threads.
+create_app_v2 = _build_app

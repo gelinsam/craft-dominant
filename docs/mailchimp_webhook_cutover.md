@@ -46,7 +46,7 @@ The secret is displayed **once**, at creation, and cannot be retrieved later.
 - If it was created without signing, **or** the secret was not kept, a
   replacement webhook must be created to obtain a new one.
 
-## Cutover, ordered to avoid a silent ingestion gap
+## Cutover, bounding and repairing the ingestion gap
 
 The endpoint fails closed, so between deploying the backend and installing a
 valid secret **no suppression events are ingested**. External sending is

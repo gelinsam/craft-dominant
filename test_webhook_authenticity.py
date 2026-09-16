@@ -463,3 +463,38 @@ class TestGetHandshake(_Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMailchimpInventoryIntegrity(unittest.TestCase):
+    def setUp(self):
+        from craft_engine import MailchimpClient
+        self.client = MailchimpClient.__new__(MailchimpClient)
+        self.client.audience_id = 'philly'
+
+    def test_distinct_audiences_remain_distinct(self):
+        from unittest.mock import Mock
+        self.client._request = Mock(return_value={'total_items': 2, 'lists': [
+            {'id':'philly', 'name':'Philly Whiskey', 'stats': {'member_count':100}},
+            {'id':'austin', 'name':'Austin Coffee', 'stats': {'member_count':200}}]})
+        result = self.client.audience_inventory()
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result[0]['legacy_configured_audience'])
+        self.assertFalse(result[1]['legacy_configured_audience'])
+        self.assertNotIn('email', result[0])
+        self.assertEqual(self.client._request.call_args.args[0], 'GET')
+
+    def test_truncated_inventory_is_not_reported_complete(self):
+        from unittest.mock import Mock
+        self.client._request = Mock(return_value={'total_items':30, 'lists':[]})
+        with self.assertRaises(RuntimeError):
+            self.client.audience_inventory()
+
+    def test_truncated_suppression_page_preserves_unknown(self):
+        from unittest.mock import Mock
+        self.client._request = Mock(return_value={'total_items':30, 'members':[]})
+        self.assertIsNone(self.client.get_suppressed_members())
+
+    def test_missing_suppression_total_is_not_empty_success(self):
+        from unittest.mock import Mock
+        self.client._request = Mock(return_value={'members':[]})
+        self.assertIsNone(self.client.get_suppressed_members())

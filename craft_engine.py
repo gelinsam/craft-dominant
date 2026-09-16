@@ -814,6 +814,42 @@ class MailchimpClient:
 
     # ── Suppression queries ───────────────────────────────
 
+    def audience_inventory(self) -> List[Dict]:
+        """Read every audience's identity and counts, without contact details.
+
+        An incomplete inventory must not appear to prove account-wide coverage.
+        This method only issues GETs and never changes subscription status.
+        """
+        audiences = {}
+        offset = 0
+        expected = None
+        while True:
+            response = self._request('GET', f'/lists?count=100&offset={offset}', timeout=60)
+            if not isinstance(response, dict) or not isinstance(response.get('lists'), list):
+                raise RuntimeError('Mailchimp audience inventory incomplete')
+            total = response.get('total_items')
+            if not isinstance(total, int) or total < 0 or (expected is not None and total != expected):
+                raise RuntimeError('Mailchimp audience inventory changed during pagination')
+            expected = total
+            rows = response['lists']
+            for row in rows:
+                audience_id = row.get('id')
+                if not audience_id or audience_id in audiences:
+                    raise RuntimeError('Mailchimp audience inventory contains missing or duplicate IDs')
+                stats = row.get('stats') or {}
+                audiences[audience_id] = {
+                    'audience_id': audience_id, 'name': row.get('name'),
+                    'subscribed': stats.get('member_count'),
+                    'unsubscribed': stats.get('unsubscribe_count'),
+                    'cleaned': stats.get('cleaned_count'),
+                    'legacy_configured_audience': audience_id == self.audience_id,
+                }
+            offset += len(rows)
+            if offset == expected:
+                return list(audiences.values())
+            if not rows or offset > expected:
+                raise RuntimeError('Mailchimp audience inventory pagination truncated')
+
     def get_suppressed_members(self) -> Optional[List[str]]:
         """Fetch all suppressed members (unsubscribed + cleaned) from Mailchimp.
 
@@ -842,6 +878,7 @@ class MailchimpClient:
         """
         emails: List[str] = []
         offset = 0
+        expected_total = None
 
         while True:
             resp = self._request(
@@ -854,18 +891,25 @@ class MailchimpClient:
                 log.error(f"Mailchimp members request failed: status={status}, offset={offset}")
                 return None
 
-            members = resp.get('members', [])
+            members = resp.get('members')
+            total_items = resp.get('total_items')
+            if (not isinstance(members, list) or not isinstance(total_items, int)
+                    or total_items < 0
+                    or (expected_total is not None and total_items != expected_total)):
+                return None
+            expected_total = total_items
             for m in members:
                 addr = m.get('email_address', '').lower().strip()
                 if addr:
                     emails.append(addr)
 
-            total_items = resp.get('total_items', 0)
             offset += len(members)
 
-            # Done when we've fetched all or got an empty page
-            if not members or offset >= total_items:
+            if offset == total_items:
                 break
+            if not members or offset > total_items:
+                log.error("Mailchimp suppression pagination truncated: status=%s", status)
+                return None
 
             # Brief pause between pages to respect rate limits
             time.sleep(0.2)
