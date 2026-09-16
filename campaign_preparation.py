@@ -33,7 +33,7 @@ def prepare_draft(db, request, sources, contact_history, now):
         raise ValueError('Current time requires a timezone')
     if not sources or not request.get('run_id'):
         raise ValueError('A run ID and provider evidence are required')
-    audience = build_crm_audience(db, request['event_id'], request['segment'], request['purpose'])
+    audience = build_crm_audience(db, request['event_id'], request['segment'], request['purpose'], now=now)
     scope = (audience['event_type'], audience['city'])
     allowed, denied = set(), set()
     source_ids = set()
@@ -55,7 +55,32 @@ def prepare_draft(db, request, sources, contact_history, now):
     if contact_history.get('complete') is not True:
         blockers.append('contact_history_incomplete')
     require_fresh(contact_history['observed_at'], now)
-    if 'active_campaigns' not in contact_history or contact_history['active_campaigns']:
+    reserved = set()
+    active = contact_history.get('active_campaigns')
+    unresolved = active is None
+    if active is not None and not isinstance(active, list):
+        raise ValueError('Active campaigns must be an explicit list')
+    for campaign in active or []:
+        # Legacy ID-only evidence still blocks readiness; it cannot establish
+        # that there is no overlap. Partial snapshots can exclude known people.
+        if not isinstance(campaign, dict):
+            unresolved = True
+            continue
+        if not campaign.get('campaign_id') or not campaign.get('provider'):
+            raise ValueError('Active campaign evidence requires provider and ID')
+        require_fresh(campaign['observed_at'], now)
+        recipients = campaign.get('recipient_emails')
+        if not isinstance(recipients, list):
+            unresolved = True
+            continue
+        for value in recipients:
+            email = email_key(value)
+            if not email or '@' not in email or any(c in email for c in '\r\n'):
+                raise ValueError('Invalid active campaign recipient')
+            reserved.add(email)
+        if campaign.get('membership_complete') is not True:
+            unresolved = True
+    if unresolved:
         blockers.append('active_campaigns_unresolved')
     if contact_history.get('scope') != 'all_festivals_all_providers':
         blockers.append('cross_provider_history_incomplete')
@@ -70,7 +95,8 @@ def prepare_draft(db, request, sources, contact_history, now):
         if now - timestamp < timedelta(days=cooldown):
             recent.add(email_key(item['email']))
     candidates = {r['email'] for r in audience['records']}
-    recipients = sorted((candidates & allowed) - recent)
+    eligible = candidates & allowed
+    recipients = sorted(eligible - recent - reserved)
     if not recipients:
         raise ValueError('No eligible recipients remain')
     output = io.StringIO()
@@ -82,6 +108,8 @@ def prepare_draft(db, request, sources, contact_history, now):
         'segment': request['segment'], 'purpose': request['purpose'],
         'prepared_at': now.isoformat(), 'source_list_ids': sorted(source_ids),
         'recipient_count': len(recipients), 'recipient_sha256': recipient_digest(recipients),
+        'excluded_recent_contacts': len(eligible & recent),
+        'excluded_active_campaign_recipients': len((eligible - recent) & reserved),
         'upload_csv': output.getvalue(), 'state': 'AWAITING_BROWSER_IMPORT',
         'sending_blockers': blockers + ['fresh_presend_recheck_required', 'sending_disabled'],
         'external_send_enabled': False,
