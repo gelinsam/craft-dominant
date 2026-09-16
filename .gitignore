@@ -2,3 +2,8 @@
 pg_test_output.txt
 __pycache__/
 .pytest_cache/
+
+# Private campaign observations and generated report (never public source).
+data/campaign-evidence.json
+data/campaign-intelligence.json
+
