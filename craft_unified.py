@@ -1920,30 +1920,17 @@ class EventbriteSync:
     def __init__(self, api_key: str, db: Database):
         self.api_key = api_key
         self.db = db
-        self.session = requests.Session()
+        from provider_reads import ReadOnlySession
+        self.session = ReadOnlySession()
         self.session.headers['Authorization'] = f'Bearer {api_key}'
         self._org_id = None
     def _get(self, endpoint: str, params: dict = None) -> dict:
-        import time
         url = f"{self.BASE_URL}{endpoint}"
-        for attempt in range(3):
-            try:
-                response = self.session.get(url, params=params or {}, timeout=90)
-                if response.status_code == 429:
-                    retry = int(response.headers.get('Retry-After', 60))
-                    log.warning(f"Rate limited, waiting {retry}s")
-                    time.sleep(retry)
-                    continue
-                if response.status_code != 200:
-                    raise Exception(f"API error {response.status_code}: {response.text[:200]}")
-                return response.json()
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                log.warning(f"Eventbrite API error (attempt {attempt+1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(5 * (attempt + 1))
-                else:
-                    raise
-        raise RuntimeError("Eventbrite API retry budget exhausted")
+        response = self.session.get(url, params=params or {}, timeout=90)
+        if response.status_code != 200:
+            # Never log provider bodies: they may echo credentials or PII.
+            raise RuntimeError(f"Eventbrite API error {response.status_code}")
+        return response.json()
     def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
         params = dict(params or {})
         results = []
