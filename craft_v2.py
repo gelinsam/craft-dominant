@@ -204,12 +204,17 @@ def _build_app():
 
     from launch_intelligence import refresh_history
     app.extensions["craft_maintenance"].append(refresh_history)
+    from launch_action_packs import refresh_packs
+    app.extensions["craft_maintenance"].append(lambda: refresh_packs(db))
 
     @app.get("/api/intelligence/launches")
     @require_command_auth
     def launch_intelligence():
         from launch_intelligence import build_report
-        response = jsonify(build_report())
+        from launch_action_packs import read_packs
+        report = build_report()
+        report["action_packs"] = read_packs()
+        response = jsonify(report)
         response.headers['Cache-Control'] = 'private, no-store, max-age=0'
         return response
 
@@ -877,3 +882,4 @@ def _build_app():
 # Production uses the explicit factory. Importing diagnostics or tests must
 # never open databases, run migrations, or start ingestion threads.
 create_app_v2 = _build_app
+

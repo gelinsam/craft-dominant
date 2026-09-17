@@ -6,6 +6,27 @@ const recipes=[
  ['Make it local','Feature confirmed roasters and the music lineup. Localize city, venue, date and destination without claiming borrowed footage is from this city.'],
  ['Close','Use countdowns, useful festival information and truthful inventory or pricing reminders. Adjust spend using ticket pacing; retain low-budget support where appropriate.']
 ];
+function ActionPacks({value}){
+ const [copied,setCopied]=useState('');
+ if(!value)return null;
+ return <section className="my-8"><h2 className="text-2xl font-semibold">Prepared action packs</h2><p className="text-sm text-slate-600 mt-2">{value.cadence} Last prepared: {value.generated_at||'Pending first maintenance run'} · {value.status}. Preparation only; no posts, emails or ad changes are executed.</p>
+ {value.status==='stale'&&<p role="alert" className="text-amber-800">Preparation is stale. Refresh source evidence before using these packs.</p>}
+ <div className="space-y-4 mt-4">{value.packs?.map(p=><details className="border rounded-xl p-5" key={p.id}><summary className="cursor-pointer font-semibold">{p.festival} · {p.event_date||'Date pending'} · {p.priority}</summary>
+ <p className="mt-3">{p.phase} · {p.days_out==null?'Relative preparation':p.days_out+' days out'} · {p.status}</p>
+ <p className="mt-2"><strong>Audience:</strong> {p.audience}</p><p className="text-sm mt-2">{p.crm_preparation}</p>
+ {p.crm_candidates?.map(c=><p key={c.segment} className="text-sm mt-1">{c.label}: {fmt(c.candidates)} candidates · {c.status}. {c.excluded_current_buyers!=null?c.excluded_current_buyers+' current buyers excluded.':''}</p>)}
+ <p className="text-sm mt-2">Candidate segments can overlap; these are not confirmed reachable recipients.</p>
+ <p className="mt-2"><strong>Evidence:</strong> {fmt(p.tickets)} recorded tickets · {fmt(p.candidate_spend,true)} candidate spend · {p.pace_delta_pct==null?'No comparable pacing verdict':p.pace_delta_pct+'% vs '+p.reference_basis}.</p>
+ {p.references?.map(r=><p key={r.city+r.date} className="text-sm">{r.city} {r.date}: {fmt(r.same_days_tickets)} tickets at the same days out; {fmt(r.final_tickets)} final.</p>)}
+ <p className="text-sm text-slate-500 mt-2">Reference comparisons do not adjust for price, capacity or offer changes and do not establish causal lift.</p>
+ {p.warnings?.map((w,i)=><p key={i} className="text-amber-800 text-sm mt-2">{w}</p>)}
+ <div className="grid lg:grid-cols-3 gap-3 mt-4">{p.content.map(c=><article key={c.id} className="bg-slate-50 rounded-lg p-4"><h3 className="font-semibold">{c.format} · {c.suggested_date||'Relative sequence'}</h3><p className="whitespace-pre-wrap my-3">{c.caption}</p><button className="text-blue-700 underline" onClick={async()=>{try{await navigator.clipboard.writeText(c.caption);setCopied(c.id);}catch{setCopied('failed');}}}>{copied===c.id?'Copied':'Copy caption'}</button>
+ {c.asset&&<p className="mt-3"><a className="text-blue-700 underline" href={c.asset.url} target="_blank" rel="noreferrer">Reuse source from {c.asset.source_city}</a></p>}<p className="text-sm mt-2">{c.asset_instructions}</p>{c.blockers.map((b,i)=><p key={i} className="text-amber-800 text-sm mt-2">{b}</p>)}</article>)}</div>
+ {p.email_draft&&<div className="mt-4 p-4 border rounded-lg"><h3 className="font-semibold">Email copy prepared</h3><p className="mt-2">Subject: {p.email_draft.subject}</p><p className="mt-2">{p.email_draft.body}</p><p className="text-sm text-slate-500 mt-2">Copy only. Provider draft population and recipient checks are separate.</p></div>}
+ <p className="mt-3 text-sm"><strong>Paid support:</strong> {p.boost_guidance}</p><div className="flex gap-3 mt-3">{p.ticket_links.map((u,i)=><a key={u} className="text-blue-700 underline" href={u} target="_blank" rel="noreferrer">Eventbrite session {i+1}</a>)}</div>
+ </details>)}</div>{copied==='failed'&&<p role="status">Clipboard unavailable; select and copy the caption text.</p>}
+ </section>;
+}
 export default function Launches(){
  const [data,setData]=useState(null),[error,setError]=useState(''),[selected,setSelected]=useState('');
  useEffect(()=>{const c=new AbortController();let alive=true;const load=async()=>{try{const r=await fetch('/api/proxy/api/intelligence/launches',{signal:c.signal,cache:'no-store'});if(!r.ok)throw Error('Launch intelligence is unavailable.');const d=await r.json();if(alive){setData(d);setError('');}}catch(e){if(alive&&e.name!=='AbortError')setError(e.message);}};load();const t=setInterval(load,60000);return()=>{alive=false;c.abort();clearInterval(t);};},[]);
@@ -18,6 +39,7 @@ export default function Launches(){
   {data&&<>
    <div className="my-5 p-4 bg-amber-50 rounded-xl text-sm"><strong>Provisional evidence</strong> · {data.coverage}<br/>{data.creative_caution}<br/>Paid history collected: {data.meta_collected_at||'Not available'} · {data.request_errors} recorded request errors. No campaigns are executed from this view.</div>
    <div className="my-4 p-4 bg-slate-50 rounded-xl text-sm"><strong>Learning history</strong> · {data.evidence_history?.snapshots ?? 'Unknown'} saved observations. Latest: {data.evidence_history?.last_observed_at || 'Not recorded yet'}. Status: {data.evidence_history?.status || 'Unavailable'}. These preserve observed sales and creative versions; they do not establish causal lift.</div>
+   <ActionPacks value={data.action_packs}/>
    <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr>{['City / edition','Lifecycle','Event date','Tickets','Gross revenue','Candidate ad spend'].map(x=><th className="p-3 border-b" key={x}>{x}</th>)}</tr></thead><tbody>{editions.map(x=><tr key={key(x)} className="border-b"><td className="p-3"><button className="text-blue-700 underline" onClick={()=>setSelected(key(x))}>{x.city}{x.edition?' · Year '+x.edition:''}</button></td><td className="p-3">{x.lifecycle} · {x.completed?'completed':x.days_out+' days out'}</td><td className="p-3">{x.date} · {x.event_days} day{x.event_days===1?'':'s'}</td><td className="p-3">{fmt(x.tickets)}</td><td className="p-3">{fmt(x.revenue,true)}</td><td className="p-3">{fmt(x.spend,true)}</td></tr>)}</tbody></table></div>
    {e&&<section className="mt-8"><h2 className="text-2xl font-semibold">{e.city} · {e.date}</h2><a className="text-blue-700 underline" href={e.profile} target="_blank" rel="noreferrer">Instagram content reference</a>
     {e.warnings.map((w,i)=><p key={i} className="text-amber-800 text-sm mt-2">{w}</p>)}
@@ -30,4 +52,5 @@ export default function Launches(){
   </>}
  </main>;
 }
+
 
