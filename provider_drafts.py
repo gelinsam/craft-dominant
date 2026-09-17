@@ -176,7 +176,26 @@ def prepare_one(db, brief, client, state, save, now):
     eligible, counts = eligible_members(client, campaigns, now)
     recipients = sorted({r['email'] for r in candidates['records']} & eligible - buyers)
     if not recipients:
-        entry.update(state='no_audience', reason='No eligible recipients remain after current buyers and scheduled campaigns are excluded.', verified_at=now.isoformat()); save(); return entry
+        entry.update(state='no_audience', reason='No eligible recipients remain after current buyers and scheduled campaigns are excluded.', verified_at=now.isoformat(),counts=counts)
+        # Link relevant owner-scheduled work without adopting it as an owned draft.
+        for scheduled in campaigns:
+            if scheduled['status'] not in ('schedule','sending') or scheduled.get('recipients',{}).get('list_id') != client.audience_id:
+                continue
+            saved = client._request_strict('GET',f'/campaigns/{scheduled["id"]}/content').body
+            from html.parser import HTMLParser
+            from urllib.parse import urlsplit
+            links=[]
+            class Links(HTMLParser):
+                def handle_starttag(self,tag,attrs):
+                    if tag=='a': links.extend(v for k,v in attrs if k=='href')
+            Links().feed(saved.get('html',''))
+            parent=brief['ticket_url'].rsplit('/',1)[-1]
+            if any(urlsplit(u).hostname in ('www.eventbrite.com','eventbrite.com') and urlsplit(u).path.rstrip('/').endswith(parent) for u in links):
+                entry.update(state='covered_by_scheduled',reason='Your campaign is already scheduled. No overlapping draft was added.',
+                    subject=scheduled.get('settings',{}).get('subject_line'),
+                    url=f'https://{client.dc}.admin.mailchimp.com/campaigns/edit?id={scheduled["web_id"]}')
+                break
+        save(); return entry
     if (datetime.now(timezone.utc)-now).total_seconds()>3600:
         raise ValueError('Preparation evidence expired')
     subject, body = build_copy(event, brief)

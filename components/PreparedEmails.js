@@ -19,7 +19,8 @@ export default function PreparedEmails() {
   },[]);
   const drafts=data?.drafts || [];
   const ready=drafts.filter(d=>d.state==='ready');
-  const others=drafts.filter(d=>d.state!=='ready');
+  const scheduled=drafts.filter(d=>['covered_by_scheduled','schedule','sending','sent'].includes(d.state));
+  const others=drafts.filter(d=>d.state!=='ready' && !scheduled.includes(d));
   function card(d){return <article key={d.key} className="rounded-xl border border-slate-200 bg-white p-5">
     <div className="flex items-center justify-between gap-3"><h3 className="font-semibold text-slate-900">{d.event_name}</h3><span className="text-xs text-slate-500">Mailchimp</span></div>
     <p className="mt-3 text-lg font-semibold">{d.subject || d.purpose}</p>
@@ -37,6 +38,7 @@ export default function PreparedEmails() {
     {!data && !failed && <p className="mt-4 text-sm text-slate-500">Checking saved campaigns…</p>}
     {!failed && <div className="mt-4 grid gap-4 md:grid-cols-2">{ready.map(card)}</div>}
     {data && !ready.length && !failed && <p className="mt-4 text-sm text-slate-600">Audience preparation is in progress. Finished drafts will appear here automatically.</p>}
+    {!!scheduled.length && <div className="mt-6"><h3 className="font-semibold">Already scheduled</h3><div className="mt-3 grid gap-4 md:grid-cols-2">{scheduled.map(card)}</div></div>}
     {!!others.length && <details className="mt-5"><summary className="cursor-pointer text-sm font-medium">Preparing and existing campaigns ({others.length})</summary><div className="mt-3 grid gap-4 md:grid-cols-2">{others.map(card)}</div></details>}
   </section>;
 }
