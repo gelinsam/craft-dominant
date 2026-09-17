@@ -18,8 +18,9 @@ class CampaignEditionGenerationTests(TestCase):
         self.db.conn.commit()
 
     def test_sessions_generate_one_opportunity_and_reuse_existing_sibling_work(self):
-        self.add('101','Austin Coffee Festival - Saturday',20)
-        self.add('102','Austin Coffee Festival - Sunday',21)
+        # Raw Eventbrite rows share the festival name; day labels are pacing views.
+        self.add('101','Austin Coffee Festival',20)
+        self.add('102','Austin Coffee Festival',21)
         items=self.engine.detect_phases()
         self.assertEqual(len(items),1)
         self.assertEqual(items[0]['event_ids'],['101','102'])
@@ -39,8 +40,8 @@ class CampaignEditionGenerationTests(TestCase):
         self.assertEqual(self.engine.detect_phases(),[])
 
     def test_post_event_waits_until_the_entire_edition_ends(self):
-        self.add('101','Austin Coffee Festival - Saturday',-1)
-        self.add('102','Austin Coffee Festival - Sunday',0)
+        self.add('101','Austin Coffee Festival',-1)
+        self.add('102','Austin Coffee Festival',0)
         self.assertEqual(self.engine.detect_phases(),[])
         self.db.conn.execute('UPDATE events SET event_date=? WHERE event_id=?',
             ((self.today-timedelta(days=2)).isoformat(),'101'))
