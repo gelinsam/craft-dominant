@@ -35,7 +35,7 @@ def run_maintenance(tasks, now=None):
                 state = value.get('status') or value.get('state')
                 if isinstance(state, str):
                     row['result'] = state
-                    if any(word in state for word in ('failed', 'unavailable', 'error')):
+                    if any(word in state for word in ('failed', 'failure', 'unavailable', 'error')):
                         row['status'] = 'failed'
         except Exception:
             # Provider exception text can contain credentials or customer data.
