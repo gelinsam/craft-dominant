@@ -230,9 +230,15 @@ def prepare_one(db, brief, client, state, save, now):
         if not cid or not result.content_set:
             raise ValueError('Provider draft creation incomplete; existing attempt preserved')
     else:
-        # Recheck status immediately before editing; never touch a scheduled send.
-        if client._request_strict('GET',f'/campaigns/{cid}').body['status'] != 'save':
+        # Recheck both status and owner edits after potentially slow audience reads.
+        latest = client._request_strict('GET',f'/campaigns/{cid}').body
+        latest_content = client._request_strict('GET',f'/campaigns/{cid}/content').body
+        if latest['status'] != 'save':
             raise ValueError('Campaign was scheduled while preparation was running')
+        if fingerprint(latest,latest_content) != fingerprint(current,content):
+            entry.update(state='user_edited',reason='Your changes are preserved.',verified_at=now.isoformat()); save(); return entry
+        if entry.get('create_pending') and (latest_content.get('html') not in (None,'',body) or latest.get('settings',{}).get('subject_line') != subject):
+            raise ValueError('Existing draft changed; your edits are preserved')
         client._request_strict('PATCH', f'/campaigns/{cid}', {'recipients':{
             'list_id':client.audience_id,'segment_opts':{'saved_segment_id':segment_id}},
             'settings':{'subject_line':subject,'preview_text':brief['preview'],'title':title}})

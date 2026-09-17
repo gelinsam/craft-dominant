@@ -69,6 +69,14 @@ class ProviderDraftTests(unittest.TestCase):
         with patch('provider_drafts.current_buyers',side_effect=ValueError('Current buyer verification unavailable')):
             with self.assertRaisesRegex(ValueError,'buyer verification'):self.prepare()
         self.assertEqual(self.client.created,0)
+    def test_owner_edit_during_audience_refresh_is_preserved(self):
+        self.prepare();self.client.calls=[]
+        def buyer_read(*args):
+            self.client.content={'html':'Owner edit while refresh runs'}
+            return set()
+        with patch('provider_drafts.current_buyers',side_effect=buyer_read):
+            self.assertEqual(self.prepare()['state'],'user_edited')
+        self.assertFalse(any(c[0] in ('PATCH','PUT') for c in self.client.calls))
     def test_uncertain_create_cannot_retry_blindly(self):
         self.prepare();entry=next(iter(self.state['drafts'].values()));entry.pop('campaign_id');entry['create_pending']=True;self.client.campaign=None
         with self.assertRaisesRegex(ValueError,'uncertain'):self.prepare()
