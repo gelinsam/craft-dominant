@@ -210,6 +210,16 @@ def _build_app():
     from ready_posts import refresh_ready_posts
     app.extensions["craft_maintenance"].append(("Finished social posts", refresh_ready_posts))
 
+    from provider_drafts import periodic_provider_drafts, read_provider_drafts
+    app.extensions["craft_maintenance"].append(("Provider email drafts", periodic_provider_drafts))
+
+    @app.get("/api/intelligence/provider-drafts")
+    @require_command_auth
+    def provider_drafts_index():
+        response = jsonify(read_provider_drafts())
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
     from tracking_readiness import refresh_tracking
     app.extensions["craft_maintenance"].append(("Tracking verification", refresh_tracking))
 

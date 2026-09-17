@@ -1639,7 +1639,7 @@ Provide 2-3 specific, actionable learnings as JSON:
 # =============================================================================
 # BACKGROUND AUTOMATION — runs the cycle on a schedule
 # =============================================================================
-def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 6, maintenance=None):
+def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 6, maintenance=None, periodic=None):
     """Background thread that runs the campaign generation cycle periodically.
 
     Waits 60s after startup before first run (let Eventbrite sync complete first).
@@ -1691,7 +1691,20 @@ def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 
                 sleep_seconds = min(sleep_seconds, (2 ** backoff) * 60)
                 log.info(f"Campaign scheduler: backing off {sleep_seconds}s after error")
 
-            time.sleep(sleep_seconds)
+            if periodic is None:
+                time.sleep(sleep_seconds)
+            else:
+                # Reuse this worker for lightweight provider-draft upkeep.
+                # A failure cannot interrupt the six-hour intelligence cycle.
+                remaining = sleep_seconds
+                while remaining > 0:
+                    delay = min(900, remaining)
+                    time.sleep(delay)
+                    remaining -= delay
+                    try:
+                        periodic()
+                    except Exception:
+                        log.warning("Provider draft refresh unavailable")
 
     t = threading.Thread(target=_loop, daemon=True, name='campaign-scheduler')
     t.start()
