@@ -423,3 +423,36 @@ class TestSingleFlightIsGenuinelyShared(_PostSyncHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCoherentSyncStatus(_PostSyncHarness):
+    def test_completion_during_durable_read_does_not_publish_mixed_snapshot(self):
+        import inspect
+        state = inspect.getclosurevars(self.app.view_functions['sync_status']).nonlocals['_sync_state']
+        state.update(done=False, running=True)
+        def finishes_during_read(*args):
+            state.update(done=True, running=False)
+            return {'status': 'running'}
+        with patch.object(self.db, 'last_sync_run', side_effect=finishes_during_read):
+            response = self.client.get('/api/sync-status', headers=_AUTH).get_json()
+        self.assertFalse(response['done'])
+        self.assertTrue(response['running'])
+
+
+class TestMissingOrderEmail(unittest.TestCase):
+    def test_null_email_uses_observed_attendee_identity(self):
+        from datetime import datetime
+        sync = craft_unified.EventbriteSync('unused', None)
+        result = sync._parse_order({'id':'test','created':'2025-01-01T00:00:00Z',
+            'email':None,'attendees':[{'profile':{'email':'BUYER@example.com'}}]},
+            'event',datetime(2025,2,1))
+        self.assertEqual(result['email'],'buyer@example.com')
+    def test_unknown_identity_does_not_crash_or_invent_customer(self):
+        from datetime import datetime
+        sync = craft_unified.EventbriteSync('unused', None)
+        for attendees in [None,[],[{'profile':None}],[{'profile':{'email':None}}]]:
+            result = sync._parse_order({'id':'test','created':'2025-01-01T00:00:00Z',
+                'email':None,'attendees':attendees},'event',datetime(2025,2,1))
+            self.assertIsNone(result)
+
+from test_launch_intelligence import LaunchEvidenceTests, LaunchCoverageTests

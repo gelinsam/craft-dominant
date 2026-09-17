@@ -25,10 +25,10 @@ def feedback_path():
     return Path(os.environ.get('DB_PATH', 'craft_unified.db')).resolve().parent / 'campaign-feedback.json'
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, max_bytes=MAX_BYTES):
     path = Path(path)
     raw = json.dumps(value, allow_nan=False).encode()
-    if len(raw) > MAX_BYTES:
+    if len(raw) > max_bytes:
         raise ValueError('Feedback snapshot exceeds size limit')
     fd, name = tempfile.mkstemp(prefix='.feedback-', dir=path.parent)
     try:
