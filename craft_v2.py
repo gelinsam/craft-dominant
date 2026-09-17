@@ -210,8 +210,8 @@ def _build_app():
     from ready_posts import refresh_ready_posts
     app.extensions["craft_maintenance"].append(("Finished social posts", refresh_ready_posts))
 
-    from provider_drafts import refresh_provider_drafts, read_provider_drafts
-    app.extensions["craft_maintenance"].append(("Provider email drafts", lambda: refresh_provider_drafts(db)))
+    from provider_drafts import periodic_provider_drafts, read_provider_drafts
+    app.extensions["craft_maintenance"].append(("Provider email drafts", periodic_provider_drafts))
 
     @app.get("/api/intelligence/provider-drafts")
     @require_command_auth

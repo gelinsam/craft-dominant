@@ -71,10 +71,39 @@ def eligible_members(client, campaigns, now):
             if now - sent < timedelta(days=7):
                 activity = page_all(client, f'/reports/{cid}/email-activity', 'emails')
                 for member in activity:
-                    if any(a.get('action') in ('open', 'click') for a in member.get('activity', [])):
+                    if any(a.get('action') in ('sent', 'open', 'click') for a in member.get('activity', [])):
                         recent.add(email_key(member['email_address']))
     return eligible - reserved - recent, {'provider_subscribed':len(eligible),
-        'reserved_scheduled':len(eligible & reserved), 'recent_engaged':len(eligible & recent)}
+        'reserved_scheduled':len(eligible & reserved), 'recent_contacted':len(eligible & recent)}
+
+
+def current_buyers(db, siblings):
+    """Fresh read-only provider exclusions, independent of a long historical sync.
+
+    Conservatively exclude every observed current order, including refunds.
+    Unknown identity or truncated pagination never means 'not a buyer'.
+    """
+    from craft_unified import EventbriteSync
+    if not os.environ.get('EVENTBRITE_API_KEY'):
+        raise ValueError('Current buyer verification is unavailable')
+    source=EventbriteSync(os.environ['EVENTBRITE_API_KEY'],db)
+    emails=set()
+    for eid in siblings:
+        rows=source._paginate(f'/events/{eid}/orders/',{'expand':'attendees'},require_complete=True)
+        ids=set()
+        for row in rows:
+            identity=row.get('id')
+            if not identity or identity in ids:
+                raise ValueError('Current purchase pagination has unresolved identities')
+            ids.add(identity)
+            email=email_key(row.get('email'))
+            if not email:
+                attendees=row.get('attendees') or []
+                email=email_key((attendees[0].get('profile') or {}).get('email')) if attendees else ''
+            if '@' not in email or any(c.isspace() for c in email):
+                raise ValueError('Current purchase has an unresolved buyer')
+            emails.add(email)
+    return emails
 
 
 def build_copy(event, brief):
@@ -128,15 +157,12 @@ def prepare_one(db, brief, client, state, save, now):
             entry.update(state='user_edited', reason='Your changes are preserved.', verified_at=now.isoformat()); save(); return entry
         if not entry.get('fingerprint') and not entry.get('create_pending'):
             raise ValueError('Existing draft ownership cannot be established')
-    run = db.last_sync_run() or {}
-    from sales_evidence import verified_edition_at
-    if not verified_edition_at(db, eid, run, now):
-        raise ValueError('Current edition sales refresh has not completed')
+    buyers = current_buyers(db, siblings)
     candidates = build_crm_audience(db, eid, brief['segment'], 'ticket_sales', now)
     if candidates.get('history_coverage') == 'stored_records_only':
         raise ValueError('Win-back purchase history coverage needs verification')
     eligible, counts = eligible_members(client, campaigns, now)
-    recipients = sorted({r['email'] for r in candidates['records']} & eligible)
+    recipients = sorted({r['email'] for r in candidates['records']} & eligible - buyers)
     if not recipients:
         entry.update(state='no_audience', reason='No eligible recipients remain after current buyers and scheduled campaigns are excluded.', verified_at=now.isoformat()); save(); return entry
     if (datetime.now(timezone.utc)-now).total_seconds()>3600:
@@ -145,6 +171,7 @@ def prepare_one(db, brief, client, state, save, now):
     defaults = client._request_strict('GET', f'/lists/{client.audience_id}').body.get('campaign_defaults',{})
     client.from_name = defaults.get('from_name') or event['name']
     client.from_email = defaults.get('from_email') or client.from_email
+    counts['current_buyers_excluded'] = len(buyers)
     digest = recipient_digest(recipients)
     automations = page_all(client, '/automations', 'automations')
     if any(a.get('status') not in ('paused','save','archived') and a.get('recipients',{}).get('list_id') == client.audience_id for a in automations):
@@ -234,3 +261,10 @@ def read_provider_drafts(now=None):
             if not fresh: row.update(state='refreshing',reason='Audience verification is being refreshed.')
         rows.append(row)
     return {'drafts':rows,'checked_at':value.get('checked_at')}
+
+
+def periodic_provider_drafts():
+    from campaign_worker import readonly_database
+    db=readonly_database(os.environ.get('DB_PATH','craft_unified.db'))
+    try: return refresh_provider_drafts(db)
+    finally: db.close()
