@@ -290,3 +290,5 @@ from test_scheduled_maintenance import ScheduledMaintenanceTests
 
 # Run maintained model-boundary checks in the existing SQLite/Postgres jobs.
 from test_model_client import TestModelBoundary, TestStructuredSDK
+
+from test_campaign_generation import CampaignEditionGenerationTests

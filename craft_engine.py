@@ -968,69 +968,48 @@ class CraftCampaignEngine:
     # ─────────────────────────────────────────────────────────
 
     def detect_phases(self) -> List[Dict]:
-        """Check all active events (upcoming + recently past). Return events needing campaigns."""
-        # Get upcoming events
-        upcoming = self.db.get_events(upcoming_only=True)
-
-        # Also get recent past events (for post_event + reactivation phases)
-        # These phases need events that already happened
-        all_events = self.db.get_events()
+        """One automatic draft opportunity per exact festival edition/phase."""
+        from craft_unified import canonical_edition_event, festival_edition_key
         today = date.today()
-        recent_past = []
-        for e in all_events:
-            try:
-                ed = datetime.fromisoformat(e['event_date'][:10]).date()
-                days_ago = (today - ed).days
-                if 1 <= days_ago <= 90:  # Past events within 90 days
-                    recent_past.append(e)
-            except (ValueError, TypeError):
+        groups = defaultdict(list)
+        for event in self.db.get_events():
+            if re.search(r'\b(exhibitor|vendor|sponsor|payment)\b', event.get('name', ''), re.I):
                 continue
-
-        # Deduplicate by event_id
-        seen = set()
-        events = []
-        for e in upcoming + recent_past:
-            if e['event_id'] not in seen:
-                seen.add(e['event_id'])
-                events.append(e)
-
+            key = festival_edition_key(event.get('name'), event.get('event_date'))
+            if key is not None:
+                groups[key].append(event)
         needs_action = []
-
-        for event in events:
+        for rows in groups.values():
+            active = [e for e in rows if e.get('status') not in ('canceled','cancelled','deleted','draft')]
+            if not active:
+                continue
             try:
-                event_date = datetime.fromisoformat(event['event_date'][:10]).date()
-            except (ValueError, TypeError):
+                dates = [datetime.fromisoformat(e['event_date'][:10]).date() for e in active]
+            except (ValueError, TypeError, KeyError):
                 continue
-            days_until = (event_date - today).days
+            first, last = min(dates), max(dates)
+            if first <= today <= last:
+                continue  # No email opportunity while any day of the edition is happening.
+            days_until = ((first if today < first else last) - today).days
             phase = get_phase(days_until)
-            if not phase:
+            if not phase or 'email' not in phase['channels']:
                 continue
-
-            # Check if we already generated for this event + phase
+            ids = sorted({e['event_id'] for e in rows})
+            marks = ','.join('?' for _ in ids)
             existing = self.db.conn.execute(
-                "SELECT id FROM phase_log WHERE event_id = ? AND phase = ?",
-                (event['event_id'], phase['name'])
-            ).fetchone()
-
+                f"SELECT id FROM phase_log WHERE event_id IN ({marks}) AND phase = ?",
+                (*ids, phase['name'])).fetchone()
             if existing:
-                continue  # Already handled this phase transition
-
-            # Check how many campaigns we've already sent in this phase
-            sent_in_phase = self.db.conn.execute("""
-                SELECT COUNT(*) as cnt FROM campaigns
-                WHERE event_id = ? AND phase = ? AND status IN ('sent', 'approved', 'draft')
-            """, (event['event_id'], phase['name'])).fetchone()
-
-            if (sent_in_phase['cnt'] or 0) >= phase['max_frequency']:
-                continue  # Already at max frequency for this phase
-
-            needs_action.append({
-                'event': event,
-                'days_until': days_until,
-                'phase': phase,
-            })
-
-        return needs_action
+                continue
+            count = self.db.conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM campaigns WHERE event_id IN ({marks}) "
+                "AND phase = ? AND status IN ('sent','approved','draft')",
+                (*ids, phase['name'])).fetchone()['cnt']
+            if count >= phase['max_frequency']:
+                continue
+            needs_action.append({'event':canonical_edition_event(active),
+                                 'event_ids':ids, 'days_until':days_until, 'phase':phase})
+        return sorted(needs_action, key=lambda item:(item['days_until'],item['event']['event_id']))
 
     # ─────────────────────────────────────────────────────────
     # CONTEXT BUILDER — assembles everything Claude needs
@@ -1367,6 +1346,9 @@ Use real numbers from the data above. Be specific about what makes THIS event wo
 
         for item in needs_action:
             try:
+                if (self.db.last_sync_run() or {}).get('status') in ('running', 'interrupted'):
+                    log.info('Campaign generation deferred while sales refresh is incomplete')
+                    break
                 result = self.generate_campaign(
                     event=item['event'],
                     days_until=item['days_until'],

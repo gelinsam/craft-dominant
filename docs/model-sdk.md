@@ -26,3 +26,5 @@ valid campaigns, distinct learning output, invalid rates/fields, truncation and
 429 responses. They never contact Anthropic or incur model charges. Run these
 through the existing security suite in both database CI jobs. Local environments
 without the SDK skip only the six real-SDK tests; CI installs dependencies.
+
+Automatic phase detection reuses the existing festival edition key and canonical event selector. Timed-entry siblings produce one opportunity; a phase log on any sibling prevents regeneration. Cancelled/exhibitor/payment rows do not become opportunities, and post-event drafting waits until the last day ends. A running/interrupted sales refresh pauses automatic model calls. This does not replace live recipient validation or make legacy draft audience counts send-ready.
