@@ -21,6 +21,9 @@ def root():
 
 
 def page_all(client, path, key):
+    cache = getattr(client, '_draft_read_cache', None)
+    if cache is not None and (path,key) in cache:
+        return cache[(path,key)]
     rows, seen, total = [], set(), None
     while True:
         page = client._request_strict('GET', path + ('&' if '?' in path else '?') +
@@ -36,6 +39,7 @@ def page_all(client, path, key):
             seen.add(identity)
         rows.extend(batch)
         if len(rows) == total:
+            if cache is not None: cache[(path,key)] = rows
             return rows
         if not batch or len(rows) > total:
             raise ValueError('Provider pagination truncated')
@@ -115,6 +119,8 @@ def build_copy(event, brief):
         raise ValueError('Finished copy and verified ticket link required')
     e = html.escape
     body = '<!doctype html><html><body style="margin:0;background:#f4f2ed;color:#262626;font-family:Arial,sans-serif"><div style="max-width:600px;margin:24px auto;padding:36px;background:white">'
+    if brief.get('image_url', '').startswith('https://img.evbuc.com/'):
+        body += '<img src="'+e(brief['image_url'],quote=True)+'" alt="'+e(name,quote=True)+'" width="528" style="display:block;width:100%;height:auto;margin-bottom:28px">'
     body += '<p style="font-size:14px">'+e(name)+'</p><h1 style="font-size:30px;line-height:1.2">'+e(brief['heading'])+'</h1>'
     body += ''.join('<p style="font-size:18px;line-height:1.6">'+e(p)+'</p>' for p in text)
     body += '<p style="margin:32px 0"><a style="background:#183e32;color:white;padding:16px 24px;border-radius:6px;display:inline-block;text-decoration:none;font-weight:bold" href="'+e(url, quote=True)+'">'+e(brief.get('cta','Get tickets'))+'</a></p>'
@@ -149,7 +155,7 @@ def prepare_one(db, brief, client, state, save, now):
     current = content = None
     if cid:
         current = client._request_strict('GET', f'/campaigns/{cid}').body
-        entry['url'] = f'https://{client.dc}.admin.mailchimp.com/campaigns/show-email?id={current["web_id"]}'
+        entry['url'] = f'https://{client.dc}.admin.mailchimp.com/campaigns/edit?id={current["web_id"]}'
         if current['status'] != 'save':
             entry.update(state=current['status'], verified_at=now.isoformat()); save(); return entry
         content = client._request_strict('GET', f'/campaigns/{cid}/content').body
@@ -203,9 +209,15 @@ def prepare_one(db, brief, client, state, save, now):
         if client._request_strict('GET',f'/campaigns/{cid}').body['status'] != 'save':
             raise ValueError('Campaign was scheduled while preparation was running')
         client._request_strict('PATCH', f'/campaigns/{cid}', {'recipients':{
-            'list_id':client.audience_id,'segment_opts':{'saved_segment_id':segment_id}}})
-    if entry.get('create_pending'):
-        client._request_strict('PUT', f'/campaigns/{cid}/content', {'html':body})
+            'list_id':client.audience_id,'segment_opts':{'saved_segment_id':segment_id}},
+            'settings':{'subject_line':subject,'preview_text':brief['preview']}})
+        if entry.get('fingerprint') and content.get('html') != body:
+            client._request_strict('PUT', f'/campaigns/{cid}/content', {'html':body})
+    if entry.get('create_pending') and content is not None:
+        if content.get('html') and content['html'] != body:
+            raise ValueError('Existing draft content changed; your edits are preserved')
+        if not content.get('html'):
+            client._request_strict('PUT', f'/campaigns/{cid}/content', {'html':body})
     current = client._request_strict('GET', f'/campaigns/{cid}').body
     content = client._request_strict('GET', f'/campaigns/{cid}/content').body
     checklist = client._request_strict('GET', f'/campaigns/{cid}/send-checklist').body
@@ -216,7 +228,7 @@ def prepare_one(db, brief, client, state, save, now):
         raise ValueError('Saved campaign copy verification failed')
     entry.update(state='ready' if checklist.get('is_ready') is True else 'provider_check',
         reason=None if checklist.get('is_ready') is True else 'Mailchimp reports an incomplete campaign check.',
-        campaign_id=cid, url=f'https://{client.dc}.admin.mailchimp.com/campaigns/show-email?id={current["web_id"]}',
+        campaign_id=cid, url=f'https://{client.dc}.admin.mailchimp.com/campaigns/edit?id={current["web_id"]}',
         subject=subject, audience_count=len(recipients), verified_at=now.isoformat(),
         fingerprint=fingerprint(current,content), create_pending=False, counts=counts,
         rationale=brief['rationale'])
@@ -233,10 +245,12 @@ def refresh_provider_drafts(db):
         except BlockingIOError: return {'status':'already_running'}
         state = read_json(root()/'provider-drafts.json') or {'drafts':{}}
         def save(): atomic_json(root()/'provider-drafts.json',state)
+        read_cache = {}
         for brief in config.get('briefs',[]):
             now=datetime.now(timezone.utc)
             try:
                 client=MailchimpClient(os.environ['MAILCHIMP_API_KEY'],event_audience_id(brief['event_id']))
+                client._draft_read_cache = read_cache
                 prepare_one(db,brief,client,state,save,now)
             except Exception as exc:
                 # No provider payloads/customer details in the dashboard or logs.

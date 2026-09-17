@@ -29,7 +29,9 @@ class Client:
             body=self.content
         elif path.endswith('/send-checklist'): body={'is_ready':True}
         elif path=='/campaigns/c':
-            if method=='PATCH': self.campaign.update(data);self.campaign['recipients']['recipient_count']=1
+            if method=='PATCH':
+                settings=data.pop('settings',{});self.campaign['settings'].update(settings)
+                self.campaign.update(data);self.campaign['recipients']['recipient_count']=1
             body=copy.deepcopy(self.campaign)
         else: raise AssertionError(path)
         return SimpleNamespace(body=body)

@@ -32,6 +32,7 @@ export default function PreparedEmails() {
   return <section aria-label="Prepared emails">
     <h2 className="text-xl font-semibold">Emails ready for your review</h2>
     <p className="mt-1 text-sm text-slate-600">Copy and recipients saved in Mailchimp. Open, review, and choose when to send.</p>
+    <p className="mt-2 flex gap-4 text-sm"><a className="text-blue-700" href="https://us16.admin.mailchimp.com/campaigns" target="_blank" rel="noopener noreferrer">All Mailchimp campaigns ↗</a><a className="text-blue-700" href="https://www.eventbrite.com/organizations/campaigns/email" target="_blank" rel="noopener noreferrer">Eventbrite campaigns ↗</a></p>
     {failed && <p role="alert" className="mt-3 text-sm text-amber-800">Live draft status is temporarily unavailable.</p>}
     {!data && !failed && <p className="mt-4 text-sm text-slate-500">Checking saved campaigns…</p>}
     {!failed && <div className="mt-4 grid gap-4 md:grid-cols-2">{ready.map(card)}</div>}
