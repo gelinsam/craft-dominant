@@ -6437,6 +6437,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
             return jsonify({'error': 'Curve not found'}), 404
         return jsonify(curve)
 
+    app.extensions["craft_maintenance"] = []
+
     # ─── AI CAMPAIGN ENGINE ───────────────────────────────────────────
     # Plugs in: phase detection → Claude generation → Mailchimp execution
     try:
@@ -6445,7 +6447,8 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         register_engine_routes(app, campaign_engine)
         # Start background scheduler if API keys are configured
         if os.environ.get('ANTHROPIC_API_KEY'):
-            start_campaign_scheduler(campaign_engine, interval_hours=6)
+            start_campaign_scheduler(campaign_engine, interval_hours=6,
+                                     maintenance=lambda: [task() for task in app.extensions["craft_maintenance"]])
             log.info("Campaign engine: loaded + scheduler started")
         else:
             log.info("Campaign engine: loaded (no ANTHROPIC_API_KEY — manual mode only)")

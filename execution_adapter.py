@@ -1521,4 +1521,5 @@ class ExecutionAdapter:
                 "measurement_ended_at": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as e:
-            log.error(f"Failed to persist learning record for {intervention.id}: {e}")
+            log.error("Failed to persist learning record")
+            raise RuntimeError("Learning persistence failed; keep measurement pending") from None

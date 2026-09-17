@@ -286,3 +286,4 @@ from test_campaign_history_report import CampaignHistoryReportTests  # noqa: E40
 from test_campaign_feedback import CampaignFeedbackTests, CampaignFeedbackBoundaryTests
 from test_action_plan import ActionPlanTests
 from test_action_plan import ActionPlanBoundaryTests
+from test_scheduled_maintenance import ScheduledMaintenanceTests

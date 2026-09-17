@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from campaign_feedback import feedback_status
+from channel_health import meta_health
 
 
 def age_hours(value, now):
@@ -54,6 +55,15 @@ def operational_checks(db, now):
     except Exception:
         checks.append({'id':'campaign_feedback','label':'Campaign results','status':'unavailable',
                        'action':'Stored feedback could not be read.'})
+    from channel_health import meta_health
+    from measurement_cycle import measurement_status
+    meta = meta_health(now)
+    checks.append({'id':'meta_connection','label':'Meta connection','status':meta['status'],
+                   'observed_at':meta.get('observed_at'),'action':meta.get('detail','A current read-access check is not available.')})
+    measurement = measurement_status(now)
+    checks.append({'id':'measurement','label':'Attributed campaign results','status':measurement['status'],
+                   'observed_at':measurement.get('observed_at'),
+                   'action':'Existing executed interventions are measured every six hours when sales data is fresh and complete. Results are attributed, not incremental sales lift.'})
     checks.append({'id':'eventbrite_history','label':'Eventbrite delivery evidence','status':'partial',
                    'action':'Browser observations are partial. Do not infer failed delivery from a missing report.'})
     checks.append({'id':'external_execution','label':'Customer sends and ad changes','status':'approval_required',
@@ -82,7 +92,7 @@ def channel_readiness(event_ids):
         except RuntimeError:
             mc = 'audience_mapping_required'
     return {'mailchimp':mc, 'eventbrite':'browser_draft_and_recipient_verification_required',
-            'meta':'configured_access_unverified' if os.environ.get('META_ACCESS_TOKEN') and os.environ.get('META_AD_ACCOUNT_ID') else 'not_configured'}
+            'meta':meta_health()['status']}
 
 
 def build_action_plan(opportunity_engine, diagnosis_engine, db, repo, now=None):

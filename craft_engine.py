@@ -1727,7 +1727,7 @@ Provide 2-3 specific, actionable learnings as JSON:
 # =============================================================================
 # BACKGROUND AUTOMATION — runs the cycle on a schedule
 # =============================================================================
-def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 6):
+def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 6, maintenance=None):
     """Background thread that runs the campaign generation cycle periodically.
 
     Waits 60s after startup before first run (let Eventbrite sync complete first).
@@ -1748,6 +1748,16 @@ def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 
                     log.info("Campaign feedback refresh: %s", feedback['status'])
                 except Exception:
                     log.warning("Campaign feedback refresh unavailable")
+                try:
+                    from channel_health import refresh_meta_health
+                    refresh_meta_health()
+                except Exception:
+                    log.warning("Meta read-access check unavailable")
+                if maintenance:
+                    try:
+                        maintenance()
+                    except Exception:
+                        log.warning("Scheduled measurement maintenance unavailable")
                 log.info("Campaign scheduler: running cycle...")
                 results = engine.run_cycle()
                 if results:
