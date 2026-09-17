@@ -31,3 +31,7 @@ The Eventbrite preparer accepts only the Eventbrite destination because its sour
 ## Rollout and verification
 
 Run SQLite and Postgres regression suites, frontend tests and production build. Before deployment confirm `/api/sync-status` has `running: false` and no interrupted runs. After deployment verify authenticated action/evidence responses, anonymous rejection, the first real SDK refresh, preserved pacing totals and dashboard rendering. Both endpoints are read-only and use existing proxy/backend authentication. V2 external sends remain disabled; recommendations cannot send, schedule or alter ads.
+
+## Invalid CRM identities
+
+Candidate selection reuses the existing email validation boundary but quarantines invalid source records instead of aborting all valid candidates. It does not repair or mutate identities. The candidate result and preparation manifest contain `quarantined_invalid_email_records`; CSV responses include `X-CRM-Quarantined-Records` and the exported candidate count. Database lookup failures and truncated queries still fail closed. Provider eligibility exports retain their stricter failure behavior because partial consent evidence must not silently authorize a recipient.

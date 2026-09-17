@@ -24,6 +24,12 @@ class CampaignPreparationTests(unittest.TestCase):
     def prepare(self):
         return prepare_draft(self.db,self.request,self.sources,self.history,self.now)
 
+    def test_quarantine_count_survives_provider_preparation(self):
+        self.db.get_event_profiles.return_value = [{'email':'a@example.com'}, {'email':None}]
+        package=self.prepare()
+        self.assertEqual(package['upload_csv'],'a@example.com\n')
+        self.assertEqual(package['quarantined_invalid_email_records'],1)
+
     def test_new_purchase_and_recent_contact_excluded(self):
         self.db.get_event_buyers.side_effect = lambda eid: {'b@example.com'} if eid=='sun' else set()
         package=self.prepare()

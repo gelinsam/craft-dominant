@@ -22,6 +22,25 @@ class CRMAudienceTests(unittest.TestCase):
         self.db.get_event_buyers.side_effect = lambda eid: {'fan@example.com', 'buyer@example.com'}
         self.assertEqual(build_crm_audience(self.db, 'sat', 'dormant')['records'], [])
 
+    def test_invalid_candidates_are_quarantined_without_mutating_source(self):
+        rows = [{'email': 'valid@example.com'}, {'email': None},
+                {'email': 'not-an-address'}, {'email': 'a@example.com\nb@example.com'},
+                {'email': 'buyer@example.com'}]
+        self.db.get_event_profiles.return_value = rows
+        result = build_crm_audience(self.db, 'sat', 'dormant')
+        self.assertEqual([r['email'] for r in result['records']], ['valid@example.com'])
+        self.assertEqual(result['quarantined_invalid_email_records'], 3)
+        self.assertEqual(result['candidate_source_records'], 5)
+        self.assertEqual(result['excluded_current_buyers'], 1)
+        self.assertIsNone(rows[1]['email'])
+        self.assertEqual(rows[2]['email'], 'not-an-address')
+
+    def test_all_invalid_is_explicitly_empty_not_a_source_failure(self):
+        self.db.get_event_profiles.return_value = [{'email': None}]
+        result = build_crm_audience(self.db, 'sat', 'dormant')
+        self.assertEqual(result['records'], [])
+        self.assertEqual(result['quarantined_invalid_email_records'], 1)
+
     def test_referrals_explicitly_allow_current_buyers(self):
         result = build_crm_audience(self.db, 'sat', 'super_spreaders', 'referral')
         self.assertEqual(len(result['records']), 2)

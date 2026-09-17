@@ -5803,7 +5803,10 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         filename = f"{safe_name}_{audience}.csv"
         return Response(
             csv_data, mimetype='text/csv',
-            headers={'Content-Disposition': f'attachment; filename={filename}'})
+            headers={'Content-Disposition': f'attachment; filename={filename}',
+                     'X-CRM-Quarantined-Records': str(plan['quarantined_invalid_email_records']),
+                     'X-CRM-Candidate-Records': str(len(plan['records'])),
+                     'Cache-Control': 'private, no-store, max-age=0'})
 
     @app.route('/api/export/csv')
     def export_csv():

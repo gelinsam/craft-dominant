@@ -140,6 +140,7 @@ def prepare_draft(db, request, sources, contact_history, now):
         'event_type': scope[0], 'city': scope[1],
         'segment': request['segment'], 'purpose': request['purpose'], 'provider': provider,
         'contact_policy': 'provider_delivery_aware_v1',
+        'quarantined_invalid_email_records': audience.get('quarantined_invalid_email_records', 0),
         'cross_provider_delivered_candidates': len(eligible & cross_provider_delivery),
         'cross_provider_pending_candidates': len(eligible & cross_provider_pending),
         'unknown_delivery_candidates': len(eligible & uncertain_contacts),

@@ -184,10 +184,12 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
         raise ValueError('Audience exceeds supported size; refusing a truncated list')
     selected = {}
     excluded_buyers = set()
+    quarantined_invalid = 0
     for row in rows:
         email = email_key(row.get('email'))
         if not email or '@' not in email or any(c in email for c in '\r\n'):
-            raise ValueError('CRM returned an invalid email; refresh the source data')
+            quarantined_invalid += 1
+            continue
         if purpose == 'ticket_sales' and email in buyers:
             excluded_buyers.add(email)
             continue
@@ -197,6 +199,8 @@ def build_crm_audience(db, event_id, segment, purpose='ticket_sales', now=None):
         'event_type': event['event_type'], 'city': event['city'],
         'segment': segment, 'purpose': purpose, 'stage': 'candidates',
         'excluded_current_buyers': len(excluded_buyers),
+        'quarantined_invalid_email_records': quarantined_invalid,
+        'candidate_source_records': len(rows),
         'records': [selected[email] for email in sorted(selected)],
         **evidence,
     }

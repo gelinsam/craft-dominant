@@ -33,6 +33,8 @@ class ActionPlanTests(unittest.TestCase):
         self.assertEqual(action['existing_interventions'][0]['id'],'i')
         self.assertEqual(action['preparation_status'],'existing_work_review_first')
         self.assertFalse(action['execution_allowed'])
+        self.assertEqual(action['title'],'Prepare a festival recovery draft')
+        self.assertIn('not confirmed reachable',action['rationale'])
         self.engine.decision_engine.analyze_portfolio.assert_called_once()
         self.assertEqual(self.diagnosis.diagnose_grouped.call_count,1)
 
