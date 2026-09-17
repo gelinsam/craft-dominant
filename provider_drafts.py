@@ -149,7 +149,7 @@ def prepare_one(db, brief, client, state, save, now):
         'event_id':eid, 'event_name':brief['festival'], 'provider':'mailchimp',
         'purpose':brief['purpose_label'], 'state':'preparing', 'audience_count':0})
     campaigns = page_all(client, '/campaigns', 'campaigns')
-    title = 'Craft ready '+key+' | '+brief['festival']
+    title = brief['festival']+' | '+brief.get('draft_label','Discovery for past buyers')
     matches = [c for c in campaigns if c.get('settings',{}).get('title') == title]
     cid = entry.get('campaign_id')
     if len(matches) > 1:
@@ -209,7 +209,7 @@ def prepare_one(db, brief, client, state, save, now):
         raise ValueError('Active audience automation requires trigger review')
     if digest != entry.get('recipient_digest') or not entry.get('segment_id'):
         # Unique new static segment: existing user tags are never altered.
-        tag = 'Craft ready '+key+' '+digest[:10]
+        tag = 'Craft | '+brief['festival']+' | '+brief['segment'].replace('_',' ')+' | '+now.strftime('%b %d %H:%M UTC')
         client.ensure_members(recipients)
         client.tag_members(recipients, tag)
         entry['segment_id'] = client.get_tag_segment_id(tag)
@@ -235,7 +235,7 @@ def prepare_one(db, brief, client, state, save, now):
             raise ValueError('Campaign was scheduled while preparation was running')
         client._request_strict('PATCH', f'/campaigns/{cid}', {'recipients':{
             'list_id':client.audience_id,'segment_opts':{'saved_segment_id':segment_id}},
-            'settings':{'subject_line':subject,'preview_text':brief['preview']}})
+            'settings':{'subject_line':subject,'preview_text':brief['preview'],'title':title}})
         if entry.get('fingerprint') and content.get('html') != body:
             client._request_strict('PUT', f'/campaigns/{cid}/content', {'html':body})
     if entry.get('create_pending') and content is not None:
