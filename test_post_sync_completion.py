@@ -291,6 +291,32 @@ class TestPostSyncBlockCompletes(_PostSyncHarness):
         self.assertEqual(data["data"]["campaigns"], 0)
 
 
+class TestPartialSyncEvidence(_PostSyncHarness):
+    def test_partial_event_failure_is_not_complete_sales_evidence(self):
+        result = dict(SYNC_RESULT, errors=['one event page failed'])
+        with patch.object(_FakeEventbriteSync, 'sync_all', return_value=result):
+            state = self._run_sync_to_completion()
+        self.assertFalse(state['running'])
+        self.assertEqual(state['last_run']['status'], 'completed_with_integrity_warnings')
+        self.assertEqual(json.loads(state['last_run']['detail'])['event_errors'], 1)
+        self.assertEqual(state['interrupted_runs'], [])
+
+    def test_existing_unknown_ticket_counts_also_hold_measurement(self):
+        result = dict(SYNC_RESULT, integrity={
+            'events_with_ticket_loss': 0,
+            'orders_with_unknown_ticket_count': 2,
+            'unknown_ticket_count_delta': 0,
+        })
+        with patch.object(_FakeEventbriteSync, 'sync_all', return_value=result):
+            state = self._run_sync_to_completion()
+        self.assertEqual(state['last_run']['status'], 'completed_with_integrity_warnings')
+
+    def test_clean_traversal_remains_complete(self):
+        state = self._run_sync_to_completion()
+        self.assertEqual(state['last_run']['status'], 'completed')
+        self.assertEqual(json.loads(state['last_run']['detail'])['event_errors'], 0)
+
+
 class TestExistingMetaSemanticsPreserved(_PostSyncHarness):
     """With credentials present the prior behaviour must be unchanged."""
 

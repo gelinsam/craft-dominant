@@ -4336,9 +4336,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         finally:
             if run_id is not None:
                 try:
-                    integrity = (_sync_state.get('result') or {}).get('integrity') or {}
-                    status = 'completed_with_integrity_warnings' if \
-                        integrity.get('events_with_ticket_loss') else 'completed'
+                    result = _sync_state.get('result') or {}
+                    integrity = dict(result.get('integrity') or {})
+                    # A traversal may catch per-event failures and still return.
+                    # Such a run is not complete sales evidence for measurement.
+                    integrity['event_errors'] = len(result.get('errors') or [])
+                    warnings = (integrity['event_errors'] or
+                                integrity.get('events_with_ticket_loss') or
+                                integrity.get('orders_with_unknown_ticket_count'))
+                    status = 'completed_with_integrity_warnings' if warnings else 'completed'
                     db.finish_sync_run(run_id, status, json.dumps(integrity)[:500] or None)
                 except Exception as exc:
                     log.warning(f"Could not record sync run finish: {exc}")
