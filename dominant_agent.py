@@ -358,7 +358,7 @@ class OpportunityEngine:
         """
         constituent_ids = getattr(pacing, "constituent_event_ids", []) or []
         event = {}
-        for cid in constituent_ids:
+        for cid in constituent_ids or [pacing.event_id]:
             row = self.db.get_event(cid)
             if row:
                 event = dict(row)
@@ -461,8 +461,9 @@ class OpportunityEngine:
         items.sort(key=lambda item: item.expected_net_value * item.confidence, reverse=True)
         return [item.to_dict() for item in items]
 
-    def command_summary(self) -> Dict[str, Any]:
-        portfolio = self.decision_engine.analyze_portfolio()
+    def command_summary(self, portfolio=None) -> Dict[str, Any]:
+        if portfolio is None:
+            portfolio = self.decision_engine.analyze_portfolio()
 
         items_raw = []
         for pacing in portfolio:

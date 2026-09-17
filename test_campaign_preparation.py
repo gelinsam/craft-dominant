@@ -28,7 +28,7 @@ class CampaignPreparationTests(unittest.TestCase):
         self.db.get_event_buyers.side_effect = lambda eid: {'b@example.com'} if eid=='sun' else set()
         package=self.prepare()
         self.assertEqual(package['upload_csv'],'a@example.com\n')
-        self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp)]
+        self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp,provider='eventbrite',status='delivered')]
         with self.assertRaises(ValueError): self.prepare()
 
     def test_denial_across_lists_wins(self):
@@ -68,12 +68,13 @@ class CampaignPreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_import(self.prepare(),'source',self.sources[0]['csv'],self.stamp,self.now)
 
-    def test_scheduled_membership_excluded_across_provider_and_city(self):
+    def test_other_provider_scheduled_membership_is_advisory_not_excluded(self):
         self.history['active_campaigns'] = [dict(provider='mailchimp',campaign_id='other-city',
             observed_at=self.stamp,recipient_emails=[' A@example.com '],membership_complete=True)]
         result = self.prepare()
-        self.assertEqual(result['upload_csv'],'b@example.com\n')
-        self.assertEqual(result['excluded_active_campaign_recipients'],1)
+        self.assertEqual(result['upload_csv'],'a@example.com\nb@example.com\n')
+        self.assertEqual(result['excluded_active_campaign_recipients'],0)
+        self.assertEqual(result['cross_provider_pending_candidates'],1)
         self.assertNotIn('active_campaigns_unresolved',result['sending_blockers'])
         self.assertIn('sending_disabled',result['sending_blockers'])
 
@@ -95,7 +96,7 @@ class CampaignPreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.prepare()
 
     def test_recent_and_scheduled_overlap_is_counted_once(self):
-        self.history['contacts'] = [dict(email='a@example.com',contacted_at=self.stamp)]
+        self.history['contacts'] = [dict(email='a@example.com',contacted_at=self.stamp,provider='eventbrite',status='delivered')]
         self.history['active_campaigns'] = [dict(provider='eventbrite',campaign_id='sending',
             observed_at=self.stamp,recipient_emails=['a@example.com'],membership_complete=True)]
         result = self.prepare()
@@ -112,5 +113,39 @@ class CampaignPreparationTests(unittest.TestCase):
             result=self.prepare()
         self.assertIn('purchase_history_coverage_unverified',result['sending_blockers'])
         self.assertEqual(result['audience_evidence']['edition_count'],4)
+
+
+    def test_other_provider_delivery_does_not_blanket_exclude(self):
+        self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp,
+                                      provider='mailchimp',status='delivered')]
+        p=self.prepare()
+        self.assertEqual(p['recipient_count'],2)
+        self.assertEqual(p['cross_provider_delivered_candidates'],1)
+        self.assertEqual(p['excluded_recent_contacts'],0)
+
+    def test_attempt_is_unknown_not_delivery(self):
+        for status in ('sent','attempted','unknown','accepted'):
+            self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp,
+                                          provider='eventbrite',status=status)]
+            p=self.prepare()
+            self.assertEqual(p['recipient_count'],2)
+            self.assertIn('delivery_evidence_unresolved',p['sending_blockers'])
+
+    def test_other_provider_failure_allows_fallback_but_not_unsubscribe_bypass(self):
+        self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp,
+                                      provider='mailchimp',status='failed')]
+        self.assertEqual(self.prepare()['recipient_count'],2)
+        self.sources[0]['csv']=HEADER+'a@example.com,No,,No\nb@example.com,Yes,,No\n'
+        self.assertEqual(self.prepare()['upload_csv'],'b@example.com\n')
+
+    def test_legacy_contact_missing_provider_and_status_remains_unknown(self):
+        self.history['contacts']=[dict(email='a@example.com',contacted_at=self.stamp)]
+        p=self.prepare()
+        self.assertEqual(p['recipient_count'],2)
+        self.assertIn('delivery_evidence_unresolved',p['sending_blockers'])
+
+    def test_eventbrite_consent_cannot_authorize_mailchimp_destination(self):
+        self.request['provider']='mailchimp'
+        with self.assertRaises(ValueError): self.prepare()
 
 if __name__=='__main__': unittest.main()

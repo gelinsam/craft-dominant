@@ -1740,6 +1740,14 @@ def start_campaign_scheduler(engine: CraftCampaignEngine, interval_hours: int = 
 
         while True:
             try:
+                # Refresh provider observations independently of campaign generation.
+                # The collector only reads Mailchimp and preserves prior good data.
+                try:
+                    from campaign_feedback import refresh_feedback
+                    feedback = refresh_feedback()
+                    log.info("Campaign feedback refresh: %s", feedback['status'])
+                except Exception:
+                    log.warning("Campaign feedback refresh unavailable")
                 log.info("Campaign scheduler: running cycle...")
                 results = engine.run_cycle()
                 if results:

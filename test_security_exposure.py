@@ -281,3 +281,8 @@ if __name__ == "__main__":
 
 # Include the new protected report boundary in the existing CI security suite.
 from test_campaign_history_report import CampaignHistoryReportTests  # noqa: E402,F401
+
+# Keep read-only action/feedback regression checks in both existing CI jobs.
+from test_campaign_feedback import CampaignFeedbackTests, CampaignFeedbackBoundaryTests
+from test_action_plan import ActionPlanTests
+from test_action_plan import ActionPlanBoundaryTests

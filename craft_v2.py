@@ -199,6 +199,14 @@ def _build_app():
     def command_summary():
         return jsonify(opportunity_engine.command_summary())
 
+    @app.get("/api/intelligence/action-plan")
+    @require_command_auth
+    def action_plan():
+        from action_plan import build_action_plan
+        response = jsonify(build_action_plan(opportunity_engine, diagnosis_engine, db, v2_repo))
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
     @app.get("/api/v2/opportunities/<event_id>")
     @require_command_auth
     def event_opportunities(event_id: str):
