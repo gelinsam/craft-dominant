@@ -456,3 +456,6 @@ class TestMissingOrderEmail(unittest.TestCase):
             self.assertIsNone(result)
 
 from test_launch_intelligence import LaunchEvidenceTests, LaunchCoverageTests
+
+
+from test_launch_evidence import TestLaunchEvidence
