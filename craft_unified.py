@@ -6446,7 +6446,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         # Start background scheduler if API keys are configured
         if os.environ.get('ANTHROPIC_API_KEY'):
             start_campaign_scheduler(campaign_engine, interval_hours=6,
-                                     maintenance=lambda: [task() for task in app.extensions["craft_maintenance"]])
+                                     maintenance=lambda: __import__("maintenance_tasks").run_maintenance(app.extensions["craft_maintenance"]))
             log.info("Campaign engine: loaded + scheduler started")
         else:
             log.info("Campaign engine: loaded (no ANTHROPIC_API_KEY — manual mode only)")
@@ -6675,3 +6675,4 @@ Then:
 # Construction — not import — is what decides whether a sync runs.
 if __name__ == "__main__":
     main()
+

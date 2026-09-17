@@ -78,3 +78,47 @@ class ScheduledMaintenanceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             adapter._persist_learning(item)
         adapter.v2_repo.save_intervention.assert_not_called()
+
+
+
+import os
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, patch
+from maintenance_tasks import run_maintenance, maintenance_status
+
+
+class MaintenanceIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = patch.dict(os.environ, {'DB_PATH': self.temp.name+'/db'})
+        env.start(); self.addCleanup(env.stop)
+        self.now = datetime(2026, 9, 17, tzinfo=timezone.utc)
+
+    def test_failure_does_not_skip_later_preparation(self):
+        first = Mock(side_effect=RuntimeError('secret-provider-response'))
+        second = Mock(return_value={'status': 'current'})
+        result = run_maintenance([('Evidence', first), ('Drafts', second)], self.now)
+        second.assert_called_once_with()
+        self.assertEqual(result['status'], 'partial_failure')
+        self.assertEqual(result['tasks'][1]['status'], 'completed')
+        self.assertNotIn('secret-provider-response', str(maintenance_status(self.now)))
+
+    def test_reported_failure_and_recovery_are_visible(self):
+        run_maintenance([('Evidence', lambda: {'status': 'refresh_failed'})], self.now)
+        self.assertEqual(maintenance_status(self.now)['status'], 'partial_failure')
+        run_maintenance([('Evidence', lambda: {'status': 'current'})], self.now)
+        self.assertEqual(maintenance_status(self.now)['status'], 'current')
+
+    def test_old_or_future_outcomes_are_stale(self):
+        run_maintenance([('Drafts', lambda: None)], self.now)
+        self.assertEqual(maintenance_status(self.now+timedelta(hours=9))['status'], 'stale')
+        self.assertEqual(maintenance_status(self.now-timedelta(hours=1))['status'], 'stale')
+
+    def test_missing_status_is_not_success(self):
+        self.assertEqual(maintenance_status(self.now)['status'], 'not_checked')
+
+
+

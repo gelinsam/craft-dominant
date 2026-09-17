@@ -64,6 +64,12 @@ def operational_checks(db, now):
     checks.append({'id':'measurement','label':'Attributed campaign results','status':measurement['status'],
                    'observed_at':measurement.get('observed_at'),
                    'action':'Existing executed interventions are measured every six hours when sales data is fresh and complete. Results are attributed, not incremental sales lift.'})
+    from maintenance_tasks import maintenance_status
+    maintenance = maintenance_status(now)
+    failed = [r['name'] for r in maintenance.get('tasks', []) if r.get('status') == 'failed']
+    checks.append({'id':'preparation_health','label':'Automatic preparation','status':maintenance['status'],
+                   'observed_at':maintenance.get('observed_at'),
+                   'action':('Needs retry: '+', '.join(failed)+'. Other tasks continue independently.') if failed else 'Existing background tasks run independently; last outcomes are recorded.'})
     checks.append({'id':'eventbrite_history','label':'Eventbrite delivery evidence','status':'partial',
                    'action':'Browser observations are partial. Do not infer failed delivery from a missing report.'})
     checks.append({'id':'external_execution','label':'Customer sends and ad changes','status':'approval_required',
@@ -162,3 +168,4 @@ def build_action_plan(opportunity_engine, diagnosis_engine, db, repo, now=None):
                 refresh_policy={'page_seconds':60,'mailchimp_hours':6,
                                 'sales':'Existing sales sync; recommendations never pretend a page refresh syncs providers'},
                 execution_allowed=False)
+
