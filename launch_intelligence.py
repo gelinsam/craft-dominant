@@ -176,6 +176,8 @@ def refresh_history():
     except ValueError: pass
     # Missing historical evidence must be collected explicitly, not invented by a 30-day refresh.
     if not old.get('campaigns'): return {'status':'history_not_seeded'}
+    if not os.environ.get('META_ACCESS_TOKEN') or not os.environ.get('META_AD_ACCOUNT_ID','').strip():
+        return {'status':'meta_not_configured','evidence':capture_evidence()}
     capture_evidence()  # Preserve the preceding version before advancing the current snapshot.
     prior=read_snapshot('nyc-launch-history.json').get('campaigns',[])+old.get('campaigns',[])
     keyed={(x['account_id'],x['campaign']['id']):x for x in prior}
@@ -189,10 +191,10 @@ def refresh_history():
             r=m._api_get(m.BASE_URL+'/'+c['id']+'/insights',{'fields':'campaign_id,spend,impressions,clicks,actions',
               'time_range':json.dumps({'since':(now.date()-timedelta(days=30)).isoformat(),'until':now.date().isoformat()}),
               'time_increment':1,'limit':500})
-            days=r.get('data',[]); nxt=r.get('paging',{}).get('next');seen=set()
+            days=r['data']; nxt=r.get('paging',{}).get('next');seen=set()
             while nxt:
                 if nxt in seen: raise ValueError('Repeated Meta page')
-                seen.add(nxt);r=m._api_get(nxt);days+=r.get('data',[]);nxt=r.get('paging',{}).get('next')
+                seen.add(nxt);r=m._api_get(nxt);days+=r['data'];nxt=r.get('paging',{}).get('next')
             merged={d['date_start']:d for d in item.get('days',[])}
             for d in days:
                 # Missing spend cannot erase an observed value.

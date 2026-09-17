@@ -30,6 +30,7 @@ def capture(report, campaigns, path=None):
         ads.append({'account_id': item.get('account_id'),
             'campaign': {k: c.get(k) for k in ('id', 'name', 'status', 'objective')},
             'creative_observed_at': item.get('creative_observed_at'),
+            'days': [{k: day.get(k) for k in ('date_start','date_stop','spend','impressions','clicks','actions')} for day in item.get('days',[])],
             'ads': [{**{k: a.get(k) for k in ('id', 'name', 'created_time')},
                      'creative': {k: (a.get('creative') or {}).get(k) for k in
                      ('id','body','title','instagram_permalink_url','video_id','effective_object_story_id')}}
