@@ -17,6 +17,7 @@ export default function Launches(){
   {error&&<p role="alert" className="p-4 bg-amber-50">{error}</p>}{!data&&!error&&<p role="status">Loading launch evidence…</p>}
   {data&&<>
    <div className="my-5 p-4 bg-amber-50 rounded-xl text-sm"><strong>Provisional evidence</strong> · {data.coverage}<br/>{data.creative_caution}<br/>Paid history collected: {data.meta_collected_at||'Not available'} · {data.request_errors} recorded request errors. No campaigns are executed from this view.</div>
+   <div className="my-4 p-4 bg-slate-50 rounded-xl text-sm"><strong>Learning history</strong> · {data.evidence_history?.snapshots ?? 'Unknown'} saved observations. Latest: {data.evidence_history?.last_observed_at || 'Not recorded yet'}. Status: {data.evidence_history?.status || 'Unavailable'}. These preserve observed sales and creative versions; they do not establish causal lift.</div>
    <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr>{['City / edition','Lifecycle','Event date','Tickets','Gross revenue','Candidate ad spend'].map(x=><th className="p-3 border-b" key={x}>{x}</th>)}</tr></thead><tbody>{editions.map(x=><tr key={key(x)} className="border-b"><td className="p-3"><button className="text-blue-700 underline" onClick={()=>setSelected(key(x))}>{x.city}{x.edition?' · Year '+x.edition:''}</button></td><td className="p-3">{x.lifecycle} · {x.completed?'completed':x.days_out+' days out'}</td><td className="p-3">{x.date} · {x.event_days} day{x.event_days===1?'':'s'}</td><td className="p-3">{fmt(x.tickets)}</td><td className="p-3">{fmt(x.revenue,true)}</td><td className="p-3">{fmt(x.spend,true)}</td></tr>)}</tbody></table></div>
    {e&&<section className="mt-8"><h2 className="text-2xl font-semibold">{e.city} · {e.date}</h2><a className="text-blue-700 underline" href={e.profile} target="_blank" rel="noreferrer">Instagram content reference</a>
     {e.warnings.map((w,i)=><p key={i} className="text-amber-800 text-sm mt-2">{w}</p>)}
@@ -29,3 +30,4 @@ export default function Launches(){
   </>}
  </main>;
 }
+

@@ -153,7 +153,8 @@ def build_report(db_path=None, today=None):
             observed=sum(d['tickets'] for d in p['daily'] if d['date']<=cutoff)
             comparison.append({'city':p['city'],'date':p['date'],'tickets_at_same_days_out':observed,'final_tickets':p['tickets'],'fraction_sold':round(observed/p['tickets'],4)})
         e['launch_references']=comparison
-    return {'generated_at':datetime.now(timezone.utc).isoformat(),'meta_collected_at':history.get('collected_at'),
+    from launch_evidence import status as evidence_status
+    return {'evidence_history':evidence_status(),'generated_at':datetime.now(timezone.utc).isoformat(),'meta_collected_at':history.get('collected_at'),
       'status':'provisional','editions':editions,'profile_review':'Six profiles reviewed September 16, 2026. Current grids and captions are references, not original creative version history.',
       'coverage':'Candidate campaign names plus delivery windows; not audited attribution. Live stored ticket data. Gross revenue is not incremental ROAS.',
       'creative_caution':'Current Meta creative may have replaced the original. Original post dates must be checked on Instagram.',
@@ -170,11 +171,13 @@ def refresh_history():
     old=read_snapshot(path.name)
     try:
         stamp=datetime.fromisoformat(old.get('collected_at',''))
-        if stamp.tzinfo and (now-stamp).total_seconds()<86400: return {'status':'current'}
+        if stamp.tzinfo and (now-stamp).total_seconds()<86400:
+            return {'status':'current','evidence':capture_evidence()}
     except ValueError: pass
     # Missing historical evidence must be collected explicitly, not invented by a 30-day refresh.
     if not old.get('campaigns'): return {'status':'history_not_seeded'}
-    prior=old.get('campaigns',[])+read_snapshot('nyc-launch-history.json').get('campaigns',[])
+    capture_evidence()  # Preserve the preceding version before advancing the current snapshot.
+    prior=read_snapshot('nyc-launch-history.json').get('campaigns',[])+old.get('campaigns',[])
     keyed={(x['account_id'],x['campaign']['id']):x for x in prior}
     for acct in os.environ.get('META_AD_ACCOUNT_ID','').split(','):
         if not acct.strip(): continue
@@ -195,8 +198,37 @@ def refresh_history():
                 # Missing spend cannot erase an observed value.
                 previous=merged.get(d['date_start'],{})
                 merged[d['date_start']]={**previous,**{k:v for k,v in d.items() if v is not None}}
-            item.update(campaign=c,candidate_cities=cities,days=list(merged.values()),errors=[])
+            # Preserve each observed creative version with its actual observation time.
+            # Fetch every page; a partial response must not replace known creative evidence.
+            ads_response=m._api_get(m.BASE_URL+'/'+c['id']+'/ads',{'fields':'id,name,created_time,creative{id,body,title,instagram_permalink_url,video_id,effective_object_story_id}', 'limit':100})
+            ads=list(ads_response['data']); next_ads=ads_response.get('paging',{}).get('next'); seen_ads=set()
+            while next_ads:
+                if next_ads in seen_ads: raise ValueError('Repeated Meta creative page')
+                seen_ads.add(next_ads); ads_response=m._api_get(next_ads)
+                ads.extend(ads_response['data']); next_ads=ads_response.get('paging',{}).get('next')
+            previous_ads={a['id']:a for a in item.get('ads',[])}
+            for ad in ads:
+                before=previous_ads.get(ad['id'],{})
+                for k,v in before.items():
+                    if ad.get(k) is None: ad[k]=v
+                if isinstance(ad.get('creative'),dict):
+                    old_creative=before.get('creative') or {}
+                    if ad['creative'].get('id')==old_creative.get('id'):
+                        ad['creative']={**old_creative,**{k:v for k,v in ad['creative'].items() if v is not None}}
+            item.update(campaign=c,candidate_cities=cities,days=list(merged.values()),errors=[],ads=ads,creative_observed_at=now.isoformat())
             keyed[key]=item
     value={**old,'campaigns':list(keyed.values()),'candidate_count':len(keyed),'collected_at':now.isoformat(),'until':now.date().isoformat()}
     atomic_json(path,value,max_bytes=40_000_000)
-    return {'status':'refreshed','campaigns':len(keyed)}
+    return {'status':'refreshed','campaigns':len(keyed),'evidence':capture_evidence()}
+
+
+
+def capture_evidence():
+    """Capture aggregate sales and current creative evidence, without provider writes."""
+    from launch_evidence import capture
+    history=read_snapshot('coffee-launch-history.json')
+    if not history.get('campaigns'): return {'status':'history_not_seeded'}
+    # Main snapshot wins after refresh; the NYC seed must not replace newer versions.
+    campaigns=read_snapshot('nyc-launch-history.json').get('campaigns',[])+history['campaigns']
+    keyed={(c['account_id'],c['campaign']['id']):c for c in campaigns}
+    return capture(build_report(),list(keyed.values()))
