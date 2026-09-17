@@ -178,7 +178,7 @@ def _build_app():
     execution_adapter = ExecutionAdapter(db, v2_repo, _campaign_engine)
     from measurement_cycle import refresh_measurements
     app.extensions["craft_maintenance"].append(
-        lambda: refresh_measurements(db, v2_repo, execution_adapter))
+        ("Campaign measurement", lambda: refresh_measurements(db, v2_repo, execution_adapter)))
 
     def require_command_auth(fn):
         """Protect V2 business intelligence with a server-side bearer token."""
@@ -203,9 +203,9 @@ def _build_app():
         return jsonify(opportunity_engine.command_summary())
 
     from launch_intelligence import refresh_history
-    app.extensions["craft_maintenance"].append(refresh_history)
+    app.extensions["craft_maintenance"].append(("Launch evidence", refresh_history))
     from launch_action_packs import refresh_packs
-    app.extensions["craft_maintenance"].append(lambda: refresh_packs(db))
+    app.extensions["craft_maintenance"].append(("Prepared action packs", lambda: refresh_packs(db)))
 
     @app.get("/api/intelligence/launches")
     @require_command_auth
