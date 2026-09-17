@@ -176,6 +176,9 @@ def _build_app():
     except Exception:
         pass
     execution_adapter = ExecutionAdapter(db, v2_repo, _campaign_engine)
+    from measurement_cycle import refresh_measurements
+    app.extensions["craft_maintenance"].append(
+        lambda: refresh_measurements(db, v2_repo, execution_adapter))
 
     def require_command_auth(fn):
         """Protect V2 business intelligence with a server-side bearer token."""

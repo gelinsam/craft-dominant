@@ -35,3 +35,9 @@ Run SQLite and Postgres regression suites, frontend tests and production build. 
 ## Invalid CRM identities
 
 Candidate selection reuses the existing email validation boundary but quarantines invalid source records instead of aborting all valid candidates. It does not repair or mutate identities. The candidate result and preparation manifest contain `quarantined_invalid_email_records`; CSV responses include `X-CRM-Quarantined-Records` and the exported candidate count. Database lookup failures and truncated queries still fail closed. Provider eligibility exports retain their stricter failure behavior because partial consent evidence must not silently authorize a recipient.
+
+## Scheduled measurement and channel checks
+
+Reuse the existing campaign scheduler and `ExecutionAdapter.measure`; no new execution runtime or send retry is introduced. Every cycle verifies Meta read access using the existing bounded HTTP transport and stores a credential-free status. Configuration changes invalidate prior health; observations expire after eight hours. Account access does not establish campaign attribution or Pixel/CAPI quality.
+
+The same maintenance cycle measures only interventions already in `measuring`. It requires a completed sales sync no older than 24 hours, without integrity warnings. Closing an attribution window additionally requires sales sync completion after the window end. Missing timestamps or evidence hold measurement. Each failure is isolated and visible. Learning persistence failures now raise before the intervention can be saved as completed, allowing a later retry. Outcomes remain attributed orders/tickets/revenue, not causal or incremental lift; no pending measurements is not evidence of zero campaign impact.
