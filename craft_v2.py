@@ -202,6 +202,17 @@ def _build_app():
     def command_summary():
         return jsonify(opportunity_engine.command_summary())
 
+    from launch_intelligence import refresh_history
+    app.extensions["craft_maintenance"].append(refresh_history)
+
+    @app.get("/api/intelligence/launches")
+    @require_command_auth
+    def launch_intelligence():
+        from launch_intelligence import build_report
+        response = jsonify(build_report())
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
     @app.get("/api/intelligence/action-plan")
     @require_command_auth
     def action_plan():
