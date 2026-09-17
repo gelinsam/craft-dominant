@@ -687,6 +687,7 @@ export default function CraftDashboard() {
               {['events', 'crm', 'overlap', 'actions'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 rounded-lg font-medium ${tab === t ? 'bg-white shadow' : 'text-gray-600'}`}>{t === 'events' ? 'Events' : t === 'crm' ? 'CRM' : t === 'actions' ? 'Actions' : 'Overlap'}</button>))}
             </div>
             <a href="/launches" className="text-sm font-medium text-blue-700">Launch Intelligence</a>
+            <a href="/tracking" className="text-sm font-medium text-blue-700">Tracking</a>
             <a href="/audiences" className="text-sm font-medium text-blue-700">Audiences</a>
             <button onClick={() => { if (!syncing) triggerSync(); }} className={`px-3 py-2 rounded-lg text-sm font-medium ${syncing ? 'bg-gray-200 text-gray-400' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} disabled={syncing}>{syncing ? 'Syncing...' : 'Refresh Data'}</button>
           </div>
@@ -1470,3 +1471,4 @@ export default function CraftDashboard() {
     </div>
   );
 }
+

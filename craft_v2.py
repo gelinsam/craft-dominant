@@ -210,6 +210,17 @@ def _build_app():
     from ready_posts import refresh_ready_posts
     app.extensions["craft_maintenance"].append(("Finished social posts", refresh_ready_posts))
 
+    from tracking_readiness import refresh_tracking
+    app.extensions["craft_maintenance"].append(("Tracking verification", refresh_tracking))
+
+    @app.get("/api/intelligence/tracking")
+    @require_command_auth
+    def tracking_index():
+        from tracking_readiness import tracking_report
+        response = jsonify(tracking_report(db))
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
     @app.get("/api/intelligence/ready-posts")
     @require_command_auth
     def ready_posts_index():

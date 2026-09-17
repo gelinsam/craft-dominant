@@ -122,3 +122,8 @@ class MaintenanceIsolationTests(unittest.TestCase):
 
 
 
+
+    def test_partial_failure_result_remains_visible(self):
+        result = run_maintenance([('Tracking', lambda: {'status': 'partial_failure'})], self.now)
+        self.assertEqual(result['status'], 'partial_failure')
+        self.assertEqual(result['tasks'][0]['status'], 'failed')
