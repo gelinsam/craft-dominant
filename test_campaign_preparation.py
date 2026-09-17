@@ -24,6 +24,21 @@ class CampaignPreparationTests(unittest.TestCase):
     def prepare(self):
         return prepare_draft(self.db,self.request,self.sources,self.history,self.now)
 
+    def test_stale_other_provider_campaign_is_advisory_not_a_hold(self):
+        self.history['active_campaigns']=[{'provider':'mailchimp','campaign_id':'m',
+            'observed_at':(self.now-timedelta(days=2)).isoformat(),
+            'recipient_emails':['a@example.com'],'membership_complete':False}]
+        result=self.prepare()
+        self.assertEqual(result['recipient_count'],2)
+        self.assertEqual(result['cross_provider_unverified_campaigns'],1)
+        self.assertNotIn('active_campaigns_unresolved',result['sending_blockers'])
+
+    def test_unknown_active_provider_cannot_be_assumed_cross_provider(self):
+        self.history['active_campaigns']=[{'provider':'unknown','campaign_id':'m',
+            'observed_at':self.stamp,'recipient_emails':['a@example.com'],'membership_complete':True}]
+        with self.assertRaises(ValueError):
+            self.prepare()
+
     def test_quarantine_count_survives_provider_preparation(self):
         self.db.get_event_profiles.return_value = [{'email':'a@example.com'}, {'email':None}]
         package=self.prepare()

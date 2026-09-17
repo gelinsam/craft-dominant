@@ -64,6 +64,7 @@ def prepare_draft(db, request, sources, contact_history, now):
         blockers.append('contact_history_incomplete')
     require_fresh(contact_history['observed_at'], now)
     reserved = set()
+    stale_cross_provider_campaigns = 0
     active = contact_history.get('active_campaigns')
     unresolved = active is None
     if active is not None and not isinstance(active, list):
@@ -76,8 +77,15 @@ def prepare_draft(db, request, sources, contact_history, now):
             continue
         if not campaign.get('campaign_id') or campaign.get('provider') not in ('eventbrite', 'mailchimp'):
             raise ValueError('Active campaign evidence requires provider and ID')
-        require_fresh(campaign['observed_at'], now)
         same_provider = campaign['provider'] == provider
+        if same_provider:
+            require_fresh(campaign['observed_at'], now)
+        else:
+            try:
+                require_fresh(campaign['observed_at'], now)
+            except (ValueError, KeyError):
+                stale_cross_provider_campaigns += 1
+                continue
         recipients = campaign.get('recipient_emails')
         if not isinstance(recipients, list):
             unresolved = unresolved or same_provider
@@ -143,6 +151,7 @@ def prepare_draft(db, request, sources, contact_history, now):
         'quarantined_invalid_email_records': audience.get('quarantined_invalid_email_records', 0),
         'cross_provider_delivered_candidates': len(eligible & cross_provider_delivery),
         'cross_provider_pending_candidates': len(eligible & cross_provider_pending),
+        'cross_provider_unverified_campaigns': stale_cross_provider_campaigns,
         'unknown_delivery_candidates': len(eligible & uncertain_contacts),
         'prepared_at': now.isoformat(), 'source_list_ids': sorted(source_ids),
         'recipient_count': len(recipients), 'recipient_sha256': recipient_digest(recipients),
