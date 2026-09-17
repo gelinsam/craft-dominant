@@ -5279,6 +5279,15 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         response.headers['Cache-Control'] = 'private, no-store, max-age=0'
         return response, 200 if report is not None else 503
 
+    @app.route('/api/intelligence/campaign-evidence', methods=['GET'])
+    def live_campaign_evidence():
+        # Existing authenticated boundary; no recipient data or credentials.
+        from campaign_feedback import load_evidence, feedback_status
+        data = load_evidence()
+        response = jsonify(dict(data, feedback=feedback_status()))
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response, 200 if data.get('records') else 503
+
     @app.route('/api/intelligence/<event_id>')
     def intelligence(event_id: str):
         """Advanced intelligence for an event: cross-sell, velocity, promo codes,

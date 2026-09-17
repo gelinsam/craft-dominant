@@ -51,7 +51,13 @@ def prepare_draft(db, request, sources, contact_history, now):
         denied.update(all_emails - eligible)
     # A denial in any supplied source beats eligibility in another.
     allowed -= denied
+    provider = request.get('provider', 'eventbrite')
+    if provider != 'eventbrite':
+        raise ValueError('This preparer requires Eventbrite destination consent; use the Mailchimp adapter for Mailchimp')
     blockers = []
+    cross_provider_delivery = set()
+    cross_provider_pending = set()
+    uncertain_contacts = set()
     if audience.get('history_coverage') == 'stored_records_only':
         blockers.append('purchase_history_coverage_unverified')
     if contact_history.get('complete') is not True:
@@ -68,24 +74,25 @@ def prepare_draft(db, request, sources, contact_history, now):
         if not isinstance(campaign, dict):
             unresolved = True
             continue
-        if not campaign.get('campaign_id') or not campaign.get('provider'):
+        if not campaign.get('campaign_id') or campaign.get('provider') not in ('eventbrite', 'mailchimp'):
             raise ValueError('Active campaign evidence requires provider and ID')
         require_fresh(campaign['observed_at'], now)
+        same_provider = campaign['provider'] == provider
         recipients = campaign.get('recipient_emails')
         if not isinstance(recipients, list):
-            unresolved = True
+            unresolved = unresolved or same_provider
             continue
         for value in recipients:
             email = email_key(value)
             if not email or '@' not in email or any(c in email for c in '\r\n'):
                 raise ValueError('Invalid active campaign recipient')
-            reserved.add(email)
-        if campaign.get('membership_complete') is not True:
+            (reserved if same_provider else cross_provider_pending).add(email)
+        if same_provider and campaign.get('membership_complete') is not True:
             unresolved = True
     if unresolved:
         blockers.append('active_campaigns_unresolved')
-    if contact_history.get('scope') != 'all_festivals_all_providers':
-        blockers.append('cross_provider_history_incomplete')
+    if contact_history.get('scope') not in ('all_festivals_all_providers', f'all_festivals_{provider}'):
+        blockers.append('destination_provider_history_incomplete')
     cooldown = request.get('cooldown_days', 7)
     if not isinstance(cooldown, int) or isinstance(cooldown, bool) or not 1 <= cooldown <= 90:
         raise ValueError('Cooldown must be 1–90 days')
@@ -94,10 +101,34 @@ def prepare_draft(db, request, sources, contact_history, now):
         timestamp = observed_at(item['contacted_at'])
         if timestamp > now:
             raise ValueError('Contact timestamp is in the future')
-        if now - timestamp < timedelta(days=cooldown):
-            recent.add(email_key(item['email']))
+        email = email_key(item.get('email'))
+        if not email or '@' not in email or any(c in email for c in '\r\n'):
+            raise ValueError('Invalid contact history record')
+        if now - timestamp >= timedelta(days=cooldown):
+            continue
+        source = item.get('provider')
+        status = item.get('status', 'unknown')
+        # Acceptance/send attempts are not proof of recipient delivery. Opens
+        # and clicks demonstrate engagement, but never infer inbox placement.
+        if status in ('delivered', 'opened', 'clicked'):
+            if source == provider:
+                recent.add(email)
+            elif source in ('mailchimp', 'eventbrite'):
+                cross_provider_delivery.add(email)
+            else:
+                uncertain_contacts.add(email)
+        elif status in ('failed', 'bounced', 'not_delivered') and source in ('mailchimp', 'eventbrite'):
+            # This is contact-frequency evidence only. Independent consent and
+            # provider bounce/suppression gates above must still pass.
+            continue
+        elif source == provider or source not in ('mailchimp', 'eventbrite'):
+            uncertain_contacts.add(email)
+        else:
+            cross_provider_pending.add(email)
     candidates = {r['email'] for r in audience['records']}
     eligible = candidates & allowed
+    if eligible & uncertain_contacts:
+        blockers.append('delivery_evidence_unresolved')
     recipients = sorted(eligible - recent - reserved)
     if not recipients:
         raise ValueError('No eligible recipients remain')
@@ -107,7 +138,11 @@ def prepare_draft(db, request, sources, contact_history, now):
     return {
         'run_id': request['run_id'], 'event_id': request['event_id'],
         'event_type': scope[0], 'city': scope[1],
-        'segment': request['segment'], 'purpose': request['purpose'],
+        'segment': request['segment'], 'purpose': request['purpose'], 'provider': provider,
+        'contact_policy': 'provider_delivery_aware_v1',
+        'cross_provider_delivered_candidates': len(eligible & cross_provider_delivery),
+        'cross_provider_pending_candidates': len(eligible & cross_provider_pending),
+        'unknown_delivery_candidates': len(eligible & uncertain_contacts),
         'prepared_at': now.isoformat(), 'source_list_ids': sorted(source_ids),
         'recipient_count': len(recipients), 'recipient_sha256': recipient_digest(recipients),
         'excluded_recent_contacts': len(eligible & recent),

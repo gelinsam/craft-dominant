@@ -6,3 +6,6 @@ psycopg[binary]==3.2.4
 
 # Durable draft worker; never imported or launched by the web application.
 dbos==2.31.1
+
+# Official read-only campaign reporting client.
+mailchimp-marketing==3.0.80
