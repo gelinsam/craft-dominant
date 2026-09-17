@@ -98,13 +98,18 @@ def summarize(edition, sales, campaigns, coverage_start):
     if coverage_start and lower<coverage_start: warnings.append('Paid history begins after the comparison window; earlier spend is missing.')
     if unknown_tickets or unknown_revenue: warnings.append('Some stored order values are unknown; totals include observed values only.')
     if not matched: warnings.append('No qualifying paid campaign observations; spend is unknown, not zero.')
-    for b in buckets:
+    for i,b in enumerate(buckets):
         b['revenue']=round(b['revenue'],2); b['spend']=round(b['spend'],2) if matched else None
+        _,lo,hi=PHASES[i]
+        if coverage_start and (start-timedelta(days=lo)).isoformat()<coverage_start: b['spend']=None
+        b['not_reached']=edition.get('days_out',0)>hi
+        if b['not_reached']: b.update(tickets=None,revenue=None,spend=None)
     return {**edition,'tickets':total_tickets if any(number(s['tickets']) is not None for s in sales) else None,'revenue':round(total_revenue,2) if any(number(s['revenue']) is not None for s in sales) else None,
       'spend':round(total_spend,2) if matched else None,'unknown_tickets':unknown_tickets,
       'unknown_revenue':unknown_revenue,'phases':buckets,'campaigns':sorted(matched,key=lambda c:c['first_delivery']),
       'daily':[{'date':d,**{k:round(v,2) for k,v in x.items()}} for d,x in sorted(daily.items())],
-      'warnings':warnings,'profile':'https://www.instagram.com/'+PROFILES[edition['city']]}
+      'warnings':warnings,'event_days':(date.fromisoformat(end)-start).days+1,
+      'profile':'https://www.instagram.com/'+PROFILES[edition['city']]}
 
 
 def build_report(db_path=None, today=None):
