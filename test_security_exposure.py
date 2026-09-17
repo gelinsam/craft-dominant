@@ -286,9 +286,12 @@ from test_campaign_history_report import CampaignHistoryReportTests  # noqa: E40
 from test_campaign_feedback import CampaignFeedbackTests, CampaignFeedbackBoundaryTests
 from test_action_plan import ActionPlanTests
 from test_action_plan import ActionPlanBoundaryTests
-from test_scheduled_maintenance import ScheduledMaintenanceTests
+from test_scheduled_maintenance import ScheduledMaintenanceTests, MaintenanceIsolationTests
 
 # Run maintained model-boundary checks in the existing SQLite/Postgres jobs.
 from test_model_client import TestModelBoundary, TestStructuredSDK
 
 from test_campaign_generation import CampaignEditionGenerationTests
+
+from test_ready_posts import ReadyPostTests, ReadyPostBoundaryTests
+
