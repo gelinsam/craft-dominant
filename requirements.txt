@@ -9,3 +9,7 @@ dbos==2.31.1
 
 # Official read-only campaign reporting client.
 mailchimp-marketing==3.0.80
+
+# Maintained model transport and typed structured output (MIT).
+anthropic==1.6.0
+pydantic>=2.10,<3

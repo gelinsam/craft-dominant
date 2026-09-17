@@ -299,78 +299,7 @@ def get_phase(days_until: int) -> Optional[Dict]:
 # =============================================================================
 # CLAUDE API CLIENT — direct HTTP, no SDK dependency
 # =============================================================================
-class ClaudeClient:
-    """Minimal Anthropic Messages API client using requests."""
-
-    def __init__(self, api_key: str, model: str = "claude-sonnet-5"):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = "https://api.anthropic.com/v1/messages"
-
-    def generate(self, system_prompt: str, user_prompt: str,
-                 max_tokens: int = 4000, temperature: float = 0.7) -> Optional[str]:
-        """Call Claude and return text. Legacy temperature argument is ignored.
-
-        Current Claude models reject non-default sampling parameters. Keep the
-        Python argument for existing callers, but omit it from the API request.
-        """
-        try:
-            import requests
-        except ImportError:
-            log.error("requests library required for Claude API")
-            return None
-
-        resp = requests.post(
-            self.base_url,
-            headers={
-                'x-api-key': self.api_key,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            json={
-                'model': self.model,
-                'max_tokens': max_tokens,
-                'system': system_prompt,
-                'messages': [{'role': 'user', 'content': user_prompt}],
-            },
-            timeout=60,
-        )
-
-        if resp.status_code != 200:
-            log.error(f"Claude API error {resp.status_code}: {resp.text[:500]}")
-            return None
-
-        data = resp.json()
-        content = data.get('content', [])
-        if content and content[0].get('type') == 'text':
-            return content[0]['text']
-        return None
-
-    def generate_json(self, system_prompt: str, user_prompt: str,
-                      max_tokens: int = 4000, temperature: float = 0.5) -> Optional[Dict]:
-        """Call Claude and parse JSON from the response."""
-        text = self.generate(system_prompt, user_prompt, max_tokens, temperature)
-        if not text:
-            return None
-
-        # Extract JSON from markdown code blocks if present
-        json_match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
-        if json_match:
-            text = json_match.group(1)
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            brace_start = text.find('{')
-            brace_end = text.rfind('}')
-            if brace_start >= 0 and brace_end > brace_start:
-                try:
-                    return json.loads(text[brace_start:brace_end + 1])
-                except json.JSONDecodeError:
-                    pass
-            log.error(f"Failed to parse Claude JSON response: {text[:200]}")
-            return None
+from model_client import ClaudeClient
 
 
 # =============================================================================
@@ -1670,6 +1599,7 @@ Provide 2-3 specific, actionable learnings as JSON:
             prompt,
             max_tokens=1000,
             temperature=0.3,
+            output_kind='learning',
         )
 
         if result and result.get('learnings'):
