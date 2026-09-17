@@ -1,14 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import drafts from '../data/festival-drafts.json';
+import PreparedEmails from './PreparedEmails';
 import CampaignIntelligence from './CampaignIntelligence';
-import { summarizeCommand, draftPresentation, campaignUrl } from '../lib/attention.mjs';
+import { summarizeCommand } from '../lib/attention.mjs';
 
 export default function AttentionHub({ expanded, onOpen, refreshKey }) {
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [retry, setRetry] = useState(0);
-  const [filter, setFilter] = useState('');
   useEffect(() => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -30,7 +29,6 @@ export default function AttentionHub({ expanded, onOpen, refreshKey }) {
 
   useEffect(() => { const timer=setInterval(() => { if(document.visibilityState==='visible') setRetry(n=>n+1); },60000); return () => clearInterval(timer); }, []);
   const opportunities = summary?.opportunities || [];
-  const filtered = drafts.filter(d => d.event_name.toLowerCase().includes(filter.toLowerCase()));
   const message = loading ? 'Checking opportunities…' : error ? 'Recommendations unavailable — pacing remains below'
     : opportunities.length ? `${opportunities.length} pacing ${opportunities.length === 1 ? 'opportunity' : 'opportunities'}`
     : summary?.zeroTrusted ? 'No pacing opportunities detected' : 'Pacing assessment incomplete';
@@ -44,6 +42,8 @@ export default function AttentionHub({ expanded, onOpen, refreshKey }) {
       </div>
     </div>
     {expanded && <div className="border-t p-4 sm:p-6 space-y-7">
+      <PreparedEmails />
+      <details><summary className="cursor-pointer text-sm font-medium">Pacing opportunities and system checks</summary>
       <div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">What needs attention now</h2>
@@ -79,26 +79,8 @@ export default function AttentionHub({ expanded, onOpen, refreshKey }) {
           <div className="mt-5 rounded-lg bg-slate-50 p-4"><h3 className="font-semibold">System checks</h3><p className="mt-1 text-xs text-slate-500">Rechecked every minute while this view is open. A current page does not imply current provider data.</p><div className="mt-3 grid gap-3 md:grid-cols-2">{summary.checks.map(c=><div key={c.id}><p className="text-sm font-medium">{c.label}: {c.status.replaceAll('_',' ')}</p><p className="text-xs text-slate-600">{c.action}</p>{c.observed_at && <p className="text-xs text-slate-500">Observed: {c.observed_at}</p>}</div>)}</div></div>
         </>}
       </div>
-      <CampaignIntelligence />
-      <div>
-        <h2 className="text-lg font-semibold">Festival email drafts</h2>
-        <p className="mt-1 text-sm text-slate-600">Super-spreader drafts last checked September 16, 2026. These are saved audience snapshots; status and counts are not live Eventbrite data. Check each draft before scheduling in Eventbrite.</p>
-        <p className="mt-2 text-sm text-slate-500">Historical email evidence appears above. Results for these saved drafts are not yet connected; a draft is not evidence of a send or a sale.</p>
-        <label className="mt-4 block text-sm font-medium">Find a festival<input type="search" value={filter} onChange={e => setFilter(e.target.value)} placeholder="City or festival name" className="mt-1 block w-full max-w-sm rounded-lg border px-3 py-2 font-normal" /></label>
-        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {filtered.map(d => {
-            const status = draftPresentation(d);
-            return <article key={d.campaign_id} className="rounded-lg border p-4">
-              <span className={`text-xs font-semibold ${status.tone === 'amber' ? 'text-amber-800' : 'text-blue-700'}`}>{status.label}</span>
-              <h3 className="mt-2 font-semibold">{d.event_name}</h3>
-              <p className="mt-1 text-sm text-slate-600">{d.active_recipients === null ? 'Recipient count not recorded' : `${d.active_recipients.toLocaleString()} active recipients when checked`}</p>
-              <p className="mt-2 text-sm text-slate-500">{d.note}</p>
-              <a href={campaignUrl(d.campaign_id)} target="_blank" rel="noopener noreferrer" className="mt-3 inline-block text-sm font-medium text-blue-700">Open Eventbrite {d.state === 'scheduled' ? 'campaign' : 'draft'} ↗</a>
-            </article>;
-          })}
-        </div>
-        {!filtered.length && <p className="mt-3 text-sm text-slate-600">No saved drafts match that festival.</p>}
-      </div>
+      </details>
+      <details><summary className="cursor-pointer text-sm font-medium">Historical email evidence</summary><CampaignIntelligence /></details>
     </div>}
   </section>;
 }
