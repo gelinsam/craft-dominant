@@ -24,10 +24,14 @@ def page_all(client, path, key):
     cache = getattr(client, '_draft_read_cache', None)
     if cache is not None and (path,key) in cache:
         return cache[(path,key)]
+    fields = {'members':'members.id,members.email_address,members.status,total_items',
+              'campaigns':'campaigns.id,campaigns.web_id,campaigns.status,campaigns.settings,campaigns.recipients,campaigns.send_time,total_items',
+              'emails':'emails.email_id,emails.email_address,emails.activity,total_items',
+              'automations':'automations.id,automations.status,automations.recipients,total_items'}
     rows, seen, total = [], set(), None
     while True:
         page = client._request_strict('GET', path + ('&' if '?' in path else '?') +
-            urlencode({'count': 1000, 'offset': len(rows)}), timeout=60).body
+            urlencode({'count': 1000, 'offset': len(rows), 'fields':fields[key]}), timeout=60).body
         batch, expected = page.get(key), page.get('total_items')
         if not isinstance(batch, list) or not isinstance(expected, int) or expected < 0 or (total is not None and expected != total):
             raise ValueError('Provider pagination changed or is incomplete')
@@ -163,10 +167,12 @@ def prepare_one(db, brief, client, state, save, now):
             entry.update(state='user_edited', reason='Your changes are preserved.', verified_at=now.isoformat()); save(); return entry
         if not entry.get('fingerprint') and not entry.get('create_pending'):
             raise ValueError('Existing draft ownership cannot be established')
+    print('Preparing current buyers:',brief['festival'],flush=True)
     buyers = current_buyers(db, siblings)
     candidates = build_crm_audience(db, eid, brief['segment'], 'ticket_sales', now)
     if candidates.get('history_coverage') == 'stored_records_only':
         raise ValueError('Win-back purchase history coverage needs verification')
+    print('Preparing provider audience:',brief['festival'],flush=True)
     eligible, counts = eligible_members(client, campaigns, now)
     recipients = sorted({r['email'] for r in candidates['records']} & eligible - buyers)
     if not recipients:
