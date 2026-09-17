@@ -190,7 +190,7 @@ def prepare_one(db, brief, client, state, save, now):
                     if tag=='a': links.extend(v for k,v in attrs if k=='href')
             Links().feed(saved.get('html',''))
             parent=brief['ticket_url'].rsplit('/',1)[-1]
-            if any(urlsplit(u).hostname in ('www.eventbrite.com','eventbrite.com') and urlsplit(u).path.rstrip('/').endswith(parent) for u in links):
+            if any(urlsplit(u).hostname in ('www.eventbrite.com','eventbrite.com') and urlsplit(u).path.startswith('/e/') and urlsplit(u).path.rstrip('/').rsplit('/',1)[-1].rsplit('-',1)[-1] == parent for u in links):
                 entry.update(state='covered_by_scheduled',reason='Your campaign is already scheduled. No overlapping draft was added.',
                     subject=scheduled.get('settings',{}).get('subject_line'),
                     url=f'https://{client.dc}.admin.mailchimp.com/campaigns/edit?id={scheduled["web_id"]}')

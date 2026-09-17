@@ -37,7 +37,7 @@ export default function PreparedEmails() {
     {failed && <p role="alert" className="mt-3 text-sm text-amber-800">Live draft status is temporarily unavailable.</p>}
     {!data && !failed && <p className="mt-4 text-sm text-slate-500">Checking saved campaigns…</p>}
     {!failed && <div className="mt-4 grid gap-4 md:grid-cols-2">{ready.map(card)}</div>}
-    {data && !ready.length && !failed && <p className="mt-4 text-sm text-slate-600">Audience preparation is in progress. Finished drafts will appear here automatically.</p>}
+    {data && !ready.length && !failed && <p className="mt-4 text-sm text-slate-600">No additional email is ready for review. Scheduled campaigns and any preparation issues are shown below.</p>}
     {!!scheduled.length && <div className="mt-6"><h3 className="font-semibold">Already scheduled</h3><div className="mt-3 grid gap-4 md:grid-cols-2">{scheduled.map(card)}</div></div>}
     {!!others.length && <details className="mt-5"><summary className="cursor-pointer text-sm font-medium">Preparing and existing campaigns ({others.length})</summary><div className="mt-3 grid gap-4 md:grid-cols-2">{others.map(card)}</div></details>}
   </section>;
