@@ -43,7 +43,11 @@ def refresh_measurements(db, repo, adapter, now=None):
             fresh=(run.get('status')=='completed' and synced is not None and 0<=(now-synced).total_seconds()<=24*3600)
             for item in pending:
                 end=stamp(item.measurement_ends_at)
-                if not fresh or end is None or (now>=end and synced<end):
+                event_synced = synced if fresh else None
+                from sales_evidence import verified_edition_at, has_current_evidence
+                if run.get('status') == 'completed_with_integrity_warnings' or has_current_evidence(run):
+                    event_synced = verified_edition_at(db, getattr(item, 'event_id', None), run, now)
+                if event_synced is None or end is None or (now>=end and event_synced<end):
                     result['held']+=1
                     continue
                 try:
@@ -66,3 +70,4 @@ def refresh_measurements(db, repo, adapter, now=None):
         result['status']='measurement_unavailable'
     atomic_json(status_path(),result)
     return result
+
