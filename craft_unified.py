@@ -2136,11 +2136,14 @@ class EventbriteSync:
         created = data.get('created', '')
         if not order_id or not created:
             return None
-        email = data.get('email', '').lower().strip()
+        raw_email = data.get('email')
+        email = raw_email.lower().strip() if isinstance(raw_email, str) else ''
         if not email:
-            attendees = data.get('attendees', [])
-            if attendees:
-                email = attendees[0].get('profile', {}).get('email', '').lower().strip()
+            attendees = data.get('attendees') or []
+            if attendees and isinstance(attendees[0], dict):
+                profile = attendees[0].get('profile') or {}
+                raw_email = profile.get('email') if isinstance(profile, dict) else None
+                email = raw_email.lower().strip() if isinstance(raw_email, str) else ''
         if not email:
             return None
         try:
@@ -4565,18 +4568,20 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
         come from the database, so a sync killed by a restart is still visible
         afterwards instead of vanishing with the in-memory flag.
         """
+        # Capture process flags before durable reads: completion can occur during a query.
+        process_state = dict(_sync_state)
         try:
             last_run = db.last_sync_run('eventbrite')
             interrupted = db.interrupted_sync_runs()
         except Exception:
             last_run, interrupted = None, []
         return jsonify({
-            'done': _sync_state['done'],
-            'running': _sync_state['running'],
-            'result': _sync_state['result'],
+            'done': process_state['done'],
+            'running': process_state['running'],
+            'result': process_state['result'],
             'last_run': last_run,
             'interrupted_runs': interrupted,
-            'error': _sync_state['error']
+            'error': process_state['error']
         })
     # POST is the real verb: this triggers a full Eventbrite traversal.
     # GET is retained so existing callers and probes keep working, but the
