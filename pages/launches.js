@@ -1,3 +1,4 @@
+import Image from 'next/image';
 import { useEffect, useState } from 'react';
 const fmt=(x,money=false)=>typeof x==='number' ? (money?'$':'')+x.toLocaleString(undefined,{maximumFractionDigits:money?2:0}) : 'Unknown';
 const recipes=[
@@ -6,6 +7,26 @@ const recipes=[
  ['Make it local','Feature confirmed roasters and the music lineup. Localize city, venue, date and destination without claiming borrowed footage is from this city.'],
  ['Close','Use countdowns, useful festival information and truthful inventory or pricing reminders. Adjust spend using ticket pacing; retain low-budget support where appropriate.']
 ];
+function ReadyPosts({value}) {
+ const [copied,setCopied]=useState('');
+ if(!value)return null;
+ const current=value.status==='current';
+ return <section className="my-8" id="ready-posts">
+  <h2 className="text-2xl font-semibold">Posts ready for your review</h2>
+  <p className="text-slate-600 mt-2">Real festival photography and finished captions. Download a complete post, review it, and publish from the city’s account.</p>
+  {!current&&<p role="status" className="text-amber-800 mt-2">{value.status==='stale'?'These posts need a source refresh before use.':'Preparing the first finished posts.'}</p>}
+  <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-5 mt-5">{value.posts?.map(p=><article key={p.id} className="border rounded-xl overflow-hidden bg-white">
+   <Image unoptimized src={'/api/proxy/api/intelligence/ready-posts/media/'+p.media_id} alt={p.alt} width={1043} height={857} className="w-full h-64 object-contain bg-slate-100"/>
+   <div className="p-5"><h3 className="font-semibold text-lg">{p.festival}</h3><p className="text-sm text-slate-500">{p.event_date} · Awaiting your review</p>
+   <p className="whitespace-pre-wrap mt-4">{p.caption}</p>
+   <div className="flex flex-wrap gap-4 mt-4">{current&&<a className="bg-blue-700 text-white px-4 py-2 rounded-lg" href={'/api/proxy/api/intelligence/ready-posts/'+p.id+'/download'}>Download complete post</a>}<button className="text-blue-700 underline" onClick={async()=>{try{await navigator.clipboard.writeText(p.caption);setCopied(p.id);}catch{setCopied('failed');}}}>{copied===p.id?'Copied':'Copy caption'}</button></div>
+   <details className="mt-4 text-sm"><summary className="cursor-pointer">Source and ticket links</summary><p className="mt-2">{p.selection_basis}</p><p className="mt-2">{p.performance_basis}</p><p className="mt-2">{p.review_note}</p><a className="block text-blue-700 underline mt-2" href={p.source_url} target="_blank" rel="noreferrer">Original photo · {p.source_city}</a>{p.ticket_links.map((u,i)=><a className="block text-blue-700 underline mt-2" key={u} href={u} target="_blank" rel="noreferrer">Ticket session {i+1}</a>)}</details>
+   </div></article>)}</div>
+  {value.held?.map((p,i)=><p className="text-sm text-amber-800 mt-3" key={i}>{p.festival}: {p.reason}</p>)}
+  {copied==='failed'&&<p role="status">Select the caption to copy it manually.</p>}
+ </section>;
+}
+
 function ActionPacks({value}){
  const [copied,setCopied]=useState('');
  if(!value)return null;
@@ -39,6 +60,7 @@ export default function Launches(){
   {data&&<>
    <div className="my-5 p-4 bg-amber-50 rounded-xl text-sm"><strong>Provisional evidence</strong> · {data.coverage}<br/>{data.creative_caution}<br/>Paid history collected: {data.meta_collected_at||'Not available'} · {data.request_errors} recorded request errors. No campaigns are executed from this view.</div>
    <div className="my-4 p-4 bg-slate-50 rounded-xl text-sm"><strong>Learning history</strong> · {data.evidence_history?.snapshots ?? 'Unknown'} saved observations. Latest: {data.evidence_history?.last_observed_at || 'Not recorded yet'}. Status: {data.evidence_history?.status || 'Unavailable'}. These preserve observed sales and creative versions; they do not establish causal lift.</div>
+   <ReadyPosts value={data.ready_posts}/>
    <ActionPacks value={data.action_packs}/>
    <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr>{['City / edition','Lifecycle','Event date','Tickets','Gross revenue','Candidate ad spend'].map(x=><th className="p-3 border-b" key={x}>{x}</th>)}</tr></thead><tbody>{editions.map(x=><tr key={key(x)} className="border-b"><td className="p-3"><button className="text-blue-700 underline" onClick={()=>setSelected(key(x))}>{x.city}{x.edition?' · Year '+x.edition:''}</button></td><td className="p-3">{x.lifecycle} · {x.completed?'completed':x.days_out+' days out'}</td><td className="p-3">{x.date} · {x.event_days} day{x.event_days===1?'':'s'}</td><td className="p-3">{fmt(x.tickets)}</td><td className="p-3">{fmt(x.revenue,true)}</td><td className="p-3">{fmt(x.spend,true)}</td></tr>)}</tbody></table></div>
    {e&&<section className="mt-8"><h2 className="text-2xl font-semibold">{e.city} · {e.date}</h2><a className="text-blue-700 underline" href={e.profile} target="_blank" rel="noreferrer">Instagram content reference</a>

@@ -207,6 +207,44 @@ def _build_app():
     from launch_action_packs import refresh_packs
     app.extensions["craft_maintenance"].append(("Prepared action packs", lambda: refresh_packs(db)))
 
+    from ready_posts import refresh_ready_posts
+    app.extensions["craft_maintenance"].append(("Finished social posts", refresh_ready_posts))
+
+    @app.get("/api/intelligence/ready-posts")
+    @require_command_auth
+    def ready_posts_index():
+        from ready_posts import read_posts
+        response = jsonify(read_posts())
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
+    @app.get("/api/intelligence/ready-posts/media/<key>")
+    @require_command_auth
+    def ready_posts_media(key):
+        from flask import send_file
+        from ready_posts import media_path
+        try:
+            response = send_file(media_path(key), mimetype='image/jpeg', conditional=False)
+        except (ValueError, OSError):
+            return jsonify({'error': 'Media unavailable'}), 404
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        return response
+
+    @app.get("/api/intelligence/ready-posts/<post_id>/download")
+    @require_command_auth
+    def ready_posts_download(post_id):
+        from flask import send_file
+        from ready_posts import package
+        try:
+            response = send_file(package(post_id), mimetype='application/zip', as_attachment=True,
+                                 download_name='craft-post-'+post_id+'.zip', conditional=False)
+        except (ValueError, OSError):
+            return jsonify({'error': 'Post unavailable or needs refreshing'}), 404
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        return response
+
     @app.get("/api/intelligence/launches")
     @require_command_auth
     def launch_intelligence():
@@ -214,6 +252,8 @@ def _build_app():
         from launch_action_packs import read_packs
         report = build_report()
         report["action_packs"] = read_packs()
+        from ready_posts import read_posts
+        report["ready_posts"] = read_posts()
         response = jsonify(report)
         response.headers['Cache-Control'] = 'private, no-store, max-age=0'
         return response
