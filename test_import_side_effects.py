@@ -203,17 +203,21 @@ with patch('sqlite3.connect') as database, patch('threading.Thread') as thread:
 
 class ClaudeRequestCompatibilityTests(unittest.TestCase):
     def test_legacy_temperature_is_omitted_from_current_model_requests(self):
-        from unittest.mock import Mock, patch
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
         from craft_engine import ClaudeClient
-        response = Mock(status_code=200)
-        response.json.return_value = {'content': [{'type': 'text', 'text': '{"ok": true}'}]}
-        with patch('requests.post', return_value=response) as post:
-            result = ClaudeClient('synthetic-test-key').generate_json('System', 'User', temperature=0.3)
-        self.assertEqual(result, {'ok': True})
-        payload = post.call_args.kwargs['json']
+        sdk = MagicMock()
+        client = sdk.Anthropic.return_value.__enter__.return_value
+        client.messages.create.return_value = SimpleNamespace(
+            stop_reason='end_turn', usage=None,
+            content=[SimpleNamespace(type='text', text='Completed')])
+        with patch.dict('sys.modules', {'anthropic':sdk}):
+            result = ClaudeClient('synthetic-test-key').generate('System', 'User', temperature=0.3)
+        self.assertEqual(result, 'Completed')
+        payload = client.messages.create.call_args.kwargs
         self.assertNotIn('temperature', payload)
         self.assertNotIn('top_p', payload)
         self.assertNotIn('top_k', payload)
         self.assertEqual(payload['model'], 'claude-sonnet-5')
         self.assertEqual(payload['messages'], [{'role': 'user', 'content': 'User'}])
-        self.assertEqual(post.call_count, 1)
+        self.assertEqual(client.messages.create.call_count, 1)
