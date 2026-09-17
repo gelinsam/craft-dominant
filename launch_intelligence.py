@@ -157,7 +157,7 @@ def build_report(db_path=None, today=None):
       'status':'provisional','editions':editions,'profile_review':'Six profiles reviewed September 16, 2026. Current grids and captions are references, not original creative version history.',
       'coverage':'Candidate campaign names plus delivery windows; not audited attribution. Live stored ticket data. Gross revenue is not incremental ROAS.',
       'creative_caution':'Current Meta creative may have replaced the original. Original post dates must be checked on Instagram.',
-      'candidate_count':history.get('candidate_count',0)+nyc.get('candidate_count',0),
+      'candidate_count':len({(c.get('account_id'),c.get('campaign',{}).get('id')) for c in campaigns}),
       'request_errors':sum(bool(c.get('errors')) for c in campaigns),
       'execution_allowed':False}
 
@@ -198,5 +198,5 @@ def refresh_history():
             item.update(campaign=c,candidate_cities=cities,days=list(merged.values()),errors=[])
             keyed[key]=item
     value={**old,'campaigns':list(keyed.values()),'candidate_count':len(keyed),'collected_at':now.isoformat(),'until':now.date().isoformat()}
-    atomic_json(path,value)
+    atomic_json(path,value,max_bytes=40_000_000)
     return {'status':'refreshed','campaigns':len(keyed)}
