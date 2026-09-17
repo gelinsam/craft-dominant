@@ -459,3 +459,6 @@ from test_launch_intelligence import LaunchEvidenceTests, LaunchCoverageTests
 
 
 from test_launch_evidence import TestLaunchEvidence
+
+
+from test_launch_action_packs import TestLaunchActionPacks
