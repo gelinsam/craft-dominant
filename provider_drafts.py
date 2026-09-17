@@ -113,6 +113,12 @@ def build_copy(event, brief):
     if not url.startswith('https://www.eventbrite.com/e/') or any('[' in s or ']' in s for s in [subject, *text]):
         raise ValueError('Finished copy and verified ticket link required')
     e = html.escape
+    if 'reviewed_html' in brief:
+        body = brief['reviewed_html']
+        required = ('*|UNSUB|*', '*|LIST:ADDRESS|*', e(url, quote=True))
+        if not isinstance(body, str) or not all(token in body for token in required):
+            raise ValueError('Reviewed creative needs its ticket link and compliance footer')
+        return subject, body
     body = '<!doctype html><html><body style="margin:0;background:#f4f2ed;color:#262626;font-family:Arial,sans-serif"><div style="max-width:600px;margin:24px auto;padding:36px;background:white">'
     if brief.get('image_url', '').startswith('https://img.evbuc.com/'):
         body += '<img src="'+e(brief['image_url'],quote=True)+'" alt="'+e(name,quote=True)+'" width="528" style="display:block;width:100%;height:auto;margin-bottom:28px">'

@@ -65,6 +65,16 @@ class ProviderDraftTests(unittest.TestCase):
         self.prepare();self.client.content['html']='Owner changed this';self.client.calls=[]
         self.assertEqual(self.prepare()['state'],'user_edited')
         self.assertTrue(all(x[0]=='GET' for x in self.client.calls))
+    def test_reviewed_photo_creative_survives_audience_refresh(self):
+        creative='<html><img src="https://example.com/festival.jpg"><a href="'+BRIEF['ticket_url']+'">Tickets</a>*|UNSUB|* *|LIST:ADDRESS|*</html>'
+        with patch.dict(BRIEF, {'reviewed_html':creative}):
+            self.prepare();self.prepare()
+        self.assertEqual(self.client.content['html'],creative)
+        self.assertEqual(self.client.created,1)
+    def test_invalid_reviewed_creative_does_not_fall_back(self):
+        with patch.dict(BRIEF, {'reviewed_html':'<p>No ticket link or unsubscribe</p>'}):
+            with self.assertRaisesRegex(ValueError,'Reviewed creative'):self.prepare()
+        self.assertEqual(self.client.created,0)
     def test_incomplete_sales_never_creates(self):
         with patch('provider_drafts.current_buyers',side_effect=ValueError('Current buyer verification unavailable')):
             with self.assertRaisesRegex(ValueError,'buyer verification'):self.prepare()
