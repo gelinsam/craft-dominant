@@ -19,8 +19,8 @@ PROFILES = {'Dallas':'dallascoffeefest','San Diego':'sandiegocoffeefest',
 NAMES = {'Dallas':'Dallas Coffee Festival','San Diego':'San Diego Coffee Festival',
  'Philadelphia':'Philly Coffee Festival','Washington':'DC Coffee Festival',
  'Seattle':'Seattle Coffee Festival','New York':'NYC Coffee Festival'}
-PATTERNS = {'Dallas':r'dallas|dalcf','San Diego':r'san diego|sdcf',
- 'Philadelphia':r'philly|philadelphia|\bpcf\b','Washington':r'dccf|dc coffee',
+PATTERNS = {'Dallas':r'dallas|dalcf','San Diego':r'san diego|sdcf|\bsd\b',
+ 'Philadelphia':r'philly|philadelphia|\bpcf(?:\d{2})?\b','Washington':r'dccf|dc coffee',
  'Seattle':r'seattle|seacf','New York':r'nyc|new york'}
 PHASES = [('Launch / 91+ days',91,10000),('Build / 61–90 days',61,90),
  ('Build / 31–60 days',31,60),('Close / 15–30 days',15,30),
@@ -75,7 +75,8 @@ def summarize(edition, sales, campaigns, coverage_start):
         if c.get('candidate_cities') != [edition['city']]: continue
         name=c.get('campaign',{}).get('name','')
         # A city name alone is insufficient for coffee assignment.
-        if not re.search(r'coffee|dalcf|sdcf|dccf|seacf|\bpcf\b|seattle engagement',name,re.I): continue
+        identity = name + ' ' + json.dumps(c.get('ads', []))
+        if not re.search(r'coffee|dalcf|sdcf|dccf|seacf|\bpcf(?:\d{2})?\b|seattle engagement|san diego engagement',identity,re.I): continue
         years=set(re.findall(r'(?<!\d)20\d{2}(?!\d)',name))
         if years and str(start.year) not in years: continue
         days=[d for d in c.get('days',[]) if lower<d.get('date_start','')<=end and number(d.get('spend')) is not None]
@@ -132,7 +133,12 @@ def build_report(db_path=None, today=None):
                 sales=[dict(r) for r in con.execute(f'SELECT substr(order_timestamp,1,10) date,SUM(ticket_count) tickets,SUM(gross_amount) revenue,SUM(ticket_count IS NULL) unknown_tickets,SUM(gross_amount IS NULL) unknown_revenue FROM orders WHERE event_id IN ({marks}) GROUP BY 1 ORDER BY 1',e['event_ids'])]
                 editions.append(summarize(e,sales,campaigns,history.get('since')))
     finally: con.close()
+    refs=read_snapshot('coffee-instagram-references.json')
+    ref_keys={'Dallas':'dallas','San Diego':'sandiego','Philadelphia':'philly','Washington':'dc','Seattle':'seattle','New York':'nyc'}
     for e in editions:
+        candidates=refs.get(ref_keys[e['city']],[])
+        if e['city']=='New York': candidates=candidates[:17]  # Reviewed current relaunch posts, excluding legacy 2017 rows.
+        e['instagram_references']=[r for r in candidates if isinstance(r,dict) and re.match(r'^https://www\.instagram\.com/'+PROFILES[e['city']]+r'/(p|reel)/[\w-]+/$',r.get('url',''))]
         if e['completed']: continue
         peers=[p for p in editions if p['completed'] and p['lifecycle']=='first launch' and p['tickets'] and not p['unknown_tickets']]
         comparison=[]
