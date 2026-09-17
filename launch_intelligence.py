@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from zoneinfo import ZoneInfo
 
 FIRST = {'Dallas': 2025, 'San Diego': 2024, 'Philadelphia': 2024,
          'Washington': 2023, 'Seattle': 2025}
@@ -113,7 +114,7 @@ def summarize(edition, sales, campaigns, coverage_start):
 
 
 def build_report(db_path=None, today=None):
-    today=today or date.today(); db_path=db_path or os.environ.get('DB_PATH','craft_unified.db')
+    today=today or datetime.now(ZoneInfo('America/New_York')).date(); db_path=db_path or os.environ.get('DB_PATH','craft_unified.db')
     history=read_snapshot('coffee-launch-history.json'); nyc=read_snapshot('nyc-launch-history.json')
     campaigns=history.get('campaigns',[])+nyc.get('campaigns',[])
     con=sqlite3.connect('file:'+str(Path(db_path).resolve())+'?mode=ro',uri=True); con.row_factory=sqlite3.Row

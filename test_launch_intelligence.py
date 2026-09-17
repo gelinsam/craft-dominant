@@ -28,3 +28,13 @@ class LaunchEvidenceTests(unittest.TestCase):
         self.assertTrue(summarize(self.e,[],[],'2025-09-01')['warnings'])
 
 if __name__=='__main__':unittest.main()
+
+class LaunchCoverageTests(unittest.TestCase):
+    def test_all_unknown_is_not_zero(self):
+        e={'city':'Seattle','date':'2025-10-25','end_date':'2025-10-25'}
+        r=summarize(e,[{'date':'2025-09-01','tickets':None,'revenue':None,'unknown_tickets':1,'unknown_revenue':1}],[],None)
+        self.assertIsNone(r['tickets']);self.assertIsNone(r['revenue'])
+    def test_future_phase_is_not_observed_zero(self):
+        e={'city':'Seattle','date':'2025-10-25','end_date':'2025-10-25','days_out':20}
+        r=summarize(e,[],[],None)
+        self.assertTrue(r['phases'][-1]['not_reached']);self.assertIsNone(r['phases'][-1]['tickets'])
