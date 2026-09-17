@@ -91,13 +91,13 @@ class ProviderDraftTests(unittest.TestCase):
     def test_pagination_truncation_rejected(self):
         c=SimpleNamespace(_request_strict=lambda *a,**k:SimpleNamespace(body={'members':[],'total_items':3}))
         with self.assertRaises(ValueError):p.page_all(c,'/members','members')
-    def test_links_owner_scheduled_work_without_adopting_or_changing_it(self):
+    def test_scheduled_campaign_does_not_prevent_next_draft(self):
         self.client.campaign={'id':'c','web_id':123,'status':'schedule','settings':{'title':'Owner campaign','subject_line':'Owner subject'},'recipients':{'list_id':self.client.audience_id}}
         self.client.content={'html':'<a href="https://www.eventbrite.com/e/festival-123">Tickets</a>'}
         result=self.prepare()
-        self.assertEqual(result['state'],'covered_by_scheduled')
-        self.assertNotIn('campaign_id',result)
-        self.assertTrue(all(c[0]=='GET' for c in self.client.calls))
+        self.assertEqual(result['state'],'ready')
+        self.assertEqual(self.client.created,1)
+        self.assertEqual(result['audience_count'],1)
 
     def test_live_buyer_is_removed_even_if_crm_snapshot_is_older(self):
         with patch('provider_drafts.current_buyers',return_value={'a@example.com'}):

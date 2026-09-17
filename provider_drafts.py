@@ -63,26 +63,17 @@ def eligible_members(client, campaigns, now):
     reserved, recent = set(), set()
     for campaign in campaigns:
         cid, status = campaign['id'], campaign['status']
-        if status in ('schedule', 'sending'):
-            # Conservatively reserve all destination members when the provider's
-            # scheduled segment cannot be reproduced, rather than invent coverage.
-            recipients = campaign.get('recipients', {})
-            list_id = recipients.get('list_id')
-            if not list_id:
-                raise ValueError('Scheduled campaign has unresolved audience')
-            segment_id = recipients.get('segment_opts',{}).get('saved_segment_id')
-            path = f'/lists/{list_id}/segments/{segment_id}/members' if segment_id else f'/lists/{list_id}/members?status=subscribed'
-            selected = page_all(client, path, 'members')
-            reserved.update(email_key(m['email_address']) for m in selected)
-        elif status == 'sent' and campaign.get('send_time'):
+        # Scheduled recipients may receive a later owner-reviewed campaign.
+        # Scheduling is context, not an exclusion from draft preparation.
+        if status == 'sent' and campaign.get('send_time'):
             sent = datetime.fromisoformat(campaign['send_time'].replace('Z', '+00:00'))
             if now - sent < timedelta(days=7):
                 activity = page_all(client, f'/reports/{cid}/email-activity', 'emails')
                 for member in activity:
                     if any(a.get('action') in ('sent', 'open', 'click') for a in member.get('activity', [])):
                         recent.add(email_key(member['email_address']))
-    return eligible - reserved - recent, {'provider_subscribed':len(eligible),
-        'reserved_scheduled':len(eligible & reserved), 'recent_contacted':len(eligible & recent)}
+    return eligible - recent, {'provider_subscribed':len(eligible),
+        'scheduled_campaigns':sum(c.get('status') in ('schedule','sending') and c.get('recipients',{}).get('list_id') == client.audience_id for c in campaigns), 'recent_contacted':len(eligible & recent)}
 
 
 def current_buyers(db, siblings):
@@ -176,25 +167,7 @@ def prepare_one(db, brief, client, state, save, now):
     eligible, counts = eligible_members(client, campaigns, now)
     recipients = sorted({r['email'] for r in candidates['records']} & eligible - buyers)
     if not recipients:
-        entry.update(state='no_audience', reason='No eligible recipients remain after current buyers and scheduled campaigns are excluded.', verified_at=now.isoformat(),counts=counts)
-        # Link relevant owner-scheduled work without adopting it as an owned draft.
-        for scheduled in campaigns:
-            if scheduled['status'] not in ('schedule','sending') or scheduled.get('recipients',{}).get('list_id') != client.audience_id:
-                continue
-            saved = client._request_strict('GET',f'/campaigns/{scheduled["id"]}/content').body
-            from html.parser import HTMLParser
-            from urllib.parse import urlsplit
-            links=[]
-            class Links(HTMLParser):
-                def handle_starttag(self,tag,attrs):
-                    if tag=='a': links.extend(v for k,v in attrs if k=='href')
-            Links().feed(saved.get('html',''))
-            parent=brief['ticket_url'].rsplit('/',1)[-1]
-            if any(urlsplit(u).hostname in ('www.eventbrite.com','eventbrite.com') and urlsplit(u).path.startswith('/e/') and urlsplit(u).path.rstrip('/').rsplit('/',1)[-1].rsplit('-',1)[-1] == parent for u in links):
-                entry.update(state='covered_by_scheduled',reason='Your campaign is already scheduled. No overlapping draft was added.',
-                    subject=scheduled.get('settings',{}).get('subject_line'),
-                    url=f'https://{client.dc}.admin.mailchimp.com/campaigns/edit?id={scheduled["web_id"]}')
-                break
+        entry.update(state='no_audience', reason='No eligible recipients remain after current buyers and recent contacts are excluded.', verified_at=now.isoformat(),counts=counts)
         save(); return entry
     if (datetime.now(timezone.utc)-now).total_seconds()>3600:
         raise ValueError('Preparation evidence expired')
