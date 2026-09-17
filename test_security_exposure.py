@@ -297,3 +297,5 @@ from test_ready_posts import ReadyPostTests, ReadyPostBoundaryTests
 
 
 from test_tracking_readiness import TrackingReadinessTests
+
+from test_sales_evidence import SalesEvidenceTests, SalesSyncReceiptIntegrationTests

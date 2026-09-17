@@ -1931,12 +1931,16 @@ class EventbriteSync:
             # Never log provider bodies: they may echo credentials or PII.
             raise RuntimeError(f"Eventbrite API error {response.status_code}")
         return response.json()
-    def _paginate(self, endpoint: str, params: dict = None) -> List[dict]:
+    def _paginate(self, endpoint: str, params: dict = None, require_complete: bool = False) -> List[dict]:
         params = dict(params or {})
         results = []
         seen = set()
         while True:
             response = self._get(endpoint, params)
+            if require_complete and (not isinstance(response.get('orders'), list) or
+                    not isinstance(response.get('pagination'), dict) or
+                    not isinstance(response['pagination'].get('has_more_items'), bool)):
+                raise RuntimeError('Eventbrite order pagination completeness is unverified')
             for key in ['events', 'orders', 'attendees', 'organizations']:
                 if key in response:
                     results.extend(response[key])
@@ -1962,7 +1966,7 @@ class EventbriteSync:
         return self._org_id
     def sync_all(self, years_back: int = 2) -> dict:
         """Sync everything: events, orders, build snapshots and customers."""
-        results = {'events': 0, 'orders': 0, 'customers': 0, 'curves': 0, 'errors': []}
+        results = {'events': 0, 'orders': 0, 'customers': 0, 'curves': 0, 'errors': [], 'event_evidence': []}
         cutoff = datetime.now() - timedelta(days=years_back * 365)
         # Integrity probe. Stored ticket totals essentially never fall, so a
         # material drop across a sync means a write destroyed data rather than
@@ -1997,11 +2001,19 @@ class EventbriteSync:
                 results['events'] += 1
                 # Get orders
                 log.info(f"  Syncing: {event['name']}")
-                orders = self._paginate(f"/events/{event['event_id']}/orders/", {'expand': 'attendees'})
+                receipt = {'event_id': str(event['event_id']), 'status': 'incomplete'}
+                results['event_evidence'].append(receipt)
+                from datetime import timezone as utc_timezone
+                read_started = datetime.now(utc_timezone.utc).isoformat()
+                parsed_ids = []
+                fields_observed = True
+                orders = self._paginate(f"/events/{event['event_id']}/orders/", {'expand': 'attendees'}, require_complete=True)
                 for order_data in orders:
                     order = self._parse_order(order_data, event['event_id'], event_date)
                     if order:
                         self.db.insert_order(order)
+                        parsed_ids.append(str(order['order_id']))
+                        fields_observed = fields_observed and order.get('ticket_count') is not None and order.get('gross_amount') is not None
                         results['orders'] += 1
                 # Build snapshots for completed events
                 if event['status'] == 'completed':
@@ -2013,6 +2025,9 @@ class EventbriteSync:
                     stored = self.db.get_event(event['event_id']) or event
                     self._build_snapshots(event['event_id'], event_date.date(),
                                           stored.get('capacity') or 0)
+                from sales_evidence import event_receipt
+                receipt.update(event_receipt(self.db, event['event_id'], len(orders),
+                    parsed_ids, tickets_before.get(event['event_id'], 0), read_started, fields_observed))
             except Exception as e:
                 results['errors'].append(str(e))
                 log.error(f"  Error: {e}")
@@ -4331,11 +4346,14 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                     # A traversal may catch per-event failures and still return.
                     # Such a run is not complete sales evidence for measurement.
                     integrity['event_errors'] = len(result.get('errors') or [])
-                    warnings = (integrity['event_errors'] or
+                    integrity['incomplete_events'] = sum(r.get('status') != 'complete' for r in result.get('event_evidence', []))
+                    warnings = (integrity['event_errors'] or integrity['incomplete_events'] or
                                 integrity.get('events_with_ticket_loss') or
                                 integrity.get('orders_with_unknown_ticket_count'))
                     status = 'completed_with_integrity_warnings' if warnings else 'completed'
                     db.finish_sync_run(run_id, status, json.dumps(integrity)[:500] or None)
+                    from sales_evidence import save_evidence
+                    save_evidence(result, db.last_sync_run('eventbrite') or {})
                 except Exception as exc:
                     log.warning(f"Could not record sync run finish: {exc}")
             _sync_state['done'] = True
