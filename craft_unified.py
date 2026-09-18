@@ -2853,11 +2853,28 @@ class MetaAdsSync:
                     time.sleep(2 ** attempt)
         raise RuntimeError("Meta API retry budget exhausted") from None
 
-    @staticmethod
-    def _extract_year(text: str) -> Optional[int]:
-        """Extract a 4-digit year (2020-2039) from text, or None."""
-        m = re.search(r'\b(20[2-3]\d)\b', text)
-        return int(m.group(1)) if m else None
+    @classmethod
+    def _campaign_tokens(cls, text: str) -> str:
+        """Expand only registered aliases with a complete year suffix.
+
+        SFCF26 is a real campaign name. Arbitrary city words, numeric IDs,
+        variant numbers and embedded substrings must not become new aliases.
+        """
+        words = cls._tokenize_name(text).split()
+        expanded = []
+        for word in words:
+            match = re.fullmatch(r'([a-z]+)(20[2-3]\d|[2-3]\d)', word)
+            if match and match[1] in cls.EVENT_ALIASES:
+                expanded.extend((match[1], str(2000 + int(match[2]) % 100)))
+            else:
+                expanded.append(word)
+        return ' '.join(expanded)
+
+    @classmethod
+    def _extract_year(cls, text: str) -> Optional[int]:
+        """Return one unambiguous explicit or registered-alias year."""
+        years = set(re.findall(r'\b(20[2-3]\d)\b', cls._campaign_tokens(text)))
+        return int(next(iter(years))) if len(years) == 1 else None
 
     @staticmethod
     def _tokenize_name(text: str) -> str:
@@ -2908,8 +2925,8 @@ class MetaAdsSync:
         3. A known abbreviation appears as whole word in campaign name
         4. Reverse alias: campaign contains abbreviation that maps to this event
 
-        Year safety rule: if the campaign name contains a 4-digit year, it must
-        match the event's year.  If the campaign has no year but the event does,
+        Year safety rule: explicit years and known alias suffixes must
+        match the event's year. Conflicting years are rejected. If the campaign has no year but the event does,
         name-matching proceeds but the caller decides edition preference.
 
         Returns the match reason string, or None if no match.
@@ -2932,13 +2949,14 @@ class MetaAdsSync:
             return None
 
         # --- Year gate ---
-        campaign_year = self._extract_year(campaign_name)
+        cname_clean = self._campaign_tokens(campaign_name)
+        years = set(re.findall(r'\b(20[2-3]\d)\b', cname_clean))
+        if len(years) > 1:
+            return None  # Conflicting year evidence needs review, never a guess.
+        campaign_year = int(next(iter(years))) if years else None
         if campaign_year is not None and event_year is not None:
             if campaign_year != event_year:
                 return None  # Hard reject: explicit year mismatch
-
-        cname = campaign_name.lower()
-        cname_clean = self._tokenize_name(cname)
 
         match_reason = None
         strategy = None
@@ -2961,7 +2979,10 @@ class MetaAdsSync:
                 # attributed to DC. Prefix still absorbs the plurals and
                 # possessives this was written for — austin/austins,
                 # philly/phillys — without reaching into the middle of acronyms.
-                if all(any(cword.startswith(cw) for cword in cname_words_set)
+                # Short city tokens must be exact: DCF is Dallas, so a
+                # prefix match on DC would steal Dallas coffee spend.
+                if all(any(cword == cw or (len(cw) > 3 and cword.startswith(cw))
+                           for cword in cname_words_set)
                        for cw in content_words):
                     match_reason = f"all content words {content_words}"
                     strategy = 'content_words'
@@ -2979,7 +3000,7 @@ class MetaAdsSync:
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
         if not match_reason:
             event_lower = event_name.lower()
-            cname_words = set(self._tokenize_name(cname).split())
+            cname_words = set(cname_clean.split())
             for word in cname_words:
                 if word in self.EVENT_ALIASES:
                     for pattern in self.EVENT_ALIASES[word]:
