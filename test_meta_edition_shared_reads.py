@@ -583,4 +583,4 @@ class TestPortfolioTargetCountReuse(unittest.TestCase):
                     counts[("coffee", "Austin")] = 13
                     self.assertEqual(engine.analyze_event("a1").high_value_targets, 13)
             finally:
-                db.close()
+                db.conn.close()
