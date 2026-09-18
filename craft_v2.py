@@ -222,6 +222,8 @@ def _build_app():
 
     from tracking_readiness import refresh_tracking
     app.extensions["craft_maintenance"].append(("Tracking verification", refresh_tracking))
+    from meta_purchase_outcomes import refresh_purchase_outcomes
+    app.extensions["craft_maintenance"].append(("Meta purchase reporting", lambda: refresh_purchase_outcomes(db)))
 
     @app.get("/api/intelligence/tracking")
     @require_command_auth
