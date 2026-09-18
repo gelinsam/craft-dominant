@@ -2008,13 +2008,18 @@ class EventbriteSync:
                 parsed_ids = []
                 fields_observed = True
                 orders = self._paginate(f"/events/{event['event_id']}/orders/", {'expand': 'attendees'}, require_complete=True)
-                for order_data in orders:
-                    order = self._parse_order(order_data, event['event_id'], event_date)
-                    if order:
-                        self.db.insert_order(order)
-                        parsed_ids.append(str(order['order_id']))
-                        fields_observed = fields_observed and order.get('ticket_count') is not None and order.get('gross_amount') is not None
-                        results['orders'] += 1
+                # Fetch the complete provider page series before taking a write
+                # lock. Reuse the existing transaction boundary so a large event
+                # performs one durable commit, not one fsync for every order.
+                # A failed parse/write restores the previous event order data.
+                with self.db.deferred_commit():
+                    for order_data in orders:
+                        order = self._parse_order(order_data, event['event_id'], event_date)
+                        if order:
+                            self.db.insert_order(order)
+                            parsed_ids.append(str(order['order_id']))
+                            fields_observed = fields_observed and order.get('ticket_count') is not None and order.get('gross_amount') is not None
+                results['orders'] += len(parsed_ids)
                 # Build snapshots for completed events
                 if event['status'] == 'completed':
                     # Read the MERGED row back. `event` is parse output, which
