@@ -528,3 +528,59 @@ class TestGroupedDashboardTruth(_Fixture):
         self.db.upsert_event(event)
         self.assertFalse(EventbriteSync._is_junk_event(event['name']))
         self.assertIsNotNone(DecisionEngine(self.db).analyze_event(event['event_id']))
+
+
+class TestPortfolioTargetCountReuse(unittest.TestCase):
+    def test_counts_are_equivalent_scoped_and_discarded_after_each_read(self):
+        from unittest.mock import patch
+        from dataclasses import asdict
+        from craft_unified import DecisionEngine
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(os.path.join(folder, "counts.db"))
+            try:
+                day = (datetime.date.today() + datetime.timedelta(days=90)).isoformat()
+                for eid, city, kind, name in [
+                    ("a1", "Austin", "coffee", "Austin Coffee Festival"),
+                    ("a2", "Austin", "coffee", "Austin Coffee Festival"),
+                    ("s1", "Seattle", "coffee", "Seattle Coffee Festival"),
+                    ("s2", "Seattle", "coffee", "Seattle Coffee Festival"),
+                    ("c1", "Austin", "cocktail", "Austin Cocktail Festival"),
+                ]:
+                    db.upsert_event(dict(event_id=eid, name=name, city=city,
+                                         event_type=kind, event_date=day,
+                                         capacity=100, status="live"))
+                counts = {("coffee", "Austin"): 3, ("coffee", "Seattle"): 7,
+                          ("cocktail", "Austin"): 11}
+                def high(**kwargs):
+                    self.assertEqual(kwargs["min_ltv"], 50)
+                    self.assertEqual(kwargs["limit"], 1000)
+                    return [None] * counts[(kwargs["event_type"], kwargs["city"])]
+                engine = DecisionEngine(db)
+                with patch.object(db, "get_high_value_customers", side_effect=high) as hv, \
+                     patch.object(db, "get_at_risk_customers", return_value=[None]*4) as risk:
+                    original = engine.analyze_event
+                    # Reference behavior: every session fetches its own counts.
+                    with patch.object(engine, "analyze_event",
+                                      side_effect=lambda eid, **kw: original(eid)):
+                        reference = [asdict(x) for x in engine.analyze_portfolio()]
+                    self.assertEqual(risk.call_count, 5)
+                    hv.reset_mock(); risk.reset_mock()
+                    actual = [asdict(x) for x in engine.analyze_portfolio()]
+                    self.assertEqual(actual, reference)
+                    self.assertEqual(hv.call_count, 3)
+                    self.assertEqual(risk.call_count, 1)
+                    risk.assert_called_once_with(min_orders=2, min_days_inactive=180)
+                    # A later read must observe changed eligibility/counts.
+                    counts[("coffee", "Austin")] = 9
+                    risk.return_value = [None]*2
+                    again = engine.analyze_portfolio()
+                    self.assertEqual(risk.call_count, 2)
+                    self.assertEqual(hv.call_count, 6)
+                    self.assertTrue(any(x.high_value_targets == 9 for x in again))
+                    # Standalone reads never reuse a prior request's count.
+                    counts[("coffee", "Austin")] = 12
+                    self.assertEqual(engine.analyze_event("a1").high_value_targets, 12)
+                    counts[("coffee", "Austin")] = 13
+                    self.assertEqual(engine.analyze_event("a1").high_value_targets, 13)
+            finally:
+                db.close()

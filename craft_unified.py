@@ -3629,7 +3629,7 @@ class DecisionEngine:
         """Clear caches at start of portfolio analysis."""
         self._all_events_cache = None
         self._pattern_cache = {}
-    def analyze_event(self, event_id: str) -> Optional[EventPacing]:
+    def analyze_event(self, event_id: str, _target_counts=None) -> Optional[EventPacing]:
         """Ticket-count based analysis. Compares raw tickets sold at N days out
         against historical ticket counts at the same days-out for past editions."""
         event = self.db.get_event(event_id)
@@ -3738,10 +3738,20 @@ class DecisionEngine:
             spend_status=spend_status
         )
         # Targeting
-        high_value = len(self.db.get_high_value_customers(
-            event_type=event.get('event_type'), city=event.get('city'), min_ltv=50, limit=1000
-        ))
-        at_risk = len(self.db.get_at_risk_customers(min_orders=2, min_days_inactive=180))
+        # These counts depend on affinity, not the timed-entry session.
+        # Share them only within this portfolio read; never retain customer
+        # eligibility/counts across refreshes or standalone event reads.
+        target_counts = {} if _target_counts is None else _target_counts
+        affinity = ('high_value', event.get('event_type'), event.get('city'))
+        if affinity not in target_counts:
+            target_counts[affinity] = len(self.db.get_high_value_customers(
+                event_type=event.get('event_type'), city=event.get('city'),
+                min_ltv=50, limit=1000))
+        if 'at_risk' not in target_counts:
+            target_counts['at_risk'] = len(self.db.get_at_risk_customers(
+                min_orders=2, min_days_inactive=180))
+        high_value = target_counts[affinity]
+        at_risk = target_counts['at_risk']
         return EventPacing(
             event_id=event_id, event_name=event['name'],
             event_date=event['event_date'], days_until=days_until,
@@ -4089,8 +4099,9 @@ class DecisionEngine:
         self._invalidate_cache()
         events = self.db.get_events(upcoming_only=True)
         analyses = []
+        target_counts = {}
         for event in events:
-            analysis = self.analyze_event(event['event_id'])
+            analysis = self.analyze_event(event['event_id'], _target_counts=target_counts)
             if analysis:
                 analyses.append(analysis)
         timed_groups = self._detect_timed_entry_groups(analyses)
