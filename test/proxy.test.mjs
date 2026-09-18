@@ -334,3 +334,23 @@ describe('encoded characters in the query string are data, not routing', () => {
     assert.equal(reached, null);
   });
 });
+
+describe('bounded recommendation reads', () => {
+  test('only full action-plan analysis gets the longer deadline', async () => {
+    const original = globalThis.setTimeout;
+    try {
+      for (const [path, expected] of [
+        ['api/intelligence/action-plan', 50000],
+        ['api/intelligence/action-plan/other', 30000],
+        ['api/customers', 30000],
+      ]) {
+        let delay;
+        globalThis.setTimeout = (fn, ms) => { delay = ms; return original(fn, ms); };
+        const res = await call({path}, {fetchImpl: spyFetch()});
+        assert.equal(res.statusCode, 200);
+        assert.equal(delay, expected);
+      }
+      assert.equal(mod.config.maxDuration, 60);
+    } finally { globalThis.setTimeout = original; }
+  });
+});

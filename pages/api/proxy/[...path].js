@@ -37,6 +37,8 @@
  * None of these is a substitute for the human boundary above.
  */
 
+export const config = { maxDuration: 60 };
+
 const DEFAULT_BACKEND = 'https://craft-dominant-production.up.railway.app';
 
 // Only what the dashboard actually calls. Verified against pages/index.js and
@@ -162,7 +164,9 @@ export default async function handler(req, res) {
   const qs = incoming.searchParams.toString();
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  // Full portfolio diagnosis can take over 30 seconds during ticket imports.
+  const timeoutMs = path === 'api/intelligence/action-plan' ? 50000 : 30000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     // Belt and braces: resolve the destination and confirm it is still the
