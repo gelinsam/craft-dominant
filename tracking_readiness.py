@@ -61,6 +61,7 @@ def refresh_tracking(factory=None, now=None):
 
 
 def tracking_report(db, now=None):
+    from meta_purchase_outcomes import purchase_report
     now = now or datetime.now(timezone.utc)
     imported = registry()
     observations = read_json(root()/'tracking-observations.json') or {}
@@ -96,6 +97,7 @@ def tracking_report(db, now=None):
             pending.append({'event_id': eid, 'name': event.get('name'), 'event_date': event.get('event_date'),
                             'reason': 'No imported tracking reference for this edition; confirm setup before assuming purchase tracking.'})
     return {'registrations': rows, 'upcoming_without_reference': pending,
+            'purchase_outcomes': purchase_report(now),
             'source': 'Imported retired tracker setup claims, checked against existing event records and read-only Meta observations.',
             'observed_at': observations.get('observed_at'),
             'caution': 'Pixel visibility or a recent event does not verify browser installation, Eventbrite CAPI purchase delivery, deduplication or attribution.',
