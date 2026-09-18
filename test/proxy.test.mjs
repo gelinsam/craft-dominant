@@ -182,6 +182,8 @@ describe('the allowlist matches what the dashboard actually calls', () => {
   const pageSources = readdirSync(join(root, 'pages'))
     .filter((f) => f.endsWith('.js'))
     .map((f) => readFileSync(join(root, 'pages', f), 'utf8'))
+    // The homepage delegates its validated read to this imported helper.
+    .concat(readFileSync(join(root, 'lib', 'dashboard-read.mjs'), 'utf8'))
     .join('\n');
 
   test('every call site in the dashboard is covered by the allowlist', () => {
