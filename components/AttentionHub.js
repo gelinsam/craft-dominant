@@ -1,33 +1,24 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import PreparedEmails from './PreparedEmails';
 import CampaignIntelligence from './CampaignIntelligence';
-import { summarizeCommand } from '../lib/attention.mjs';
+import { startAttentionPolling } from '../lib/attention.mjs';
 
-export default function AttentionHub({ expanded, onOpen, refreshKey }) {
+export default function AttentionHub({ expanded, onOpen }) {
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [retry, setRetry] = useState(0);
+  const refresh = useRef(null);
   useEffect(() => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    let active = true;
-    setLoading(true);
-    setError(false);
-    // A failed refresh must not leave old recommendations looking current.
-    setSummary(null);
-    fetch('/api/proxy/api/intelligence/action-plan', { cache: 'no-store', signal: controller.signal })
-      .then(async res => {
-        if (!res.ok) throw new Error('Intelligence unavailable');
-        return summarizeCommand(await res.json());
-      })
-      .then(result => { if (active) setSummary(result); })
-      .catch(() => { if (active) setError(true); })
-      .finally(() => { clearTimeout(timeout); if (active) setLoading(false); });
-    return () => { active = false; clearTimeout(timeout); controller.abort(); };
-  }, [refreshKey, retry]);
-
-  useEffect(() => { const timer=setInterval(() => { if(document.visibilityState==='visible') setRetry(n=>n+1); },60000); return () => clearInterval(timer); }, []);
+    const polling = startAttentionPolling({
+      onChange(update) {
+        if ('summary' in update) setSummary(update.summary);
+        if ('error' in update) setError(update.error);
+        if ('loading' in update) setLoading(update.loading);
+      },
+    });
+    refresh.current = polling.refresh;
+    return () => { refresh.current = null; polling.stop(); };
+  }, []);
   const opportunities = summary?.opportunities || [];
   const message = loading ? 'Checking opportunities…' : error ? 'Recommendations unavailable — pacing remains below'
     : opportunities.length ? `${opportunities.length} pacing ${opportunities.length === 1 ? 'opportunity' : 'opportunities'}`
@@ -47,7 +38,7 @@ export default function AttentionHub({ expanded, onOpen, refreshKey }) {
       <div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">What needs attention now</h2>
-          <div className="flex gap-4 text-sm"><button disabled={loading} onClick={() => setRetry(n => n + 1)} className="text-blue-700 disabled:text-gray-400">Refresh recommendations</button><a href="/command" className="font-medium text-blue-700">Open Command Center →</a></div>
+          <div className="flex gap-4 text-sm"><button disabled={loading} onClick={() => refresh.current?.()} className="text-blue-700 disabled:text-gray-400">Refresh recommendations</button><a href="/command" className="font-medium text-blue-700">Open Command Center →</a></div>
         </div>
         <p className="mt-1 text-sm text-slate-500">Ranked by Craft using its existing diagnosis and latest stored sales data, with one action per festival edition. Refreshes every minute while open. Use Refresh Data above to sync sales. Recovery estimates are modeled, not measured results.</p>
         {error && <p role="alert" className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900">Recommendations could not be loaded. Try refreshing; this does not mean every festival is on track.</p>}
