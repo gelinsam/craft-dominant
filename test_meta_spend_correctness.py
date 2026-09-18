@@ -396,7 +396,7 @@ class TestEventPacingSpendStatus(unittest.TestCase):
 
 
 class TestYearExtraction(unittest.TestCase):
-    """Test MetaAdsSync._extract_year() static method."""
+    """Test unambiguous campaign year extraction."""
 
     def test_extracts_4digit_year(self):
         self.assertEqual(MetaAdsSync._extract_year("Austin Coffee Festival 2026"), 2026)
@@ -418,9 +418,9 @@ class TestYearExtraction(unittest.TestCase):
         self.assertIsNone(MetaAdsSync._extract_year("Campaign 1234"))
         self.assertIsNone(MetaAdsSync._extract_year("Budget 5000"))
 
-    def test_first_year_wins(self):
-        """When multiple years appear, first one is extracted."""
-        self.assertEqual(MetaAdsSync._extract_year("2025 to 2026 campaign"), 2025)
+    def test_conflicting_years_require_review(self):
+        """A cross-year name must not silently assign spend to its first year."""
+        self.assertIsNone(MetaAdsSync._extract_year("2025 to 2026 campaign"))
 
 
 class TestYearGate(unittest.TestCase):

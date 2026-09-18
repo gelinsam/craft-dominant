@@ -2072,13 +2072,14 @@ class EventbriteSync:
     JUNK_PATTERNS = [
         'vendor fee', 'vendor payment', 'payment link', 'vendor registration',
         'vendor', 'sponsor fee', 'sponsorship payment', 'booth fee',
-        'exhibitor fee', 'exhibitor registration', 'vendor app',
+        'exhibitor fee', 'exhibitor registration', 'exhibitor payment', 'vendor app',
         'test event', 'do not use', 'draft event'
     ]
-    def _is_junk_event(self, name: str) -> bool:
+    @classmethod
+    def _is_junk_event(cls, name: str) -> bool:
         """Filter out vendor fees, payment links, and other non-consumer events."""
         name_lower = name.lower().strip()
-        for pattern in self.JUNK_PATTERNS:
+        for pattern in cls.JUNK_PATTERNS:
             if pattern in name_lower:
                 return True
         return False
@@ -2858,11 +2859,28 @@ class MetaAdsSync:
                     time.sleep(2 ** attempt)
         raise RuntimeError("Meta API retry budget exhausted") from None
 
-    @staticmethod
-    def _extract_year(text: str) -> Optional[int]:
-        """Extract a 4-digit year (2020-2039) from text, or None."""
-        m = re.search(r'\b(20[2-3]\d)\b', text)
-        return int(m.group(1)) if m else None
+    @classmethod
+    def _campaign_tokens(cls, text: str) -> str:
+        """Expand only registered aliases with a complete year suffix.
+
+        SFCF26 is a real campaign name. Arbitrary city words, numeric IDs,
+        variant numbers and embedded substrings must not become new aliases.
+        """
+        words = cls._tokenize_name(text).split()
+        expanded = []
+        for word in words:
+            match = re.fullmatch(r'([a-z]+)(20[2-3]\d|[2-3]\d)', word)
+            if match and match[1] in cls.EVENT_ALIASES:
+                expanded.extend((match[1], str(2000 + int(match[2]) % 100)))
+            else:
+                expanded.append(word)
+        return ' '.join(expanded)
+
+    @classmethod
+    def _extract_year(cls, text: str) -> Optional[int]:
+        """Return one unambiguous explicit or registered-alias year."""
+        years = set(re.findall(r'\b(20[2-3]\d)\b', cls._campaign_tokens(text)))
+        return int(next(iter(years))) if len(years) == 1 else None
 
     @staticmethod
     def _tokenize_name(text: str) -> str:
@@ -2913,8 +2931,8 @@ class MetaAdsSync:
         3. A known abbreviation appears as whole word in campaign name
         4. Reverse alias: campaign contains abbreviation that maps to this event
 
-        Year safety rule: if the campaign name contains a 4-digit year, it must
-        match the event's year.  If the campaign has no year but the event does,
+        Year safety rule: explicit years and known alias suffixes must
+        match the event's year. Conflicting years are rejected. If the campaign has no year but the event does,
         name-matching proceeds but the caller decides edition preference.
 
         Returns the match reason string, or None if no match.
@@ -2937,13 +2955,14 @@ class MetaAdsSync:
             return None
 
         # --- Year gate ---
-        campaign_year = self._extract_year(campaign_name)
+        cname_clean = self._campaign_tokens(campaign_name)
+        years = set(re.findall(r'\b(20[2-3]\d)\b', cname_clean))
+        if len(years) > 1:
+            return None  # Conflicting year evidence needs review, never a guess.
+        campaign_year = int(next(iter(years))) if years else None
         if campaign_year is not None and event_year is not None:
             if campaign_year != event_year:
                 return None  # Hard reject: explicit year mismatch
-
-        cname = campaign_name.lower()
-        cname_clean = self._tokenize_name(cname)
 
         match_reason = None
         strategy = None
@@ -2966,7 +2985,10 @@ class MetaAdsSync:
                 # attributed to DC. Prefix still absorbs the plurals and
                 # possessives this was written for — austin/austins,
                 # philly/phillys — without reaching into the middle of acronyms.
-                if all(any(cword.startswith(cw) for cword in cname_words_set)
+                # Short city tokens must be exact: DCF is Dallas, so a
+                # prefix match on DC would steal Dallas coffee spend.
+                if all(any(cword == cw or (len(cw) > 3 and cword.startswith(cw))
+                           for cword in cname_words_set)
                        for cw in content_words):
                     match_reason = f"all content words {content_words}"
                     strategy = 'content_words'
@@ -2984,7 +3006,7 @@ class MetaAdsSync:
         # Strategy 4: Reverse alias — campaign word is an alias that maps to this event
         if not match_reason:
             event_lower = event_name.lower()
-            cname_words = set(self._tokenize_name(cname).split())
+            cname_words = set(cname_clean.split())
             for word in cname_words:
                 if word in self.EVENT_ALIASES:
                     for pattern in self.EVENT_ALIASES[word]:
@@ -3600,7 +3622,8 @@ class DecisionEngine:
     def _get_all_events(self) -> list:
         """Get all events (cached per portfolio run)."""
         if self._all_events_cache is None:
-            self._all_events_cache = self.db.get_events(upcoming_only=False)
+            self._all_events_cache = [e for e in self.db.get_events(upcoming_only=False)
+                                      if not EventbriteSync._is_junk_event(e.get('name') or '')]
         return self._all_events_cache
     def _invalidate_cache(self):
         """Clear caches at start of portfolio analysis."""
@@ -3610,7 +3633,7 @@ class DecisionEngine:
         """Ticket-count based analysis. Compares raw tickets sold at N days out
         against historical ticket counts at the same days-out for past editions."""
         event = self.db.get_event(event_id)
-        if not event:
+        if not event or EventbriteSync._is_junk_event(event.get('name') or ''):
             return None
         event_date = datetime.fromisoformat(event['event_date']).date()
         days_until = (event_date - date.today()).days
@@ -3899,8 +3922,10 @@ class DecisionEngine:
         # Compute grouped spend status from constituent event IDs
         constituent_ids = [a.event_id for a in day_analyses]
         grouped_spend_status = self._get_grouped_spend_status(constituent_ids)
-        # CAC only meaningful with current spend
-        cac_val = (total_spend / total_tickets) if total_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
+        # Shared edition spend requires the same edition-wide ticket denominator
+        # as an individual session. One day's tickets would inflate acquisition cost.
+        edition_tickets = self.db.get_edition_tickets(constituent_ids[0]) if constituent_ids else 0
+        cac_val = (total_spend / edition_tickets) if edition_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
         days_until = day_analyses[0].days_until
         best_urgency = max(a.urgency for a in day_analyses)
         best_decision = None

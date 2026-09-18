@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import copy
 import os
 import tempfile
@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import provider_drafts as p
+from audience_routing import event_audience_id as actual_event_audience_id
 CURRENT_BUYERS=p.current_buyers
 
 NOW=datetime.now(timezone.utc)
@@ -52,6 +53,16 @@ class ProviderDraftTests(unittest.TestCase):
         for target,value in [('provider_drafts.event_audience_id','1234567890'),('provider_drafts.build_crm_audience',{'records':[{'email':'a@example.com'},{'email':'nonconsented@example.com'}]}),('provider_drafts.current_buyers',set())]:
             m=patch(target,return_value=value);m.start();self.addCleanup(m.stop)
     def prepare(self):return p.prepare_one(self.db,BRIEF,self.client,self.state,lambda:self.saved.append(copy.deepcopy(self.state)),NOW)
+    def test_reviewed_route_is_explicit_and_cannot_override_environment(self):
+        with patch.dict('os.environ',{'MAILCHIMP_EVENT_AUDIENCES':'{}'}):
+            self.assertEqual(actual_event_audience_id('e','1234567890'),'1234567890')
+            for value in (None,'whole_list','',True):
+                with self.subTest(value=value),self.assertRaises(RuntimeError):actual_event_audience_id('e',value)
+        with patch.dict('os.environ',{'MAILCHIMP_EVENT_AUDIENCES':'{"e":"aaaaaaaaaa"}'}):
+            with self.assertRaisesRegex(RuntimeError,'conflicts'):actual_event_audience_id('e','1234567890')
+            self.assertEqual(actual_event_audience_id('e'),'aaaaaaaaaa')
+        with patch.dict('os.environ',{'MAILCHIMP_EVENT_AUDIENCES':'broken'}):
+            with self.assertRaisesRegex(RuntimeError,'invalid'):actual_event_audience_id('e','1234567890')
     def test_creates_exact_consent_segment_and_saved_draft_once(self):
         result=self.prepare();self.assertEqual(result['state'],'ready');self.assertEqual(result['audience_count'],1)
         self.assertEqual(self.client.calls[[x[0] for x in self.client.calls].index('SEGMENT')][2],['a@example.com'])
@@ -61,6 +72,28 @@ class ProviderDraftTests(unittest.TestCase):
         self.prepare();self.client.campaign['status']='schedule';self.client.calls=[]
         self.assertEqual(self.prepare()['state'],'schedule')
         self.assertTrue(all(x[0]=='GET' for x in self.client.calls))
+    def test_early_draft_requires_owner_requested_bounded_window(self):
+        self.db.get_event=lambda e:{'name':'City Coffee','city':'City','event_type':'coffee',
+            'event_date':(NOW+timedelta(days=200)).date().isoformat()}
+        with self.assertRaisesRegex(ValueError,'outside'):self.prepare()
+        with patch.dict(BRIEF,{'preparation_horizon_days':365}):
+            with self.assertRaisesRegex(ValueError,'explicit reviewed'):self.prepare()
+        with patch.dict(BRIEF,{'preparation_horizon_days':365,'owner_requested':True}):
+            self.assertEqual(self.prepare()['state'],'ready')
+            self.prepare()
+        self.assertEqual(self.client.created,1)
+
+    def test_invalid_early_window_cannot_expand_scope(self):
+        for horizon in (True,'365',366,0,-1):
+            with self.subTest(horizon=horizon),patch.dict(BRIEF,{'preparation_horizon_days':horizon,'owner_requested':True}):
+                with self.assertRaisesRegex(ValueError,'explicit reviewed'):self.prepare()
+        self.assertEqual(self.client.created,0)
+
+    def test_owner_request_does_not_allow_more_than_one_year(self):
+        self.db.get_event=lambda e:{'name':'City Coffee','city':'City','event_type':'coffee',
+            'event_date':(NOW+timedelta(days=366)).date().isoformat()}
+        with patch.dict(BRIEF,{'preparation_horizon_days':365,'owner_requested':True}):
+            with self.assertRaisesRegex(ValueError,'outside'):self.prepare()
     def test_owner_edits_preserved(self):
         self.prepare();self.client.content['html']='Owner changed this';self.client.calls=[]
         self.assertEqual(self.prepare()['state'],'user_edited')

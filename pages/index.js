@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Treemap, ScatterChart, Scatter, ZAxis, Legend } from 'recharts';
 
 import AttentionHub from '../components/AttentionHub';
+import {readDashboard} from '../lib/dashboard-read.mjs';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'https://craft-dominant-production.up.railway.app';
 
@@ -557,6 +558,8 @@ export default function CraftDashboard() {
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState(null);
+  const [dashboardError, setDashboardError] = useState(null);
+  const dashboardRefresh = useRef(null);
 
   // CRM state
   const [crmView, setCrmView] = useState('targeting');
@@ -586,16 +589,48 @@ export default function CraftDashboard() {
   const [crmTypes, setCrmTypes] = useState([]);
   const CRM_LIMIT = 50;
 
-  const fetchDashboard = () => {
-    fetch(`/api/proxy/api/dashboard`).then(r => r.json()).then(d => {
-      setDashboard(d);
-      if (d.events?.length) setSelectedEvent(d.events[0]);
-      setLoading(false);
-      if (d.sync?.running) { setSyncing(true); setTimeout(fetchDashboard, 10000); }
-      else { setSyncing(false); if (d.sync?.error) setSyncError(d.sync.error); }
-    }).catch(() => setLoading(false));
-  };
-  useEffect(() => { fetchDashboard(); }, []);
+  const fetchDashboard = () => dashboardRefresh.current?.();
+  useEffect(() => {
+    let disposed = false, inFlight = false, queued = false, timer, controller;
+    const load = async () => {
+      if (disposed) return;
+      if (inFlight) { queued = true; return; }
+      clearTimeout(timer);
+      inFlight = true;
+      controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      let delay = 60000;
+      try {
+        const d = await readDashboard(fetch, controller.signal);
+        if (disposed) return;
+        setDashboard(d);
+        setSelectedEvent(previous => d.events.find(e => e.event_id === previous?.event_id) || d.events[0] || null);
+        setDashboardError(null);
+        setSyncing(Boolean(d.sync?.running));
+        setSyncError(d.sync?.error || null);
+        delay = d.sync?.running ? 10000 : 60000;
+      } catch (error) {
+        if (!disposed) setDashboardError('Could not refresh the dashboard.');
+        delay = 15000;
+      } finally {
+        clearTimeout(timeout);
+        inFlight = false;
+        if (!disposed) {
+          setLoading(false);
+          timer = setTimeout(load, queued ? 0 : delay);
+          queued = false;
+        }
+      }
+    };
+    dashboardRefresh.current = load;
+    load();
+    return () => {
+      disposed = true;
+      dashboardRefresh.current = null;
+      clearTimeout(timer);
+      controller?.abort();
+    };
+  }, []);
 
   const fetchCustomers = () => {
     const params = new URLSearchParams({ limit: CRM_LIMIT, offset: crmPage * CRM_LIMIT, sort: crmSort, order: crmOrder });
@@ -655,15 +690,33 @@ export default function CraftDashboard() {
   };
   const toggleIntel = (key) => setIntelOpen(prev => ({ ...prev, [key]: !prev[key] }));
 
-  const triggerSync = () => {
+  const triggerSync = async () => {
+    if (syncing) return;
     setSyncing(true); setSyncError(null);
-    fetch(`/api/proxy/api/sync`, { method: 'POST' }).then(r => r.json()).then(() => {
-      const poll = () => { fetch(`/api/proxy/api/sync-status`).then(r => r.json()).then(s => { if (s.done) { setSyncing(false); if (s.error) setSyncError(s.error); fetchDashboard(); } else setTimeout(poll, 5000); }); };
-      setTimeout(poll, 5000);
-    });
+    try {
+      const response = await fetch('/api/proxy/api/sync', {method:'POST'});
+      if (!response.ok) throw new Error('Sync request failed');
+      const result = await response.json();
+      if (!['started','already_running'].includes(result.status)) throw new Error('Sync did not start');
+      if (dashboardRefresh.current) fetchDashboard();
+    } catch (error) {
+      if (dashboardRefresh.current) {
+        setSyncing(false);
+        setSyncError('Sales refresh could not start. Please try again.');
+        fetchDashboard();
+      }
+    }
   };
 
   if (loading) return (<div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center gap-4"><div className="text-2xl font-bold">Craft Dominant</div><div className="text-gray-500">Loading dashboard...</div></div>);
+
+  if (!dashboard && dashboardError) return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+      <h1 className="text-2xl font-bold">Craft Dominant</h1>
+      <p role="alert">The dashboard is temporarily unavailable. Retrying automatically.</p>
+      <button className="rounded bg-blue-600 text-white px-4 py-2" onClick={fetchDashboard}>Retry now</button>
+    </div>
+  );
 
   const { portfolio, decisions, events, customers: cs } = dashboard || {};
   const isEmpty = !events?.length && !portfolio?.total_tickets;
@@ -694,6 +747,7 @@ export default function CraftDashboard() {
         </div>
       </header>
 
+      {dashboardError && <div role="status" className="bg-amber-50 text-amber-900 py-3 px-6 text-sm text-center">Showing the last successful dashboard while we retry the refresh. <button className="underline ml-2" onClick={fetchDashboard}>Retry now</button></div>}
       {syncing && <div className="bg-blue-600 text-white py-2 px-6 text-center text-sm">Syncing data from Eventbrite... Dashboard will update automatically.</div>}
       {(dashboard?.data_quality?.unknown_amounts > 0 || dashboard?.data_quality?.unknown_ticket_counts > 0) && <div role="status" className="bg-amber-50 text-amber-900 py-2 px-6 text-sm">Some order details are missing: {dashboard.data_quality.unknown_amounts} amounts and {dashboard.data_quality.unknown_ticket_counts} ticket counts. Totals include observed values only.</div>}
       {syncError && <div className="bg-red-100 text-red-700 py-2 px-6 text-center text-sm">Sync error: {syncError}</div>}

@@ -473,3 +473,58 @@ class TestPortfolioMultiEditionProductionShape(unittest.TestCase):
         self.assertAlmostEqual(
             portfolio_spend_total(self.db, y2026),
             round(8732.18 + 9596.49 + 7146.49, 2), places=2)
+
+
+class TestGroupedDashboardTruth(_Fixture):
+    def _groups(self):
+        from craft_unified import DecisionEngine
+        from unittest.mock import patch
+        engine = DecisionEngine(self.db)
+        with patch.object(self.db, 'get_edition_spend_status', return_value='current_has_spend'):
+            raw = [engine.analyze_event(r['event_id']) for r in self.rows]
+            return [engine._create_day_event(engine._get_pattern(self.NAME),
+                    [a for a in raw if a.event_date == day], raw)
+                    for day, _ in self.DAYS]
+
+    def test_both_day_cards_use_edition_ticket_denominator(self):
+        spend = self._write_edition_spend()
+        tickets = self.db.get_edition_tickets(self.canonical)
+        groups = self._groups()
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(sum(g.tickets_sold for g in groups), tickets)
+        for group in groups:
+            self.assertEqual(group.cac, round(spend / tickets, 2))
+            self.assertEqual(group.ad_spend, spend)
+            self.assertLess(group.cac, spend / group.tickets_sold)
+
+    def test_empty_day_still_shares_real_festival_acquisition_cost(self):
+        spend = self._write_edition_spend()
+        for row in self.sunday_rows():
+            self.db.conn.execute('DELETE FROM orders WHERE event_id = ?', (row['event_id'],))
+        self.db.conn.commit()
+        groups = self._groups()
+        self.assertEqual(groups[1].tickets_sold, 0)
+        self.assertEqual(groups[0].cac, groups[1].cac)
+        self.assertEqual(groups[1].cac, round(spend / groups[0].tickets_sold, 2))
+
+    def test_administrative_event_is_preserved_but_not_analyzed(self):
+        from craft_unified import DecisionEngine, EventbriteSync
+        event = {'event_id': 'admin-payment', 'name': 'Dallas Coffee Festival 2027 — Exhibitor Payment',
+                 'event_type': 'coffee', 'city': 'Dallas', 'event_date': '2035-03-20',
+                 'status': 'upcoming', 'capacity': 1300}
+        self.db.upsert_event(event)
+        self.assertTrue(EventbriteSync._is_junk_event(event['name']))
+        engine = DecisionEngine(self.db)
+        self.assertIsNone(engine.analyze_event(event['event_id']))
+        self.assertNotIn(event['event_id'], [a.event_id for a in engine.analyze_portfolio()])
+        self.assertNotIn(event['event_id'], [e['event_id'] for e in engine._get_all_events()])
+        self.assertIsNotNone(self.db.get_event(event['event_id']))
+
+    def test_consumer_festival_is_not_filtered(self):
+        from craft_unified import DecisionEngine, EventbriteSync
+        event = {'event_id': 'consumer-festival', 'name': 'Dallas Coffee Festival',
+                 'event_type': 'coffee', 'city': 'Dallas', 'event_date': '2035-03-20',
+                 'status': 'upcoming', 'capacity': 1300}
+        self.db.upsert_event(event)
+        self.assertFalse(EventbriteSync._is_junk_event(event['name']))
+        self.assertIsNotNone(DecisionEngine(self.db).analyze_event(event['event_id']))

@@ -132,12 +132,16 @@ def build_copy(event, brief):
 def prepare_one(db, brief, client, state, save, now):
     eid = str(brief['event_id'])
     event = dict(db.get_event(eid) or {})
-    if event_audience_id(eid) != client.audience_id or not event:
+    if event_audience_id(eid, brief.get('audience_id')) != client.audience_id or not event:
         raise ValueError('Reviewed audience route is missing')
     if (event.get('city'), event.get('event_type')) != (brief['city'], brief['event_type']):
         raise ValueError('Festival scope changed')
     days = (datetime.fromisoformat(event['event_date']).date() - now.date()).days
-    if not 0 <= days <= 120:
+    horizon = brief.get('preparation_horizon_days', 120)
+    if (isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= 365
+            or (horizon > 120 and brief.get('owner_requested') is not True)):
+        raise ValueError('Early draft preparation requires an explicit reviewed window')
+    if not 0 <= days <= horizon:
         raise ValueError('Festival is outside the preparation window')
     # Identity spans all sibling sessions and remains stable across refreshes.
     siblings = sorted(db.edition_sibling_ids(eid))
@@ -259,7 +263,7 @@ def refresh_provider_drafts(db):
         for brief in config.get('briefs',[]):
             now=datetime.now(timezone.utc)
             try:
-                client=MailchimpClient(os.environ['MAILCHIMP_API_KEY'],event_audience_id(brief['event_id']))
+                client=MailchimpClient(os.environ['MAILCHIMP_API_KEY'],event_audience_id(brief['event_id'], brief.get('audience_id')))
                 client._draft_read_cache = read_cache
                 prepare_one(db,brief,client,state,save,now)
             except Exception as exc:
