@@ -182,6 +182,8 @@ describe('the allowlist matches what the dashboard actually calls', () => {
   const pageSources = readdirSync(join(root, 'pages'))
     .filter((f) => f.endsWith('.js'))
     .map((f) => readFileSync(join(root, 'pages', f), 'utf8'))
+    // The homepage delegates its validated read to this imported helper.
+    .concat(readFileSync(join(root, 'lib', 'dashboard-read.mjs'), 'utf8'))
     .join('\n');
 
   test('every call site in the dashboard is covered by the allowlist', () => {
@@ -281,10 +283,12 @@ describe('sync is a mutation', () => {
     assert.equal(res.statusCode, 200);
   });
 
-  test('sync-status stays a read', async () => {
-    const fetchImpl = spyFetch();
+  test('unused sync-status is not exposed by the dashboard proxy', async () => {
+    let reached = false;
+    const fetchImpl = async () => { reached = true; throw new Error('must not forward'); };
     const res = await call({ path: 'api/sync-status', method: 'GET' }, { fetchImpl });
-    assert.equal(res.statusCode, 200);
+    assert.equal(res.statusCode, 404);
+    assert.equal(reached, false);
   });
 });
 

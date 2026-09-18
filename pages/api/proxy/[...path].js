@@ -50,7 +50,6 @@ const ALLOWED = [
   { prefix: 'api/intelligence', methods: ['GET'] },
   { prefix: 'api/overlap', methods: ['GET'] },
   { prefix: 'api/export', methods: ['GET'] },
-  { prefix: 'api/sync-status', methods: ['GET'] },
   { prefix: 'api/v2/diagnostics/mailchimp-audiences', methods: ['GET'] },
   { prefix: 'api/sync', methods: ['POST'] },         // triggers a local sync: never GET
   { prefix: 'api/engine/status', methods: ['GET'] },

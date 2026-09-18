@@ -143,3 +143,36 @@ def test_explicit_year_gate_still_rejects(sync):
 def test_clean_event_name_unchanged_for_plain_names(sync):
     assert sync._clean_event_name("Austin Coffee Festival 2026") == "austin coffee festival"
     assert sync._clean_event_name("DC Wine Festival Fall Edition 2026") == "dc wine festival"
+
+
+@pytest.mark.parametrize('campaign', ['SFCF26 engagement v1 - Copy 2', 'post:SFCF2026 coffee'])
+def test_compact_alias_year_recovers_correct_edition(sync, campaign):
+    assert sync._campaign_matches_event(campaign, 'San Francisco Coffee Festival', 2026)
+    assert sync._extract_year(campaign) == 2026
+    assert sync._campaign_matches_event(campaign, 'San Francisco Coffee Festival', 2025) is None
+    assert sync._campaign_matches_event(campaign, 'Seattle Coffee Festival', 2026) is None
+
+
+@pytest.mark.parametrize('campaign', ['XSFCF26', 'SFCF260', 'SFCF261234', 'SFCF2', 'NYC26', 'Seattle26'])
+def test_compact_year_does_not_invent_aliases(sync, campaign):
+    assert sync._campaign_tokens(campaign) == campaign.lower()
+
+
+@pytest.mark.parametrize('campaign', ['SFCF25 2026', 'SFCF26 SFCF27', 'SFCF 2025 2026'])
+def test_conflicting_years_do_not_choose_an_edition(sync, campaign):
+    assert sync._extract_year(campaign) is None
+    for year in (2025, 2026, 2027):
+        assert sync._campaign_matches_event(campaign, 'San Francisco Coffee Festival', year) is None
+
+
+def test_compact_alias_retains_dc_dallas_san_diego_isolation(sync):
+    assert sync._campaign_matches_event('DCF coffee', 'DC Coffee Festival', 2026) is None
+    assert sync._campaign_matches_event('SDCF26 coffee', 'San Diego Coffee Festival', 2026)
+    assert sync._campaign_matches_event('SDCF26 coffee', 'DC Coffee Festival', 2026) is None
+    assert sync._campaign_matches_event('DCF27 coffee', 'Dallas Coffee Festival', 2027)
+    assert sync._campaign_matches_event('DCF27 coffee', 'DC Coffee Festival', 2027) is None
+
+
+def test_plain_variant_number_is_not_a_year(sync):
+    assert sync._extract_year('SFCF engagement v1 - Copy 2') is None
+    assert sync._campaign_matches_event('SFCF engagement v1 - Copy 2', 'SF Coffee Festival', 2026)
