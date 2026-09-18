@@ -2067,13 +2067,14 @@ class EventbriteSync:
     JUNK_PATTERNS = [
         'vendor fee', 'vendor payment', 'payment link', 'vendor registration',
         'vendor', 'sponsor fee', 'sponsorship payment', 'booth fee',
-        'exhibitor fee', 'exhibitor registration', 'vendor app',
+        'exhibitor fee', 'exhibitor registration', 'exhibitor payment', 'vendor app',
         'test event', 'do not use', 'draft event'
     ]
-    def _is_junk_event(self, name: str) -> bool:
+    @classmethod
+    def _is_junk_event(cls, name: str) -> bool:
         """Filter out vendor fees, payment links, and other non-consumer events."""
         name_lower = name.lower().strip()
-        for pattern in self.JUNK_PATTERNS:
+        for pattern in cls.JUNK_PATTERNS:
             if pattern in name_lower:
                 return True
         return False
@@ -3595,7 +3596,8 @@ class DecisionEngine:
     def _get_all_events(self) -> list:
         """Get all events (cached per portfolio run)."""
         if self._all_events_cache is None:
-            self._all_events_cache = self.db.get_events(upcoming_only=False)
+            self._all_events_cache = [e for e in self.db.get_events(upcoming_only=False)
+                                      if not EventbriteSync._is_junk_event(e.get('name') or '')]
         return self._all_events_cache
     def _invalidate_cache(self):
         """Clear caches at start of portfolio analysis."""
@@ -3605,7 +3607,7 @@ class DecisionEngine:
         """Ticket-count based analysis. Compares raw tickets sold at N days out
         against historical ticket counts at the same days-out for past editions."""
         event = self.db.get_event(event_id)
-        if not event:
+        if not event or EventbriteSync._is_junk_event(event.get('name') or ''):
             return None
         event_date = datetime.fromisoformat(event['event_date']).date()
         days_until = (event_date - date.today()).days
@@ -3894,8 +3896,10 @@ class DecisionEngine:
         # Compute grouped spend status from constituent event IDs
         constituent_ids = [a.event_id for a in day_analyses]
         grouped_spend_status = self._get_grouped_spend_status(constituent_ids)
-        # CAC only meaningful with current spend
-        cac_val = (total_spend / total_tickets) if total_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
+        # Shared edition spend requires the same edition-wide ticket denominator
+        # as an individual session. One day's tickets would inflate acquisition cost.
+        edition_tickets = self.db.get_edition_tickets(constituent_ids[0]) if constituent_ids else 0
+        cac_val = (total_spend / edition_tickets) if edition_tickets > 0 and total_spend > 0 and grouped_spend_status == 'current_has_spend' else 0
         days_until = day_analyses[0].days_until
         best_urgency = max(a.urgency for a in day_analyses)
         best_decision = None
