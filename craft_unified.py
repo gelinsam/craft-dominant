@@ -4504,7 +4504,7 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                                     elif day_threshold == 45:
                                         audience = db.get_event_profiles(et, ec, timing_segment='early_bird')
                                         acc = db.get_event_profiles(et, ec, momentum='accelerating')
-                                        audience = list(set(audience + acc))
+                                        audience = audience + acc
                                     elif day_threshold == 30:
                                         past_attendees = db.get_past_attendees_not_purchased(
                                             event['event_id'], event['name'], limit=5000,
@@ -4514,19 +4514,24 @@ def create_app(db: Database, auto_sync: bool = False) -> Flask:
                                     elif day_threshold == 14:
                                         audience = db.get_event_profiles(et, ec, timing_segment='planner')
                                         dec = db.get_event_profiles(et, ec, momentum='decelerating')
-                                        audience = list(set(audience + dec))
+                                        audience = audience + dec
                                     elif day_threshold == 7:
                                         audience = db.get_event_profiles(et, ec, timing_segment='last_minute')
                                     # Store export record
-                                    audience_emails = [a.get('email') for a in audience]
+                                    # Profiles are dictionaries; deduplicate recipient identities,
+                                    # retaining stable order even when segment memberships overlap.
+                                    audience_emails = list(dict.fromkeys(
+                                        email.strip().lower() for a in audience
+                                        if isinstance((email := a.get('email')), str) and email.strip()
+                                    ))
                                     db.conn.execute("""
                                         INSERT INTO auto_exports
                                         (event_id, milestone, export_type, audience_count, audience_emails, created_at)
                                         VALUES (?, ?, ?, ?, ?, ?)
-                                    """, (event['event_id'], milestone_name, export_type, len(audience),
+                                    """, (event['event_id'], milestone_name, export_type, len(audience_emails),
                                           json.dumps(audience_emails), datetime.now().isoformat()))
                                     db.conn.commit()
-                                    log.info(f"Auto-export created: {event['name']} {milestone_name} ({len(audience)} audience)")
+                                    log.info(f"Auto-export created: {event['name']} {milestone_name} ({len(audience_emails)} audience)")
                 except Exception as e:
                     log.warning(f"Error processing event {event.get('event_id')}: {e}")
         except Exception as e:
