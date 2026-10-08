@@ -1,0 +1,121 @@
+{
+  "synthetic": true,
+  "provider_calls": 0,
+  "database_writes": 0,
+  "ready_example": {
+    "schema_version": 1,
+    "generated_at": "2026-10-07T20:00:00+00:00",
+    "source_digest": "c5c0643863319ab3461127b05a0ab0bb0a665b08aa6ee92550d4b5006d468b6d",
+    "mode": "read_only",
+    "dispatch_enabled": false,
+    "objective": "Incremental profitable events and contribution margin per founder hour",
+    "work": [
+      {
+        "action_id": "edition1",
+        "event_ids": [
+          "1",
+          "2"
+        ],
+        "event_name": "Example Coffee",
+        "owner": "crm_email",
+        "state": "ready_for_internal_preparation",
+        "blockers": [],
+        "existing_interventions": [],
+        "next_step": "Prepare evidence and a proposal through the existing workflow.",
+        "handoff": [
+          "independent_qa",
+          "chief_of_staff",
+          "human_approval"
+        ],
+        "source": {
+          "opportunity_id": "opp1",
+          "pace_delta_pct": null,
+          "days_until": null,
+          "channel_readiness": {}
+        },
+        "external_execution_allowed": false
+      }
+    ],
+    "exceptions": [],
+    "coverage": {},
+    "metrics": {
+      "incremental_contribution_margin": null,
+      "founder_hours": null,
+      "contribution_per_founder_hour": null,
+      "additional_profitable_events": null,
+      "status": "unmeasured",
+      "reason": "No reconciled event contribution ledger or founder-time baseline."
+    },
+    "approval_policy": {
+      "outbound_email": "explicit_human_approval",
+      "financial_commitment": "explicit_human_approval",
+      "live_ad_budget_change": "explicit_human_approval"
+    },
+    "external_execution_allowed": false
+  },
+  "held_example": {
+    "schema_version": 1,
+    "generated_at": "2026-10-07T20:00:00+00:00",
+    "source_digest": "b3943cee64940666fa29d3692c0199a22301a09914046db14401e1545ea190e1",
+    "mode": "read_only",
+    "dispatch_enabled": false,
+    "objective": "Incremental profitable events and contribution margin per founder hour",
+    "work": [
+      {
+        "action_id": "edition1",
+        "event_ids": [
+          "1",
+          "2"
+        ],
+        "event_name": "Example Coffee",
+        "owner": "crm_email",
+        "state": "held",
+        "blockers": [
+          "sales_evidence_not_current",
+          "review_existing_work_before_preparing"
+        ],
+        "existing_interventions": [
+          {
+            "id": "example-existing",
+            "status": "proposed"
+          }
+        ],
+        "next_step": "Review evidence and existing interventions.",
+        "handoff": [
+          "independent_qa",
+          "chief_of_staff",
+          "human_approval"
+        ],
+        "source": {
+          "opportunity_id": "opp1",
+          "pace_delta_pct": null,
+          "days_until": null,
+          "channel_readiness": {}
+        },
+        "external_execution_allowed": false
+      }
+    ],
+    "exceptions": [
+      {
+        "id": "sales_sync",
+        "status": "stale",
+        "owner": "revenue_pacing"
+      }
+    ],
+    "coverage": {},
+    "metrics": {
+      "incremental_contribution_margin": null,
+      "founder_hours": null,
+      "contribution_per_founder_hour": null,
+      "additional_profitable_events": null,
+      "status": "unmeasured",
+      "reason": "No reconciled event contribution ledger or founder-time baseline."
+    },
+    "approval_policy": {
+      "outbound_email": "explicit_human_approval",
+      "financial_commitment": "explicit_human_approval",
+      "live_ad_budget_change": "explicit_human_approval"
+    },
+    "external_execution_allowed": false
+  }
+}
