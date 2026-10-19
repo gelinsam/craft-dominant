@@ -581,3 +581,63 @@ class TestMetaSyncEndpointAuth(unittest.TestCase):
     def test_diagnostics_route_is_also_protected(self):
         self.assertEqual(
             self.client.get("/api/v2/diagnostics/meta-assignment").status_code, 401)
+
+class TestEditionRollover(_Base):
+    def setUp(self):
+        super().setUp()
+        self.events = [ev('spring26', 'DC Wine Fest! Spring Edition', '2026-04-25'),
+                       ev('fall26', 'DC Wine Fest! Fall Edition', '2026-10-16'),
+                       ev('spring27', 'DC Wine Fest! Spring Edition', '2027-04-16')]
+
+    def test_fall_season_cannot_match_spring(self):
+        self.assertIsNone(self.m._match_strategy('DCWF Fall 2027', 'DC Wine Fest! Spring Edition', 2027))
+        self.assertIsNone(self.m._match_strategy('DCWFF27', 'DC Wine Fest! Spring Edition', 2027))
+
+    def test_spring_compact_year_is_explicit(self):
+        a = self.m._assign_campaign_to_edition(
+            {'id': 'new', 'name': 'DC Wine Fest | Spring2027 | Purchase',
+             'created_time': '2026-10-19T10:00:00+0000'}, self.events, datetime.date(2026,10,19))
+        self.assertEqual(a['canonical_event']['event_id'], 'spring27')
+
+    def test_legacy_spend_does_not_roll_to_next_edition(self):
+        self.db.save_ad_spend_batch([('fall26', 'legacy', 'DCWF Sales Campaign', '2026-07-13', 100, 50, 2)])
+        for today in (datetime.date(2026,10,10), datetime.date(2026,10,19), datetime.date(2027,1,1)):
+            a = self.m._assign_campaign_to_edition(
+                {'id': 'legacy', 'name': 'DCWF Sales Campaign'}, self.events, today)
+            self.assertEqual(a['canonical_event']['event_id'], 'fall26')
+
+    def test_unobserved_legacy_uses_creation_time(self):
+        a = self.m._assign_campaign_to_edition(
+            {'id':'old', 'name':'DCWF Sales Campaign', 'created_time':'2026-07-13T10:00:00+0000'},
+            self.events, datetime.date(2026,10,19))
+        self.assertEqual(a['canonical_event']['event_id'], 'fall26')
+
+    def test_misattributed_spring_delivery_uses_original_timing(self):
+        self.db.save_ad_spend_batch([('fall26', 'spring', 'DCWF Wine Time', '2026-02-03', 100, 50, 2)])
+        a = self.m._assign_campaign_to_edition({'id':'spring','name':'DCWF Wine Time'}, self.events, datetime.date(2026,10,19))
+        self.assertEqual(a['canonical_event']['event_id'], 'spring26')
+
+class TestDuplicateEditionRepair(_Base):
+    def test_archive_and_preserve_new_spend_and_tickets(self):
+        from repair_edition_spend import repair
+        for eid,day in [('old','2026-10-16'),('new','2027-04-16')]:
+            self.db.upsert_event({'event_id':eid,'name':'DC Wine Fest','event_date':day})
+        self.db.save_ad_spend_batch([('old','c','DCWF','2026-10-01',100,50,2),
+                                    ('new','c','DCWF','2026-10-01',100,50,2),
+                                    ('new','newc','Spring2027','2026-10-19',1,2,1)])
+        self.assertEqual(repair(self.db,'new','old')['duplicate_spend'],100)
+        self.assertEqual(self.db.get_event_spend('new'),101)
+        repair(self.db,'new','old',True)
+        self.assertEqual(self.db.get_event_spend('new'),1)
+        self.assertEqual(self.db.get_event_spend('old'),100)
+        self.assertEqual(self.db.conn.execute('SELECT COUNT(*) n FROM edition_spend_repair_archive').fetchone()['n'],1)
+        self.assertEqual(repair(self.db,'new','old',True)['rows'],0)
+
+    def test_conflicting_duplicate_aborts(self):
+        from repair_edition_spend import repair
+        for eid,day in [('old','2026-10-16'),('new','2027-04-16')]:
+            self.db.upsert_event({'event_id':eid,'name':'DC Wine Fest','event_date':day})
+        self.db.save_ad_spend_batch([('old','c','DCWF','2026-10-01',100,50,2),
+                                    ('new','c','DCWF','2026-10-01',105,50,2)])
+        with self.assertRaises(ValueError): repair(self.db,'new','old',True)
+        self.assertEqual(self.db.get_event_spend('new'),105)

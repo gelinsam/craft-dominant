@@ -2870,7 +2870,7 @@ class MetaAdsSync:
         expanded = []
         for word in words:
             match = re.fullmatch(r'([a-z]+)(20[2-3]\d|[2-3]\d)', word)
-            if match and match[1] in cls.EVENT_ALIASES:
+            if match and (match[1] in cls.EVENT_ALIASES or match[1] in {'spring', 'summer', 'fall', 'winter'}):
                 expanded.extend((match[1], str(2000 + int(match[2]) % 100)))
             else:
                 expanded.append(word)
@@ -2964,6 +2964,16 @@ class MetaAdsSync:
             if campaign_year != event_year:
                 return None  # Hard reject: explicit year mismatch
 
+        # Season is edition identity, not decoration. Expand seasonal aliases
+        # before comparing so DCWFF and 'Fall' cannot match a spring edition.
+        campaign_seasons = set(re.findall(r'\b(spring|summer|fall|winter)\b', cname_clean))
+        for token in cname_clean.split():
+            for alias_name in self.EVENT_ALIASES.get(token, []):
+                campaign_seasons.update(re.findall(r'\b(spring|summer|fall|winter)\b', alias_name))
+        event_seasons = set(re.findall(r'\b(spring|summer|fall|winter)\b', event_name.lower()))
+        if len(campaign_seasons) > 1 or (campaign_seasons and event_seasons and campaign_seasons != event_seasons):
+            return None
+
         match_reason = None
         strategy = None
 
@@ -3031,7 +3041,7 @@ class MetaAdsSync:
         if not cleaned:
             return []
         url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
-        params = {'fields': 'id,name,status,objective', 'limit': 200}
+        params = {'fields': 'id,name,status,objective,created_time', 'limit': 200}
         matched = []
         seen_ids = set()
         visited_pages = set()
@@ -3070,7 +3080,7 @@ class MetaAdsSync:
         Used by sync_all_events() to avoid re-fetching per event.
         """
         url = f"{self.BASE_URL}/act_{self.ad_account_id}/campaigns"
-        params = {'fields': 'id,name,status,objective', 'limit': 200}
+        params = {'fields': 'id,name,status,objective,created_time', 'limit': 200}
         all_campaigns = []
         seen_ids = set()
         visited_pages = set()
@@ -3214,6 +3224,21 @@ class MetaAdsSync:
         Returns None (no match), or a dict with either `ambiguous` set, or the
         chosen edition plus the canonical event row that will carry its spend.
         """
+        # Undated legacy campaigns must not jump to the next edition when
+        # today's date passes opening day. Resolve relative to first observed
+        # delivery (or Meta creation for campaigns not yet observed), not today.
+        anchor = today
+        observed = self.db.conn.execute(
+            "SELECT MIN(spend_date) AS first_day FROM ad_spend WHERE campaign_id = ?",
+            (campaign.get('id'),)).fetchone()
+        first_day = observed['first_day'] if observed else None
+        anchor_text = first_day or campaign.get('created_time')
+        if anchor_text:
+            try:
+                anchor = date.fromisoformat(str(anchor_text)[:10])
+            except (TypeError, ValueError):
+                pass
+
         # --- Match raw rows, keeping the strategy so rank ordering applies ---
         by_edition = {}
         for event in events_list:
@@ -3259,7 +3284,7 @@ class MetaAdsSync:
                 rep = canonical_edition_event(v['events'])
                 reps[rep['event_id']] = k
             resolved = self._pick_closest_event(list(
-                canonical_edition_event(v['events']) for v in top.values()), today)
+                canonical_edition_event(v['events']) for v in top.values()), anchor)
             if resolved is None:
                 return {
                     'ambiguous': True,
