@@ -281,6 +281,16 @@ def _build_app():
         response.headers['Cache-Control'] = 'private, no-store, max-age=0'
         return response
 
+    @app.get("/api/intelligence/chief-of-staff")
+    @require_command_auth
+    def chief_of_staff_brief():
+        from action_plan import build_action_plan
+        from chief_of_staff import build_brief
+        response = jsonify(build_brief(build_action_plan(
+            opportunity_engine, diagnosis_engine, db, v2_repo)))
+        response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        return response
+
     @app.get("/api/intelligence/action-plan")
     @require_command_auth
     def action_plan():
@@ -945,4 +955,3 @@ def _build_app():
 # Production uses the explicit factory. Importing diagnostics or tests must
 # never open databases, run migrations, or start ingestion threads.
 create_app_v2 = _build_app
-
